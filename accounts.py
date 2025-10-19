@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import logging
+
 from config import SETTINGS
 from proxy_manager import (
     ProxyConfig,
@@ -18,12 +20,18 @@ from proxy_manager import (
     test_proxy_connection,
 )
 from session_store import has_session, remove as remove_session, save_from
+from totp_store import generate_code as generate_totp_code
+from totp_store import has_secret as has_totp_secret
+from totp_store import remove_secret as remove_totp_secret
+from totp_store import save_secret as save_totp_secret
 from utils import ask, banner, em, ok, press_enter, title, warn
 
 BASE = Path(__file__).resolve().parent
 DATA = BASE / "data"
 DATA.mkdir(exist_ok=True)
 FILE = DATA / "accounts.json"
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_account(record: Dict) -> Dict:
@@ -40,6 +48,11 @@ def _normalize_account(record: Dict) -> Dict:
     except Exception:
         sticky_value = sticky_default
     result["proxy_sticky_minutes"] = max(1, sticky_value)
+    username = result.get("username")
+    if username:
+        result["has_totp"] = has_totp_secret(username)
+    else:
+        result.setdefault("has_totp", False)
     return result
 
 
@@ -57,6 +70,7 @@ def _prepare_for_save(record: Dict) -> Dict:
         stored.pop("proxy_user", None)
         stored.pop("proxy_pass", None)
         stored.pop("proxy_sticky_minutes", None)
+    stored.pop("has_totp", None)
     return stored
 
 
@@ -110,6 +124,22 @@ def update_account(username: str, updates: Dict) -> bool:
     return False
 
 
+def _prompt_totp(username: str) -> bool:
+    while True:
+        raw = ask("TOTP Secret / otpauth URI (opcional): ").strip()
+        if not raw:
+            return False
+        try:
+            save_totp_secret(username, raw)
+            ok("Se guardó el TOTP cifrado para esta cuenta.")
+            return True
+        except ValueError as exc:
+            warn(f"No se pudo guardar el TOTP: {exc}")
+            retry = ask("¿Reintentar ingreso de TOTP? (s/N): ").strip().lower()
+            if retry != "s":
+                return False
+
+
 def add_account(username: str, alias: str, proxy: Optional[Dict] = None) -> bool:
     items = _load()
     if _find(items, username):
@@ -134,6 +164,7 @@ def remove_account(username: str) -> None:
     new_items = [it for it in items if it.get("username", "").lower() != username.lower()]
     _save(new_items)
     remove_session(username)
+    remove_totp_secret(username)
     clear_proxy(username)
     ok("Eliminada (si existía).")
 
@@ -231,7 +262,17 @@ def _login_and_save_session(account: Dict, password: str) -> bool:
 
         cl = Client()
         binding = apply_proxy_to_client(cl, username, account, reason="login")
-        cl.login(username, password)
+        verification_code = ""
+        if has_totp_secret(username):
+            code = generate_totp_code(username)
+            if code:
+                verification_code = code
+                logger.debug("Aplicando TOTP automático para @%s", username)
+            else:
+                warn(
+                    "No se pudo generar el código 2FA automático. Intentá reconfigurar el TOTP."
+                )
+        cl.login(username, password, verification_code=verification_code)
         save_from(cl, username)
         mark_connected(username, True)
         ok(f"Sesión guardada para {username}.")
@@ -259,7 +300,11 @@ def prompt_login(username: str) -> bool:
 
 
 def _proxy_indicator(account: Dict) -> str:
-    return em("🛡️") if account.get("proxy_url") else ""
+    return f" {em('🛡️')}" if account.get("proxy_url") else ""
+
+
+def _totp_indicator(account: Dict) -> str:
+    return f" {em('🔐')}" if account.get("has_totp") else ""
 
 
 def menu_accounts():
@@ -280,7 +325,10 @@ def menu_accounts():
                 conn = "[conectada]" if it.get("connected") else "[no conectada]"
                 sess = "[sesión]" if has_session(it["username"]) else "[sin sesión]"
                 proxy_flag = _proxy_indicator(it)
-                print(f" - @{it['username']} {conn} {sess} {flag} {proxy_flag}")
+                totp_flag = _totp_indicator(it)
+                print(
+                    f" - @{it['username']} {conn} {sess} {flag} {proxy_flag}{totp_flag}"
+                )
 
         print("\n1) Agregar cuenta")
         print("2) Eliminar cuenta")
@@ -294,9 +342,19 @@ def menu_accounts():
             u = ask("Username (sin @): ").strip().lstrip("@")
             if not u:
                 continue
+            if get_account(u):
+                warn("Ya existe.")
+                press_enter()
+                continue
             proxy_data = _prompt_proxy_settings()
+            totp_saved = _prompt_totp(u)
             if add_account(u, alias, proxy_data):
+                if not totp_saved:
+                    remove_totp_secret(u)
                 prompt_login(u)
+            else:
+                if totp_saved:
+                    remove_totp_secret(u)
             press_enter()
         elif op == "2":
             u = ask("Username a eliminar: ").strip().lstrip("@")
@@ -312,8 +370,10 @@ def menu_accounts():
             print("\n1) Activar/Desactivar")
             print("2) Editar proxy")
             print("3) Probar proxy")
-            print("4) Volver")
-            choice = ask("Opción: ").strip() or "4"
+            print("4) Configurar/Reemplazar TOTP")
+            print("5) Eliminar TOTP")
+            print("6) Volver")
+            choice = ask("Opción: ").strip() or "6"
             if choice == "1":
                 val = ask("1=activar, 0=desactivar: ").strip()
                 set_active(u, val == "1")
@@ -327,6 +387,20 @@ def menu_accounts():
             elif choice == "3":
                 _test_existing_proxy(account)
                 press_enter()
+            elif choice == "4":
+                configured = _prompt_totp(u)
+                if not configured:
+                    warn("No se configuró TOTP.")
+                press_enter()
+                account = get_account(u) or account
+            elif choice == "5":
+                if has_totp_secret(u):
+                    remove_totp_secret(u)
+                    ok("Se eliminó el TOTP almacenado.")
+                else:
+                    warn("La cuenta no tenía TOTP guardado.")
+                press_enter()
+                account = get_account(u) or account
             else:
                 continue
         elif op == "4":
@@ -344,7 +418,8 @@ def menu_accounts():
             for idx, acct in enumerate(group, start=1):
                 sess = "[sesión]" if has_session(acct["username"]) else "[sin sesión]"
                 proxy_flag = _proxy_indicator(acct)
-                print(f" {idx}) @{acct['username']} {sess} {proxy_flag}")
+                totp_flag = _totp_indicator(acct)
+                print(f" {idx}) @{acct['username']} {sess} {proxy_flag}{totp_flag}")
             raw = ask("Selección: ").strip()
             if not raw:
                 warn("Sin selección.")
