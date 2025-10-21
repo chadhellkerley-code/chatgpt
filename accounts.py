@@ -386,8 +386,8 @@ def menu_accounts():
         print("3) Activar/Desactivar / Proxy")
         print("4) Iniciar sesión y guardar sesiónid (auto en TODAS del alias)")
         print("5) Iniciar sesión y guardar sesión ID (seleccionar cuenta)")
-        print("X) 🧭 Modo de exploración automática por hashtag (nuevo)")
-        print("6) Volver\n")
+        print("6) Modo de exploración automática por hashtag (nuevo)")
+        print("7) Volver\n")
 
         op = ask("Opción: ").strip()
         if op == "1":
@@ -500,9 +500,9 @@ def menu_accounts():
             for acct in targets:
                 prompt_login(acct["username"])
             press_enter()
-        elif op.lower() == "x":
-            _launch_hashtag_mode(alias)
         elif op == "6":
+            _launch_hashtag_mode(alias)
+        elif op == "7":
             break
         else:
             warn("Opción inválida.")

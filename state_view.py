@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
+from math import ceil
 from typing import Optional
 
-from storage import TZ, conversation_rows, menu_supabase
+from storage import (
+    TZ,
+    conversation_rows,
+    export_conversation_state,
+    menu_supabase,
+    purge_conversations_before,
+)
 from ui import Fore, banner, format_table, full_line, style_text
-from utils import ask, press_enter, warn
+from utils import ask, ok, press_enter, warn
+
+_PAGE_SIZE = 12
+_DEFAULT_RANGE_DAYS = 7
 
 
 def _parse_date(value: str) -> Optional[datetime]:
@@ -31,10 +41,15 @@ def _format_rows(rows: list[dict]) -> list[str]:
     return format_table(table)
 
 
+def _default_start() -> datetime:
+    return datetime.now(TZ) - timedelta(days=_DEFAULT_RANGE_DAYS)
+
+
 def menu_conversation_state() -> None:
     account_filter: Optional[str] = None
-    start: Optional[datetime] = None
+    start: Optional[datetime] = _default_start()
     end: Optional[datetime] = None
+    page = 0
 
     while True:
         banner()
@@ -42,12 +57,24 @@ def menu_conversation_state() -> None:
         print(full_line())
 
         rows = conversation_rows(account_filter=account_filter, start=start, end=end)
+        total_rows = len(rows)
+        total_pages = max(1, ceil(total_rows / _PAGE_SIZE))
+        if page >= total_pages:
+            page = total_pages - 1
+        offset = page * _PAGE_SIZE
+        visible = rows[offset : offset + _PAGE_SIZE]
         if rows:
-            rendered = _format_rows(rows)
+            rendered = _format_rows(visible)
             for line in rendered:
                 print(style_text(line, bold=False))
             print(full_line())
-            print(style_text(f"Total filas: {len(rows)}", color=Fore.GREEN, bold=True))
+            print(
+                style_text(
+                    f"Página {page + 1}/{total_pages} · Total filas: {total_rows}",
+                    color=Fore.GREEN,
+                    bold=True,
+                )
+            )
         else:
             print(style_text("No hay conversaciones registradas.", color=Fore.YELLOW, bold=True))
         print(full_line())
@@ -61,18 +88,45 @@ def menu_conversation_state() -> None:
             filters.append(f"Hasta: {end.strftime('%Y-%m-%d')}")
         filters_text = ", ".join(filters) if filters else "(sin filtros)"
         print(style_text(f"Filtros activos: {filters_text}", color=Fore.WHITE, bold=True))
+        if start:
+            print(
+                style_text(
+                    f"Rango por defecto: últimos {_DEFAULT_RANGE_DAYS} días",
+                    color=Fore.BLUE,
+                    bold=False,
+                )
+            )
         print()
-        print("[Enter] Refrescar  |  [F] Filtrar  |  [L] Limpiar filtros  |  [C] Configurar Supabase  |  [V] Volver")
+        print(
+            "[Enter] Refrescar  |  [F] Filtrar  |  [L] Limpiar filtros  |  "
+            "[N] Página siguiente  |  [P] Página anterior  |  [E] Exportar CSV  |  "
+            "[D] Eliminar datos antiguos  |  [C] Configurar Supabase  |  [V] Volver"
+        )
         choice = ask("Acción: ").strip().lower()
 
         if choice in {"", "r"}:
             continue
         if choice == "v":
             break
+        if choice == "n":
+            if page + 1 < total_pages:
+                page += 1
+            else:
+                warn("Ya estás en la última página.")
+                press_enter()
+            continue
+        if choice == "p":
+            if page > 0:
+                page -= 1
+            else:
+                warn("Ya estás en la primera página.")
+                press_enter()
+            continue
         if choice == "l":
             account_filter = None
-            start = None
+            start = _default_start()
             end = None
+            page = 0
             continue
         if choice == "c":
             menu_supabase()
@@ -93,6 +147,23 @@ def menu_conversation_state() -> None:
             else:
                 end = None
             start = parsed_start
+            page = 0
+            continue
+        if choice == "e":
+            if not rows:
+                warn("No hay datos para exportar.")
+                press_enter()
+                continue
+            path = export_conversation_state(rows)
+            ok(f"CSV generado en: {path}")
+            press_enter()
+            continue
+        if choice == "d":
+            cutoff = datetime.now(TZ) - timedelta(days=30)
+            removed = purge_conversations_before(cutoff)
+            ok(f"Se eliminaron {removed} registros anteriores al último mes.")
+            page = 0
+            press_enter()
             continue
         warn("Opción inválida.")
         press_enter()

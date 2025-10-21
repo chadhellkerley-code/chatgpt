@@ -6,14 +6,7 @@ import argparse
 import sys
 from typing import List
 
-from config import SETTINGS
-from licensekit import (
-    ensure_supabase_credentials,
-    ensure_table_exists,
-    fetch_license,
-    list_licenses,
-    package_license,
-)
+from licensekit import fetch_license, list_licenses, package_license
 
 
 def _format_record(record: dict) -> str:
@@ -43,19 +36,7 @@ def _select_license_interactive(records: List[dict]) -> str:
 def main(argv: List[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--license", help="Clave de licencia a empaquetar")
-    parser.add_argument("--supabase-url", help="Override de SUPABASE_URL")
-    parser.add_argument("--supabase-key", help="Override de SUPABASE_KEY")
     args = parser.parse_args(argv)
-
-    _, url_found, key_found = ensure_supabase_credentials(interactive=False)
-    url = args.supabase_url or url_found or SETTINGS.supabase_url
-    key = args.supabase_key or key_found or SETTINGS.supabase_key
-
-    if not url or not key:
-        parser.error("Debes definir SUPABASE_URL y SUPABASE_KEY (argumentos o .env.local).")
-
-    if not ensure_table_exists(url, key, interactive=False):
-        parser.error("La tabla de licencias no está disponible. Ejecutá el menú 7 primero.")
 
     license_key = args.license
     if not license_key:
@@ -65,9 +46,9 @@ def main(argv: List[str] | None = None) -> int:
         license_key = _select_license_interactive(records)
 
     if not fetch_license(license_key):
-        parser.error("Licencia no encontrada en Supabase.")
+        parser.error("Licencia no encontrada en el registro local.")
 
-    success, bundle_path, message = package_license(license_key, url, key)
+    success, bundle_path, message = package_license(license_key)
     if not success:
         parser.error(message)
 

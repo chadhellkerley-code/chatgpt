@@ -93,11 +93,7 @@ def _write_client_env(root: Path) -> None:
 
 
 def build_for_license(
-    record: Dict[str, str],
-    supabase_url: str,
-    supabase_key: str,
-    *,
-    name: str | None = None,
+    record: Dict[str, str], *, name: str | None = None
 ) -> Tuple[bool, Path | None, str]:
     """Genera un ejecutable para la licencia suministrada."""
 
@@ -124,9 +120,8 @@ def build_for_license(
         payload = {
             "license_key": record.get("license_key"),
             "client_name": record.get("client_name"),
-            "supabase_url": supabase_url,
-            "supabase_key": supabase_key,
             "expires_at": record.get("expires_at"),
+            "status": record.get("status", "active"),
         }
         payload_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"

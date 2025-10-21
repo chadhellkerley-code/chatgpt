@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Dict
 
-from licensekit import verify_license_remote
+from licensekit import validate_license_payload
 from ui import Fore, full_line, style_text
 
 PAYLOAD_NAME = "storage/license_payload.json"
@@ -42,13 +42,21 @@ def _print_error(msg: str) -> None:
 
 def launch_with_license() -> None:
     payload = _load_payload()
-    license_key = payload.get("license_key", "")
-    supabase_url = payload.get("supabase_url", "")
-    supabase_key = payload.get("supabase_key", "")
+    if not payload:
+        _print_error("No se encontró la licencia incluida en el paquete.")
+        sys.exit(2)
 
-    ok, message, record = verify_license_remote(license_key, supabase_url, supabase_key)
-    if not ok:
-        _print_error(message or "No se pudo validar la licencia.")
+    attempts = 3
+    record: Dict[str, str] = {}
+    for remaining in range(attempts, 0, -1):
+        provided = input("Ingresá tu código de licencia: ").strip()
+        ok, message, record = validate_license_payload(provided, payload)
+        if ok:
+            break
+        _print_error(message or "Licencia inválida.")
+        if remaining - 1:
+            print(style_text(f"Intentos restantes: {remaining - 1}", color=Fore.YELLOW))
+    else:
         sys.exit(2)
 
     print(full_line(color=Fore.GREEN))

@@ -1,5 +1,6 @@
 # storage.py
 # -*- coding: utf-8 -*-
+import csv
 import json
 import re
 import time
@@ -20,6 +21,8 @@ STO.mkdir(exist_ok=True)
 SENT = STO / "sent_log.jsonl"
 AUTO = STO / "autoresponder_state.json"
 STATE = STO / "state.json"
+EXPORTS = STO / "exports"
+EXPORTS.mkdir(exist_ok=True)
 
 TZ_LABEL = "America/Argentina/Cordoba"
 try:
@@ -127,6 +130,66 @@ def conversation_rows(
             latest[key] = payload
     rows = sorted(latest.values(), key=lambda item: item["timestamp"], reverse=True)
     return rows
+
+
+def export_conversation_state(rows: List[dict]) -> Path:
+    """Exporta el estado de conversaciones a un CSV dentro de storage/exports."""
+
+    timestamp = _now_local().strftime("%Y%m%d-%H%M%S")
+    path = EXPORTS / f"conversation_state_{timestamp}.csv"
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(
+            ["fecha_hora", "cuenta_emisora", "cuenta_receptora", "estado"]
+        )
+        for row in rows:
+            ts = row["timestamp"].strftime("%Y-%m-%d %H:%M")
+            writer.writerow([ts, row["account"], row["recipient"], row["status"]])
+    return path
+
+
+def purge_conversations_before(cutoff: datetime) -> int:
+    """Elimina registros anteriores al cutoff (en zona local)."""
+
+    if not SENT.exists():
+        return 0
+
+    try:
+        cutoff_utc = cutoff.astimezone(ZoneInfo("UTC"))
+    except Exception:
+        cutoff_utc = cutoff
+
+    kept_lines: List[str] = []
+    removed = 0
+    for line in SENT.read_text(encoding="utf-8").splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            kept_lines.append(raw)
+            continue
+        ts = obj.get("ts")
+        if ts is None:
+            kept_lines.append(raw)
+            continue
+        try:
+            dt_utc = datetime.fromtimestamp(float(ts), tz=ZoneInfo("UTC"))
+        except Exception:
+            kept_lines.append(raw)
+            continue
+        if dt_utc < cutoff_utc:
+            removed += 1
+            continue
+        kept_lines.append(raw)
+
+    with SENT.open("w", encoding="utf-8") as fh:
+        if kept_lines:
+            fh.write("\n".join(kept_lines) + "\n")
+        else:
+            fh.write("")
+    return removed
 
 
 def _counts_for_date(date: datetime.date) -> tuple[int, int]:

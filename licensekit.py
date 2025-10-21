@@ -9,6 +9,7 @@ import json
 import os
 import secrets
 import shutil
+import string
 import sys
 import tempfile
 import textwrap
@@ -41,7 +42,63 @@ _TABLE_SQL = textwrap.dedent(
     );
     """
 ).strip()
-_PAYLOAD_PATH = Path(__file__).resolve().parent / "storage" / "license_payload.json"
+_STORAGE_ROOT = Path(__file__).resolve().parent / "storage"
+_PAYLOAD_PATH = _STORAGE_ROOT / "license_payload.json"
+_LICENSES_FILE = _STORAGE_ROOT / "licenses.json"
+
+
+def _load_local_licenses() -> List[Dict[str, Any]]:
+    if not _LICENSES_FILE.exists():
+        return []
+    try:
+        data = json.loads(_LICENSES_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    records: List[Dict[str, Any]] = []
+    for item in data:
+        if isinstance(item, dict):
+            records.append(_normalize_record(dict(item)))
+    return records
+
+
+def _save_local_licenses(records: List[Dict[str, Any]]) -> None:
+    _LICENSES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    serialized = [dict(_normalize_record(dict(rec))) for rec in records]
+    _LICENSES_FILE.write_text(
+        json.dumps(serialized, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _find_local_license(license_key: str) -> Optional[Dict[str, Any]]:
+    key = (license_key or "").strip()
+    if not key:
+        return None
+    for record in _load_local_licenses():
+        if str(record.get("license_key", "")) == key:
+            return record
+    return None
+
+
+def _upsert_local_license(record: Dict[str, Any]) -> Dict[str, Any]:
+    records = [rec for rec in _load_local_licenses() if rec.get("license_key") != record.get("license_key")]
+    normalized = _normalize_record(dict(record))
+    records.append(normalized)
+    _save_local_licenses(records)
+    return normalized
+
+
+def _delete_local_license_record(license_key: str) -> bool:
+    key = (license_key or "").strip()
+    if not key:
+        return False
+    records = _load_local_licenses()
+    new_records = [rec for rec in records if rec.get("license_key") != key]
+    if len(new_records) == len(records):
+        return False
+    _save_local_licenses(new_records)
+    return True
 
 
 def _supabase_credentials() -> Tuple[str, str]:
@@ -226,6 +283,16 @@ def _is_expired(record: Dict[str, Any]) -> bool:
     return expires < now
 
 
+def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    status = str(record.get("status", _STATUS_ACTIVE)).lower()
+    if status not in {_STATUS_ACTIVE, _STATUS_EXPIRED, _STATUS_REVOKED, _STATUS_PAUSED}:
+        status = _STATUS_ACTIVE
+    record["status"] = status
+    if _is_expired(record):
+        record["status"] = _STATUS_EXPIRED
+    return record
+
+
 def _status_label(record: Dict[str, Any]) -> Tuple[str, str]:
     status = str(record.get("status", "")).lower()
     if status == _STATUS_REVOKED:
@@ -377,7 +444,7 @@ def _render_table(records: Iterable[Dict[str, Any]]) -> None:
 
 
 def _show_active_licenses() -> None:
-    records = [rec for rec in _fetch_licenses() if _is_active_record(rec)]
+    records = [rec for rec in _load_local_licenses() if _is_active_record(rec)]
     banner()
     print(style_text("Licencias activas", color=Fore.CYAN, bold=True))
     print(full_line())
@@ -391,16 +458,7 @@ def _show_active_licenses() -> None:
 
 
 def _fetch_licenses() -> List[Dict[str, Any]]:
-    data, error, status = _request("get", f"{_TABLE}?select=*")
-    if _is_missing_table(error, status):
-        _show_missing_table_help()
-        return []
-    if error:
-        warn(f"No se pudieron obtener licencias: {error}")
-        return []
-    if not isinstance(data, list):
-        return []
-    return data
+    return _load_local_licenses()
 
 
 def _select_license(records: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -428,22 +486,17 @@ def _select_license(records: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 
 
 def _update_license(license_key: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    endpoint = f"{_TABLE}?license_key=eq.{license_key}"
-    data, error, status = _request("patch", endpoint, json_payload=payload)
-    if _is_missing_table(error, status):
-        _show_missing_table_help()
-        return None
-    if error:
-        warn(f"No se pudo actualizar la licencia: {error}")
+    record = _find_local_license(license_key)
+    if not record:
+        warn("No se encontró la licencia.")
         press_enter()
         return None
-    if isinstance(data, list) and data:
-        ok("Licencia actualizada.")
-        press_enter()
-        return data[0]
+    updated = dict(record)
+    updated.update(payload)
+    updated = _upsert_local_license(updated)
     ok("Licencia actualizada.")
     press_enter()
-    return None
+    return updated
 
 
 def _extend_license(record: Dict[str, Any]) -> None:
@@ -473,15 +526,10 @@ def _delete_license(record: Dict[str, Any]) -> None:
         warn("Sin cambios.")
         press_enter()
         return
-    endpoint = f"{_TABLE}?license_key=eq.{record['license_key']}"
-    _, error, status = _request("delete", endpoint)
-    if _is_missing_table(error, status):
-        _show_missing_table_help()
-        return
-    if error:
-        warn(f"No se pudo eliminar la licencia: {error}")
-    else:
+    if _delete_local_license_record(record["license_key"]):
         ok("Licencia eliminada.")
+    else:
+        warn("No se pudo eliminar la licencia.")
     press_enter()
 
 
@@ -532,18 +580,11 @@ def _license_actions_loop(license_key: str) -> None:
 
 
 def _fetch_single(license_key: str) -> Optional[Dict[str, Any]]:
-    endpoint = f"{_TABLE}?license_key=eq.{license_key}&select=*"
-    data, error, status = _request("get", endpoint)
-    if _is_missing_table(error, status):
-        _show_missing_table_help()
-        return None
-    if error or not isinstance(data, list):
-        return None
-    return data[0] if data else None
+    return _find_local_license(license_key)
 
 
 def _generate_key() -> str:
-    return secrets.token_urlsafe(18)
+    return "".join(secrets.choice(string.digits) for _ in range(15))
 
 
 def _package_license(
@@ -554,7 +595,25 @@ def _package_license(
     except Exception as exc:  # pragma: no cover - entorno sin módulo
         return False, None, f"No se pudo importar el generador de ejecutables: {exc}"
 
-    success, artifact_path, message = build_for_license(record, url, key)
+    success, artifact_path, message = build_for_license(record)
+    if not success or not artifact_path:
+        return False, None, message
+
+    try:
+        bundle_path = _prepare_delivery_bundle(record, artifact_path)
+    except Exception as exc:  # pragma: no cover - errores de FS
+        return False, None, f"Build generado pero falló el empaquetado: {exc}"
+
+    return True, bundle_path, message
+
+
+def _package_license_local(record: Dict[str, Any]) -> Tuple[bool, Optional[Path], str]:
+    try:
+        from tools.build_executable import build_for_license
+    except Exception as exc:  # pragma: no cover - entorno sin módulo
+        return False, None, f"No se pudo importar el generador de ejecutables: {exc}"
+
+    success, artifact_path, message = build_for_license(record)
     if not success or not artifact_path:
         return False, None, message
 
@@ -634,6 +693,41 @@ def _create_license(url: str, key: str) -> None:
     press_enter()
 
 
+def _create_license_local() -> None:
+    banner()
+    print(full_line())
+    print(style_text("Nueva licencia", color=Fore.CYAN, bold=True))
+    print(full_line())
+    client = ask("Nombre del cliente: ").strip()
+    if not client:
+        warn("Se requiere un nombre de cliente.")
+        press_enter()
+        return
+    email = ask("Email del cliente (opcional): ").strip()
+    duration = ask_int("Días de validez (mínimo 30): ", min_value=30, default=30)
+    issued = dt.datetime.now(dt.timezone.utc)
+    expires = issued + dt.timedelta(days=duration)
+    record = {
+        "license_key": _generate_key(),
+        "client_name": client,
+        "client_email": email or None,
+        "created_at": issued.isoformat(),
+        "expires_at": expires.isoformat(),
+        "status": _STATUS_ACTIVE,
+    }
+    record = _upsert_local_license(record)
+    ok(f"Licencia creada para {client}.")
+    _render_table([record])
+    success, bundle_path, message = _package_license_local(record)
+    if success:
+        ok(
+            f"✅ Licencia creada. ZIP de entrega generado en: {bundle_path}"
+        )
+    else:
+        warn(message)
+    press_enter()
+
+
 def _manage_license_simple() -> None:
     records = _fetch_licenses()
     if not records:
@@ -700,6 +794,28 @@ def verify_license_remote(
     return True, "", record
 
 
+def validate_license_payload(
+    input_key: str, payload: Dict[str, Any]
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """Valida una licencia contra el payload incrustado en el cliente."""
+
+    record = _normalize_record(dict(payload or {}))
+    expected = str(record.get("license_key", "")).strip()
+    if not expected:
+        return False, "Licencia no configurada.", {}
+    provided = (input_key or "").strip()
+    if provided != expected:
+        return False, "Licencia incorrecta.", record
+    status = record.get("status", _STATUS_ACTIVE)
+    if status == _STATUS_REVOKED:
+        return False, "Licencia revocada.", record
+    if status == _STATUS_PAUSED:
+        return False, "Licencia pausada.", record
+    if _is_expired(record):
+        return False, "Licencia vencida.", record
+    return True, "", record
+
+
 def enforce_startup_validation() -> None:
     if os.environ.get("LICENSE_ALREADY_VALIDATED") == "1":
         return
@@ -714,10 +830,7 @@ def enforce_startup_validation() -> None:
         sys.exit(2)
 
     license_key = payload.get("license_key", "")
-    supabase_url = payload.get("supabase_url", "")
-    supabase_key = payload.get("supabase_key", "")
-
-    ok, message, _ = verify_license_remote(license_key, supabase_url, supabase_key)
+    ok, message, _ = validate_license_payload(license_key, payload)
     if not ok:
         print(full_line(color=Fore.RED))
         print(style_text("Licencia inválida", color=Fore.RED, bold=True))
@@ -731,11 +844,6 @@ def menu_deliver() -> None:
         warn("Esta opción no está disponible en builds de cliente.")
         press_enter()
         return
-    ready, url, key = _ensure_supabase()
-    if not ready:
-        return
-    if not _ensure_table_ready(url or "", key or ""):
-        return
     while True:
         banner()
         print(full_line())
@@ -748,7 +856,7 @@ def menu_deliver() -> None:
         print()
         choice = ask("Opción: ").strip()
         if choice == "1":
-            _create_license(url or "", key or "")
+            _create_license_local()
         elif choice == "2":
             _show_active_licenses()
         elif choice == "3":
@@ -760,20 +868,8 @@ def menu_deliver() -> None:
             press_enter()
 
 
-def ensure_supabase_credentials(interactive: bool = False) -> Tuple[bool, Optional[str], Optional[str]]:
-    """Expone las credenciales de Supabase, solicitándolas si se requiere."""
-
-    return _ensure_supabase(interactive=interactive)
-
-
-def ensure_table_exists(url: str, key: str, *, interactive: bool = False) -> bool:
-    """Comprueba que la tabla de licencias exista (sin interacción por defecto)."""
-
-    return _ensure_table_ready(url, key, interactive=interactive)
-
-
 def list_licenses() -> List[Dict[str, Any]]:
-    """Devuelve todas las licencias disponibles en Supabase."""
+    """Devuelve las licencias almacenadas localmente."""
 
     return _fetch_licenses()
 
@@ -784,13 +880,11 @@ def fetch_license(license_key: str) -> Optional[Dict[str, Any]]:
     return _fetch_single(license_key)
 
 
-def package_license(
-    license_key: str, url: str, key: str
-) -> Tuple[bool, Optional[Path], str]:
+def package_license(license_key: str) -> Tuple[bool, Optional[Path], str]:
     """Genera artefactos limpios para la licencia indicada."""
 
     record = _fetch_single(license_key)
     if not record:
         return False, None, "Licencia no encontrada."
-    return _package_license(record, url, key)
+    return _package_license_local(record)
 
