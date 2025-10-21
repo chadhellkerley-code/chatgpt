@@ -253,6 +253,57 @@ def _test_existing_proxy(account: Dict) -> None:
         warn(f"Error probando proxy: {exc}")
 
 
+def _launch_hashtag_mode(alias: str) -> None:
+    try:
+        from actions import hashtag_mode
+    except Exception as exc:  # pragma: no cover - módulo opcional
+        warn(f"No se pudo iniciar el modo hashtag: {exc}")
+        press_enter()
+        return
+
+    accounts = [acct for acct in _load() if acct.get("alias") == alias]
+    active_accounts = [acct for acct in accounts if acct.get("active")]
+    if not active_accounts:
+        warn("No hay cuentas activas en este alias para ejecutar el modo hashtag.")
+        press_enter()
+        return
+
+    print("Seleccioná cuentas activas (coma separada, * para todas):")
+    for idx, acct in enumerate(active_accounts, start=1):
+        sess = "[sesión]" if has_session(acct["username"]) else "[sin sesión]"
+        proxy_flag = _proxy_indicator(acct)
+        totp_flag = _totp_indicator(acct)
+        print(f" {idx}) @{acct['username']} {sess} {proxy_flag}{totp_flag}")
+    raw = ask("Selección: ").strip()
+    if not raw:
+        warn("Sin selección.")
+        press_enter()
+        return
+
+    if raw == "*":
+        chosen = [acct["username"] for acct in active_accounts]
+    else:
+        selected: set[str] = set()
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if part.isdigit():
+                idx = int(part)
+                if 1 <= idx <= len(active_accounts):
+                    selected.add(active_accounts[idx - 1]["username"])
+            else:
+                selected.add(part.lstrip("@"))
+        chosen = [acct["username"] for acct in active_accounts if acct["username"] in selected]
+
+    if not chosen:
+        warn("No se encontraron cuentas con esos datos.")
+        press_enter()
+        return
+
+    hashtag_mode.run_from_menu(chosen)
+
+
 def _login_and_save_session(account: Dict, password: str) -> bool:
     """Login con instagrapi y guarda sesión en storage/sessions."""
 
@@ -335,6 +386,7 @@ def menu_accounts():
         print("3) Activar/Desactivar / Proxy")
         print("4) Iniciar sesión y guardar sesiónid (auto en TODAS del alias)")
         print("5) Iniciar sesión y guardar sesión ID (seleccionar cuenta)")
+        print("X) 🧭 Modo de exploración automática por hashtag (nuevo)")
         print("6) Volver\n")
 
         op = ask("Opción: ").strip()
@@ -448,6 +500,8 @@ def menu_accounts():
             for acct in targets:
                 prompt_login(acct["username"])
             press_enter()
+        elif op.lower() == "x":
+            _launch_hashtag_mode(alias)
         elif op == "6":
             break
         else:

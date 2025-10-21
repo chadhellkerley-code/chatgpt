@@ -6,7 +6,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, time as dtime
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable, Iterator, List, Optional
 
 from zoneinfo import ZoneInfo
 
@@ -83,6 +83,50 @@ def _iter_records() -> Iterator[dict]:
             obj["local_dt"] = dt
             yield obj
     return _generator()
+
+
+def _status_from_record(entry: dict) -> str:
+    detail = (entry.get("detail") or "").strip()
+    if detail:
+        return detail
+    return "Mensaje enviado" if entry.get("ok") else "Error"
+
+
+def conversation_rows(
+    *,
+    account_filter: Optional[str] = None,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+) -> List[dict]:
+    """Devuelve una vista plana del estado de conversaciones recientes."""
+
+    account_key = account_filter.lower().lstrip("@") if account_filter else None
+    latest: dict[tuple[str, str], dict] = {}
+    for entry in _iter_records():
+        local_dt: datetime | None = entry.get("local_dt")
+        if not local_dt:
+            continue
+        if start and local_dt < start:
+            continue
+        if end and local_dt > end:
+            continue
+        account = str(entry.get("account", ""))
+        if account_key and account.lower().lstrip("@") != account_key:
+            continue
+        recipient = str(entry.get("to", ""))
+        key = (account, recipient)
+        status = _status_from_record(entry)
+        payload = {
+            "timestamp": local_dt,
+            "account": account,
+            "recipient": recipient,
+            "status": status,
+        }
+        previous = latest.get(key)
+        if previous is None or previous["timestamp"] <= local_dt:
+            latest[key] = payload
+    rows = sorted(latest.values(), key=lambda item: item["timestamp"], reverse=True)
+    return rows
 
 
 def _counts_for_date(date: datetime.date) -> tuple[int, int]:

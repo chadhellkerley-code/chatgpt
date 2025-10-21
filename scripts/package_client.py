@@ -67,11 +67,11 @@ def main(argv: List[str] | None = None) -> int:
     if not fetch_license(license_key):
         parser.error("Licencia no encontrada en Supabase.")
 
-    success, message = package_license(license_key, url, key)
+    success, bundle_path, message = package_license(license_key, url, key)
     if not success:
         parser.error(message)
 
-    print(message)
+    print(f"{message}. ZIP generado en: {bundle_path}")
     return 0
 
 

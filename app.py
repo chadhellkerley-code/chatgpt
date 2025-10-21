@@ -23,6 +23,7 @@ ig = _safe_import("ig")
 storage = _safe_import("storage")
 responder = _safe_import("responder")
 licensekit = _safe_import("licensekit")
+state_view = _safe_import("state_view")
 
 
 def _counts():
@@ -62,11 +63,14 @@ def _print_dashboard() -> None:
         f"3) {em('💬')} Enviar mensajes (rotando cuentas activas)  ",
         f"4) {em('📜')} Ver registros de envíos  ",
         f"5) {em('🤖')} Auto-responder con OpenAI  ",
-        f"6) {em('📊')} Configurar Supabase  ",
+        f"6) {em('📊')} Estado de la conversación  ",
     ]
     if not SETTINGS.client_distribution:
-        options.append(f"7) {em('📦')} Entregar a cliente (licencia / EXE)  ")
-    options.append(f"8) {em('🚪')} Salir  ")
+        options.append(f"7) {em('📦')} Entregar a cliente (licencia / ZIP)  ")
+        exit_label = f"8) {em('🚪')} Salir  "
+    else:
+        exit_label = f"7) {em('🚪')} Salir  "
+    options.append(exit_label)
     for text in options:
         print(style_text(text))
     print()
@@ -89,15 +93,15 @@ def menu():
             storage.menu_logs()
         elif op == "5" and responder:
             responder.menu_autoresponder()
-        elif op == "6" and storage:
-            storage.menu_supabase()
+        elif op == "6" and state_view:
+            state_view.menu_conversation_state()
         elif (
             op == "7"
             and licensekit
             and not SETTINGS.client_distribution
         ):
             licensekit.menu_deliver()
-        elif op == "8":
+        elif op == "8" or (op == "7" and SETTINGS.client_distribution):
             print("Saliendo...")
             time.sleep(0.3)
             break

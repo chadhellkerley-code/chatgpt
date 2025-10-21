@@ -9,6 +9,7 @@ LICENSES_TABLE_SQL = """
 create table if not exists public.licenses (
     id uuid primary key default gen_random_uuid(),
     client_name text not null,
+    client_email text,
     license_key text not null unique,
     expires_at timestamptz not null,
     status text not null default 'active',

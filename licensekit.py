@@ -8,7 +8,9 @@ import datetime as dt
 import json
 import os
 import secrets
+import shutil
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -31,6 +33,7 @@ _TABLE_SQL = textwrap.dedent(
     create table if not exists public.licenses (
         id uuid primary key default gen_random_uuid(),
         client_name text not null,
+        client_email text,
         license_key text not null unique,
         expires_at timestamptz not null,
         status text not null default 'active',
@@ -254,6 +257,91 @@ def _days_left(record: Dict[str, Any]) -> str:
     return str(int(delta.total_seconds() // 86400))
 
 
+def _mask_key(value: str) -> str:
+    value = (value or "").strip()
+    if len(value) <= 8:
+        return value[:4] + "…"
+    return f"{value[:4]}…{value[-4:]}"
+
+
+def _safe_client_folder(name: str) -> str:
+    clean = [c if c.isalnum() or c in {" ", "-", "_"} else "_" for c in name]
+    result = "".join(clean).strip()
+    return result or "Cliente"
+
+
+def _is_active_record(record: Dict[str, Any]) -> bool:
+    status = str(record.get("status", "")).lower()
+    if status != _STATUS_ACTIVE:
+        return False
+    expires = _parse_iso(record.get("expires_at"))
+    if not expires:
+        return False
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=dt.timezone.utc)
+    return expires > dt.datetime.now(dt.timezone.utc)
+
+
+def _prepare_delivery_bundle(record: Dict[str, Any], artifact_path: Path) -> Path:
+    client_name = record.get("client_name", "Cliente")
+    folder_name = _safe_client_folder(client_name)
+    desktop = Path.home() / "Escritorio" / "Clientes" / folder_name
+    desktop.mkdir(parents=True, exist_ok=True)
+
+    destination = desktop / artifact_path.name
+    if artifact_path.is_dir():
+        if destination.exists():
+            shutil.rmtree(destination)
+        shutil.copytree(artifact_path, destination)
+    else:
+        shutil.copy2(artifact_path, destination)
+
+    command_path = desktop / "Cliente-HerramientaIG.command"
+    script = "\n".join(
+        [
+            "#!/bin/bash",
+            "DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"",
+            f"\"$DIR/{destination.name}\" \"$@\"",
+        ]
+    )
+    command_path.write_text(script, encoding="utf-8")
+    os.chmod(command_path, 0o755)
+
+    expires = _format_date(record.get("expires_at")) or "-"
+    license_key = record.get("license_key", "")
+    instructions = textwrap.dedent(
+        f"""
+        Cliente: {client_name}
+        Licencia: {license_key}
+        Expira: {expires}
+
+        Cómo ejecutar:
+        1) Doble clic en Cliente-HerramientaIG.command (o clic derecho → Abrir)
+        2) Ingresar la licencia cuando la aplicación lo solicite
+        3) Configurar tus propias cuentas, leads y claves en el menú
+        """
+    ).strip()
+    instructions_path = desktop / "INSTRUCCIONES.txt"
+    instructions_path.write_text(instructions + "\n", encoding="utf-8")
+
+    zip_name = f"{_safe_client_folder(client_name)}-HerramientaIG.zip"
+    zip_path = desktop / zip_name
+    if zip_path.exists():
+        zip_path.unlink()
+
+    with tempfile.TemporaryDirectory(prefix="license_zip_") as tmp:
+        tmp_dir = Path(tmp)
+        if destination.is_dir():
+            shutil.copytree(destination, tmp_dir / destination.name)
+        else:
+            shutil.copy2(destination, tmp_dir / destination.name)
+        shutil.copy2(instructions_path, tmp_dir / instructions_path.name)
+        shutil.copy2(command_path, tmp_dir / command_path.name)
+        shutil.make_archive(str(zip_path.with_suffix("")), "zip", root_dir=tmp_dir)
+
+    return zip_path
+
+
 def _render_table(records: Iterable[Dict[str, Any]]) -> None:
     rows: List[Tuple[str, str, str, str, str, str, str]] = []
     for idx, rec in enumerate(records, start=1):
@@ -263,7 +351,7 @@ def _render_table(records: Iterable[Dict[str, Any]]) -> None:
             (
                 str(idx),
                 rec.get("client_name", "-"),
-                rec.get("license_key", "-"),
+                _mask_key(rec.get("license_key", "-")),
                 _format_date(rec.get("created_at")),
                 _format_date(rec.get("expires_at")),
                 _days_left(rec),
@@ -286,6 +374,20 @@ def _render_table(records: Iterable[Dict[str, Any]]) -> None:
         body_row = "  ".join(row[i].ljust(widths[i]) for i in range(len(headers)))
         print(body_row)
     print(line)
+
+
+def _show_active_licenses() -> None:
+    records = [rec for rec in _fetch_licenses() if _is_active_record(rec)]
+    banner()
+    print(style_text("Licencias activas", color=Fore.CYAN, bold=True))
+    print(full_line())
+    if not records:
+        warn("No hay licencias activas.")
+        press_enter()
+        return
+    records.sort(key=lambda r: r.get("expires_at") or "")
+    _render_table(records)
+    press_enter()
 
 
 def _fetch_licenses() -> List[Dict[str, Any]]:
@@ -444,16 +546,24 @@ def _generate_key() -> str:
     return secrets.token_urlsafe(18)
 
 
-def _package_license(record: Dict[str, Any], url: str, key: str) -> Tuple[bool, str]:
+def _package_license(
+    record: Dict[str, Any], url: str, key: str
+) -> Tuple[bool, Optional[Path], str]:
     try:
         from tools.build_executable import build_for_license
     except Exception as exc:  # pragma: no cover - entorno sin módulo
-        return False, f"No se pudo importar el generador de ejecutables: {exc}"
+        return False, None, f"No se pudo importar el generador de ejecutables: {exc}"
 
-    success, _output, message = build_for_license(record, url, key)
-    if success:
-        return True, message
-    return False, message
+    success, artifact_path, message = build_for_license(record, url, key)
+    if not success or not artifact_path:
+        return False, None, message
+
+    try:
+        bundle_path = _prepare_delivery_bundle(record, artifact_path)
+    except Exception as exc:  # pragma: no cover - errores de FS
+        return False, None, f"Build generado pero falló el empaquetado: {exc}"
+
+    return True, bundle_path, message
 
 
 def _build_executable(record: Dict[str, Any], url: str, key: str) -> None:
@@ -463,9 +573,9 @@ def _build_executable(record: Dict[str, Any], url: str, key: str) -> None:
         press_enter()
         return
 
-    success, message = _package_license(record, url, key)
+    success, bundle_path, message = _package_license(record, url, key)
     if success:
-        ok(message)
+        ok(f"{message}. ZIP generado en: {bundle_path}")
     else:
         warn(message)
     press_enter()
@@ -481,17 +591,25 @@ def _create_license(url: str, key: str) -> None:
         warn("Se requiere un nombre de cliente.")
         press_enter()
         return
+    email = ask("Email del cliente (opcional): ").strip()
     duration = ask_int("Duración en días (mínimo 30): ", min_value=30, default=30)
     issued = dt.datetime.now(dt.timezone.utc)
     expires = issued + dt.timedelta(days=duration)
     payload = {
         "license_key": _generate_key(),
         "client_name": client,
+        "client_email": email or None,
         "created_at": issued.astimezone(dt.timezone.utc).isoformat(),
         "expires_at": expires.astimezone(dt.timezone.utc).isoformat(),
         "status": _STATUS_ACTIVE,
     }
-    data, error, status = _request("post", _TABLE, json_payload=[payload])
+    insert_payload = payload.copy()
+    if not email:
+        insert_payload.pop("client_email", None)
+    data, error, status = _request("post", _TABLE, json_payload=[insert_payload])
+    if error and "client_email" in error.lower():
+        insert_payload.pop("client_email", None)
+        data, error, status = _request("post", _TABLE, json_payload=[insert_payload])
     if _is_missing_table(error, status):
         _show_missing_table_help()
         return
@@ -501,39 +619,53 @@ def _create_license(url: str, key: str) -> None:
         return
     if isinstance(data, list) and data:
         record = data[0]
-        ok(f"Licencia creada para {client}.")
-        _render_table([record])
-        _build_executable(record, url, key)
     else:
-        ok("Licencia creada.")
-        press_enter()
+        record = _fetch_single(payload["license_key"]) or payload
 
-
-def _select_and_manage() -> None:
-    records = _fetch_licenses()
-    if not records:
-        press_enter()
-        return
-    record = _select_license(records)
-    if not record:
-        return
-    _license_actions_loop(record["license_key"])
-
-
-def _select_and_package(url: str, key: str) -> None:
-    records = _fetch_licenses()
-    if not records:
-        press_enter()
-        return
-    record = _select_license(records)
-    if not record:
-        return
-    success, message = _package_license(record, url, key)
+    ok(f"Licencia creada para {client}.")
+    _render_table([record])
+    success, bundle_path, message = _package_license(record, url, key)
     if success:
-        ok(message)
+        ok(
+            f"ZIP de entrega generado en: {bundle_path}. Último paso: compartir con el cliente."
+        )
     else:
         warn(message)
     press_enter()
+
+
+def _manage_license_simple() -> None:
+    records = _fetch_licenses()
+    if not records:
+        press_enter()
+        return
+    record = _select_license(records)
+    if not record:
+        return
+
+    while True:
+        current = _fetch_single(record["license_key"]) or record
+        banner()
+        print(style_text("Gestión de licencia", color=Fore.CYAN, bold=True))
+        print(full_line())
+        _render_table([current])
+        print("1) Extender licencia")
+        print("2) Revocar licencia")
+        print("3) Eliminar licencia")
+        print("4) Volver")
+        choice = ask("Opción: ").strip()
+        if choice == "1":
+            _extend_license(current)
+        elif choice == "2":
+            _update_status(current, _STATUS_REVOKED, "revocar")
+            break
+        elif choice == "3":
+            _delete_license(current)
+            break
+        elif choice == "4":
+            break
+        else:
+            warn("Opción inválida.")
 
 
 def verify_license_remote(
@@ -609,18 +741,18 @@ def menu_deliver() -> None:
         print(full_line())
         print(style_text("Entrega al cliente", color=Fore.CYAN, bold=True))
         print(full_line())
-        print("1) Ver y gestionar licencias")
-        print("2) Crear nueva licencia")
-        print("3) Empaquetar build para cliente")
+        print("1) Crear nueva licencia + generar ZIP")
+        print("2) Ver licencias activas")
+        print("3) Eliminar o extender licencia")
         print("4) Volver")
         print()
         choice = ask("Opción: ").strip()
         if choice == "1":
-            _select_and_manage()
-        elif choice == "2":
             _create_license(url or "", key or "")
+        elif choice == "2":
+            _show_active_licenses()
         elif choice == "3":
-            _select_and_package(url or "", key or "")
+            _manage_license_simple()
         elif choice == "4":
             break
         else:
@@ -652,11 +784,13 @@ def fetch_license(license_key: str) -> Optional[Dict[str, Any]]:
     return _fetch_single(license_key)
 
 
-def package_license(license_key: str, url: str, key: str) -> Tuple[bool, str]:
+def package_license(
+    license_key: str, url: str, key: str
+) -> Tuple[bool, Optional[Path], str]:
     """Genera artefactos limpios para la licencia indicada."""
 
     record = _fetch_single(license_key)
     if not record:
-        return False, "Licencia no encontrada."
+        return False, None, "Licencia no encontrada."
     return _package_license(record, url, key)
 
