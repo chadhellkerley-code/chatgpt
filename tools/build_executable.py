@@ -142,6 +142,7 @@ def build_for_license(
             "client_name": record.get("client_name"),
             "expires_at": record.get("expires_at"),
             "status": record.get("status", "active"),
+            "edition": "client",
         }
         payload_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"

@@ -16,6 +16,7 @@ from dotenv import dotenv_values, load_dotenv
 _ROOT = Path(__file__).resolve().parent
 _ENV_FILENAMES = (".env", ".env.local")
 _CONFIG_FILE = _ROOT / "storage" / "config.json"
+_LICENSE_PAYLOAD = _ROOT / "storage" / "license_payload.json"
 
 
 def _load_file_values() -> Dict[str, str]:
@@ -108,12 +109,34 @@ def _validated_ranges(values: Dict[str, str]) -> Tuple[int, int, int, int]:
     return max_per_account, max_concurrency, delay_min, delay_max
 
 
+def _client_distribution_flag(env_values: Dict[str, str], default: bool) -> bool:
+    env_value = env_values.get("CLIENT_DISTRIBUTION")
+    if env_value is not None:
+        return _coerce_bool(env_value, default)
+
+    if _LICENSE_PAYLOAD.exists():
+        try:
+            payload = json.loads(_LICENSE_PAYLOAD.read_text(encoding="utf-8"))
+        except Exception:
+            return True
+
+        edition = str(payload.get("edition", "")).strip().lower()
+        if edition:
+            return edition == "client"
+
+        return bool(payload)
+
+    return default
+
+
 def load_settings() -> Settings:
     file_values = _load_file_values()
     env_values = {**file_values, **os.environ}
     max_per_account, max_concurrency, delay_min, delay_max = _validated_ranges(env_values)
 
     defaults = Settings()
+    client_distribution = _client_distribution_flag(env_values, defaults.client_distribution)
+
     return Settings(
         max_per_account=max_per_account,
         max_concurrency=max_concurrency,
@@ -126,9 +149,7 @@ def load_settings() -> Settings:
         supabase_url=env_values.get("SUPABASE_URL", ""),
         supabase_key=env_values.get("SUPABASE_KEY", ""),
         openai_api_key=env_values.get("OPENAI_API_KEY", ""),
-        client_distribution=_coerce_bool(
-            env_values.get("CLIENT_DISTRIBUTION"), defaults.client_distribution
-        ),
+        client_distribution=client_distribution,
         proxy_default_url=env_values.get("PROXY_DEFAULT_URL", defaults.proxy_default_url),
         proxy_default_user=env_values.get("PROXY_DEFAULT_USER", defaults.proxy_default_user),
         proxy_default_pass=env_values.get("PROXY_DEFAULT_PASS", defaults.proxy_default_pass),
