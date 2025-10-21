@@ -337,6 +337,24 @@ def _safe_client_folder(name: str) -> str:
     return result or "Cliente"
 
 
+def _desktop_root() -> Path:
+    env_override = os.environ.get("DESKTOP_DIR")
+    if env_override:
+        candidate = Path(env_override).expanduser()
+        if candidate.exists():
+            return candidate
+
+    home = Path.home()
+    candidates = [home / "Desktop", home / "Escritorio"]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    default = home / "Desktop"
+    default.mkdir(parents=True, exist_ok=True)
+    return default
+
+
 def _is_active_record(record: Dict[str, Any]) -> bool:
     status = str(record.get("status", "")).lower()
     if status != _STATUS_ACTIVE:
@@ -352,7 +370,8 @@ def _is_active_record(record: Dict[str, Any]) -> bool:
 def _prepare_delivery_bundle(record: Dict[str, Any], artifact_path: Path) -> Path:
     client_name = record.get("client_name", "Cliente")
     folder_name = _safe_client_folder(client_name)
-    desktop = Path.home() / "Escritorio" / "Clientes" / folder_name
+    desktop_root = _desktop_root()
+    desktop = desktop_root / "Clientes" / folder_name
     desktop.mkdir(parents=True, exist_ok=True)
 
     destination = desktop / artifact_path.name

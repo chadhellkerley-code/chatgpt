@@ -13,7 +13,7 @@ from storage import (
     menu_supabase,
     purge_conversations_before,
 )
-from ui import Fore, banner, format_table, full_line, style_text
+from ui import Fore, banner, full_line, style_text
 from utils import ask, ok, press_enter, warn
 
 _PAGE_SIZE = 12
@@ -38,7 +38,21 @@ def _format_rows(rows: list[dict]) -> list[str]:
     for row in rows:
         ts = row["timestamp"].strftime("%Y-%m-%d %H:%M")
         table.append([ts, f"@{row['account']}", f"@{row['recipient']}", row["status"]])
-    return format_table(table)
+
+    if not table:
+        return []
+
+    min_widths = [21, 22, 22, 28]
+    widths = [0] * len(table[0])
+    for row in table:
+        for idx, cell in enumerate(row):
+            widths[idx] = max(widths[idx], len(str(cell)))
+    widths = [max(width, min_widths[idx]) for idx, width in enumerate(widths)]
+
+    rendered: list[str] = []
+    for row in table:
+        rendered.append("  ".join(str(cell).ljust(widths[idx]) for idx, cell in enumerate(row)))
+    return rendered
 
 
 def _default_start() -> datetime:
@@ -97,41 +111,51 @@ def menu_conversation_state() -> None:
                 )
             )
         print()
-        print(
-            "[Enter] Refrescar  |  [F] Filtrar  |  [L] Limpiar filtros  |  "
-            "[N] Página siguiente  |  [P] Página anterior  |  [E] Exportar CSV  |  "
-            "[D] Eliminar datos antiguos  |  [C] Configurar Supabase  |  [V] Volver"
-        )
+        print(style_text("Seleccioná una opción:", color=Fore.WHITE, bold=True))
+        options = [
+            "[Enter] Refrescar",
+            "1) Filtrar",
+            "2) Limpiar filtros",
+            "3) Página siguiente",
+            "4) Página anterior",
+            "5) Exportar CSV",
+            "6) Eliminar datos antiguos",
+            "7) Configurar Supabase",
+            "8) Volver",
+        ]
+        for line in options:
+            print(style_text(line, color=Fore.CYAN if line.startswith("[") else Fore.WHITE, bold=True))
+
         choice = ask("Acción: ").strip().lower()
 
         if choice in {"", "r"}:
             continue
-        if choice == "v":
+        if choice in {"8", "v"}:
             break
-        if choice == "n":
+        if choice in {"3", "n"}:
             if page + 1 < total_pages:
                 page += 1
             else:
                 warn("Ya estás en la última página.")
                 press_enter()
             continue
-        if choice == "p":
+        if choice in {"4", "p"}:
             if page > 0:
                 page -= 1
             else:
                 warn("Ya estás en la primera página.")
                 press_enter()
             continue
-        if choice == "l":
+        if choice in {"2", "l"}:
             account_filter = None
             start = _default_start()
             end = None
             page = 0
             continue
-        if choice == "c":
+        if choice in {"7", "c"}:
             menu_supabase()
             continue
-        if choice == "f":
+        if choice in {"1", "f"}:
             account = ask("Filtrar por cuenta (vacío = todas): ").strip()
             account_filter = account or None
             start_candidate = ask("Desde (YYYY-MM-DD, vacío = sin límite): ")
@@ -149,7 +173,7 @@ def menu_conversation_state() -> None:
             start = parsed_start
             page = 0
             continue
-        if choice == "e":
+        if choice in {"5", "e"}:
             if not rows:
                 warn("No hay datos para exportar.")
                 press_enter()
@@ -158,7 +182,7 @@ def menu_conversation_state() -> None:
             ok(f"CSV generado en: {path}")
             press_enter()
             continue
-        if choice == "d":
+        if choice in {"6", "d"}:
             cutoff = datetime.now(TZ) - timedelta(days=30)
             removed = purge_conversations_before(cutoff)
             ok(f"Se eliminaron {removed} registros anteriores al último mes.")
