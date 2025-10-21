@@ -345,10 +345,35 @@ def _desktop_root() -> Path:
             return candidate
 
     home = Path.home()
-    candidates = [home / "Desktop", home / "Escritorio"]
+    candidates: List[Path] = []
+
+    xdg_config = home / ".config" / "user-dirs.dirs"
+    if xdg_config.exists():
+        try:
+            content = xdg_config.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            content = ""
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("XDG_DESKTOP_DIR") and "=" in line:
+                _, value = line.split("=", 1)
+                value = value.strip().strip('"')
+                value = value.replace("$HOME", str(home))
+                candidates.append(Path(value))
+
+    for name in ("Desktop", "desktop", "Escritorio", "escritorio"):
+        candidates.append(home / name)
+
+    seen: set[Path] = set()
     for candidate in candidates:
-        if candidate.exists():
-            return candidate
+        resolved = candidate.expanduser()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.exists():
+            return resolved
 
     default = home / "Desktop"
     default.mkdir(parents=True, exist_ok=True)

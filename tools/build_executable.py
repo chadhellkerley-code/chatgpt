@@ -92,6 +92,26 @@ def _write_client_env(root: Path) -> None:
     )
 
 
+_HIDDEN_IMPORTS = [
+    "accounts",
+    "actions.hashtag_mode",
+    "app",
+    "config",
+    "ig",
+    "leads",
+    "licensekit",
+    "proxy_manager",
+    "responder",
+    "runtime",
+    "session_store",
+    "state_view",
+    "storage",
+    "totp_store",
+    "ui",
+    "utils",
+]
+
+
 def build_for_license(
     record: Dict[str, str], *, name: str | None = None
 ) -> Tuple[bool, Path | None, str]:
@@ -147,6 +167,9 @@ def build_for_license(
             f"{payload_path}{os.pathsep}storage",
             "client_launcher.py",
         ]
+
+        for module in _HIDDEN_IMPORTS:
+            command.extend(["--hidden-import", module])
 
         subprocess.run(command, check=True, cwd=workspace)
 
