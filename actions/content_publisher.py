@@ -577,6 +577,8 @@ def run_from_menu(alias: str) -> None:
     job.media_info = {}
     for media_path in job.media_paths:
         result = prepare_media_for_upload(media_path, job.kind, output_dir=PROCESSED_MEDIA_DIR)
+        for notice in result.get("notices", []):
+            warn(notice)
         if not result.get("ok"):
             reason = result.get("reason", "normalization_failed")
             warn(f"{media_path.name}: {reason}")

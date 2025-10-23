@@ -22,8 +22,18 @@ _VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 
 try:  # pragma: no cover - depende del entorno del operador
     from PIL import Image  # type: ignore
+
+    try:  # Pillow ≥ 9.1 expone la enumeración Resampling
+        _RESAMPLE_METHOD = Image.Resampling.LANCZOS  # type: ignore[attr-defined]
+    except AttributeError:  # pragma: no cover - versiones antiguas
+        _RESAMPLE_METHOD = getattr(Image, "ANTIALIAS", getattr(Image, "LANCZOS", Image.BICUBIC))
+    else:  # pragma: no cover - asegurar compatibilidad retro
+        if not hasattr(Image, "ANTIALIAS"):
+            # MoviePy <=1.0.3 aún referencia Image.ANTIALIAS
+            Image.ANTIALIAS = _RESAMPLE_METHOD  # type: ignore[attr-defined]
 except Exception:  # noqa: S110
     Image = None  # type: ignore
+    _RESAMPLE_METHOD = None
 
 _MOVIEPY = None
 _MOVIEPY_ERROR = None
@@ -144,6 +154,11 @@ def normalize_video(
     ffmpeg_bin = shutil.which("ffmpeg")
     success = False
     ffmpeg_reason = None
+    notices: list[str] = []
+    if not ffmpeg_bin:
+        notices.append(
+            "⚠️ El archivo no pudo procesarse. Se intentará convertir automáticamente a un formato compatible..."
+        )
     if ffmpeg_bin:
         filter_chain = _video_filter_for(target)
         cmd = [
@@ -185,12 +200,15 @@ def normalize_video(
         except subprocess.CalledProcessError as exc:
             ffmpeg_reason = f"transcode_failed:{exc.returncode}"
             logger.warning("ffmpeg no pudo convertir %s: %s", src.name, exc)
+            notices.append(
+                "⚠️ El archivo no pudo procesarse. Se intentará convertir automáticamente a un formato compatible..."
+            )
 
     if not success:
         moviepy = _ensure_moviepy()
         if moviepy is None:
             reason = ffmpeg_reason or "missing_dependency:moviepy==1.0.3"
-            return {"ok": False, "reason": reason}
+            return {"ok": False, "reason": reason, "notices": notices}
         try:
             with moviepy.VideoFileClip(str(src)) as clip:
                 target_size = _target_video_size(target)
@@ -212,7 +230,10 @@ def normalize_video(
                 )
             success = True
         except Exception as exc:  # pragma: no cover
-            return {"ok": False, "reason": f"moviepy_error:{exc}"}
+            notices.append(
+                "⚠️ El archivo no pudo procesarse. Se intentará convertir automáticamente a un formato compatible..."
+            )
+            return {"ok": False, "reason": f"moviepy_error:{exc}", "notices": notices}
         finally:
             temp_audio = output.with_suffix(".temp.m4a")
             if temp_audio.exists():
@@ -221,7 +242,7 @@ def normalize_video(
     meta = _probe_video(output)
     thumb = _ensure_thumbnail(output, is_video=True)
     if not thumb["ok"]:
-        return {"ok": False, "reason": thumb["reason"]}
+        return {"ok": False, "reason": thumb["reason"], "notices": notices}
 
     return {
         "ok": True,
@@ -229,6 +250,7 @@ def normalize_video(
         "media_path": str(output),
         "thumb_path": thumb.get("thumb_path"),
         "meta": meta or {},
+        "notices": notices,
     }
 
 
@@ -307,7 +329,7 @@ def _letterbox_image(img, target_size: tuple[int, int]):  # type: ignore[no-unty
     scale = min(target_w / width, target_h / height)
     scaled_w = int(round(width * scale))
     scaled_h = int(round(height * scale))
-    resample = getattr(Image, 'LANCZOS', getattr(Image, 'BICUBIC', Image.NEAREST))
+    resample = _RESAMPLE_METHOD or getattr(Image, "LANCZOS", getattr(Image, "BICUBIC", Image.NEAREST))
     resized = img.resize((scaled_w, scaled_h), resample=resample)
     background = Image.new("RGB", target_size, (0, 0, 0))
     offset = ((target_w - scaled_w) // 2, (target_h - scaled_h) // 2)
