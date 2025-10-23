@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import logging
+import warnings
 from typing import Optional
 
 from ui import (
@@ -99,4 +101,24 @@ def bullet(msg: str) -> None:
 def env_hint(key: str, value: str | None) -> str:
     shown = value if value else "(sin definir)"
     return f"{key} = {shown}"
+
+
+def enable_quiet_mode() -> None:
+    """Silencia warnings y logs ruidosos de dependencias externas."""
+
+    warnings.filterwarnings("ignore")
+
+    noisy_loggers = (
+        "urllib3",
+        "requests",
+        "httpx",
+        "moviepy",
+        "PIL.Image",
+        "charset_normalizer",
+    )
+
+    for name in noisy_loggers:
+        logging.getLogger(name).setLevel(logging.ERROR)
+
+    logging.getLogger().setLevel(logging.ERROR)
 

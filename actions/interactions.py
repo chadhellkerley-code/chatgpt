@@ -16,6 +16,7 @@ from typing import Callable, Iterable, List, Optional, Sequence
 from json import JSONDecodeError
 
 from accounts import get_account, list_all, mark_connected, prompt_login
+from actions.interactions_adapters import fetch_hashtag_reels
 from config import SETTINGS
 from proxy_manager import apply_proxy_to_client, record_proxy_failure, should_retry_proxy
 from runtime import (
@@ -28,7 +29,7 @@ from runtime import (
 )
 from session_store import has_session, load_into
 from ui import Fore, banner, full_line, style_text
-from utils import ask, ask_int, ask_multiline, ok, press_enter, warn
+from utils import ask, ask_int, ask_multiline, enable_quiet_mode, ok, press_enter, warn
 
 logger = logging.getLogger(__name__)
 
@@ -235,8 +236,16 @@ def _prepare_comments() -> List[str]:
     return lines
 
 
-def _normalize_hashtag(hashtag: str) -> str:
-    return hashtag.lstrip("#").strip()
+def _sanitize_hashtag(raw) -> str | None:
+    if raw is None:
+        return None
+    tag = str(raw).strip()
+    if not tag:
+        return None
+    tag = tag.lstrip("#").strip()
+    if not tag:
+        return None
+    return tag.lower()
 
 
 def _safe_media_pk_from_url(client, url: str) -> Optional[str]:
@@ -333,31 +342,13 @@ def _try_methods(client, method_names: Iterable[str], *args, amount: int | None 
 
 
 def _targets_from_hashtag(client, hashtag: str, limit: int, kind: str):
-    hashtag = _normalize_hashtag(hashtag)
+    hashtag = _sanitize_hashtag(hashtag)
     if not hashtag:
         return []
     amount = max(limit * 3, 40)
     try:
         if kind == "reel":
-            reels = _try_methods(
-                client,
-                (
-                    "hashtag_medias_reels_v1",
-                    "hashtag_medias_reels",
-                    "hashtag_medias_recent",
-                    "hashtag_medias_recent_v1",
-                    "hashtag_medias",
-                ),
-                hashtag,
-                amount=amount,
-            )
-            filtered = [
-                media
-                for media in reels
-                if "clip" in getattr(media, "product_type", "").lower()
-                or getattr(media, "media_type", "").lower() == "clip"
-            ]
-            return list(filtered)[:limit]
+            return list(fetch_hashtag_reels(client, hashtag, limit))
         medias = list(
             _try_methods(
                 client,
@@ -527,7 +518,7 @@ def _fetch_reels(client, source: str, hashtag: str, amount: int):
     try:
         def _operation():
             if source == "hashtag":
-                return _targets_from_hashtag(client, hashtag, amount, "reel")
+                return fetch_hashtag_reels(client, hashtag, amount)
             return _try_methods(
                 client,
                 (
@@ -542,13 +533,23 @@ def _fetch_reels(client, source: str, hashtag: str, amount: int):
             )
 
         reels = _execute_with_retry(_operation) or []
-        filtered = [
-            media
-            for media in reels
-            if "clip" in str(getattr(media, "product_type", "")).lower()
-            or getattr(media, "media_type", None) in (2, "clip")
-        ]
-        return list(filtered)[:amount]
+        filtered = []
+        for media in reels:
+            product_type = getattr(media, "product_type", None)
+            media_type = getattr(media, "media_type", None)
+
+            product_label = product_type.lower() if isinstance(product_type, str) else ""
+            if product_label in ("clips", "reel"):
+                filtered.append(media)
+            elif media_type == 2:
+                filtered.append(media)
+            elif isinstance(media_type, str) and media_type.lower() in ("clip", "video"):
+                filtered.append(media)
+
+            if len(filtered) >= amount:
+                break
+
+        return filtered[:amount]
     except Exception as exc:
         logger.warning("No se pudieron obtener reels (%s): %s", source, exc, exc_info=False)
         return []
@@ -670,6 +671,7 @@ def _print_summary(title: str, summaries: List[InteractionSummary], start: float
 
 
 def _run_comment_flow(alias: str) -> None:
+    enable_quiet_mode()
     banner()
     print(style_text("🎯 Interacciones - Comentarios", color=Fore.CYAN, bold=True))
     print(full_line())
@@ -717,9 +719,9 @@ def _run_comment_flow(alias: str) -> None:
             press_enter()
             return
     else:
-        hashtag = _normalize_hashtag(ask("Hashtag (sin #): ").strip())
+        hashtag = _sanitize_hashtag(ask("Hashtag (sin #): ").strip())
         if not hashtag:
-            warn("Debés indicar un hashtag.")
+            warn("Ingresá un hashtag válido.")
             press_enter()
             return
 
@@ -790,6 +792,7 @@ def _run_comment_flow(alias: str) -> None:
 
 
 def _run_reel_flow(alias: str) -> None:
+    enable_quiet_mode()
     banner()
     print(style_text("🎯 Interacciones - Ver & Like Reels", color=Fore.CYAN, bold=True))
     print(full_line())
@@ -806,7 +809,11 @@ def _run_reel_flow(alias: str) -> None:
     source = "hashtag" if source_choice != "2" else "explore"
     hashtag = ""
     if source == "hashtag":
-        hashtag = _normalize_hashtag(ask("Hashtag (sin #): ").strip())
+        hashtag = _sanitize_hashtag(ask("Hashtag (sin #): ").strip())
+        if not hashtag:
+            warn("Ingresá un hashtag válido.")
+            press_enter()
+            return
     amount = ask_int("Cantidad de reels por cuenta: ", min_value=1, default=5)
     like = ask("¿Dar like? (s/N): ").strip().lower() == "s"
     delay_min = ask_int("Delay mínimo entre reels (seg): ", min_value=0, default=5)
