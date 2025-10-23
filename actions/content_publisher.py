@@ -7,8 +7,6 @@ import hashlib
 import logging
 import os
 import random
-import subprocess
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -30,6 +28,7 @@ from runtime import (
 from session_store import has_session, load_into
 from ui import Fore, banner, full_line, style_text
 from utils import ask, ask_int, ask_multiline, ok, press_enter, warn
+from media_norm import normalize_image, prepare_media_for_upload
 
 logger = logging.getLogger(__name__)
 
@@ -43,23 +42,6 @@ PROCESSED_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 _VIDEO_EXTS = {".mp4", ".mov", ".m4v"}
 
-try:  # pragma: no cover - depende del entorno del operador
-    from PIL import Image  # type: ignore
-except Exception:  # noqa: S110 - si Pillow no está instalado se gestiona más adelante
-    Image = None  # type: ignore
-
-_MOVIEPY_MODULE = None
-_MOVIEPY_FAILED = False
-
-
-class InvalidMediaError(Exception):
-    """Error controlado cuando un archivo multimedia no es válido."""
-
-    def __init__(self, path: Path, reason: str) -> None:
-        message = f"{path.name}: {reason}"
-        super().__init__(message)
-        self.path = path
-        self.reason = reason
 
 
 @dataclass
@@ -77,6 +59,7 @@ class PublishJob:
     delay_min: int = 0
     delay_max: int = 0
     omitted_media: List[tuple[Path, str]] = field(default_factory=list)
+    media_info: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -211,193 +194,10 @@ def _prompt_media_paths(kind: str) -> List[Path]:
     return paths
 
 
-def _hash_for_path(path: Path) -> str:
-    stat = path.stat()
-    payload = f"{path.resolve()}::{stat.st_size}::{stat.st_mtime}".encode("utf-8")
-    return hashlib.md5(payload).hexdigest()[:10]
 
 
-def _ensure_moviepy():
-    global _MOVIEPY_MODULE, _MOVIEPY_FAILED
-    if _MOVIEPY_MODULE is not None:
-        return _MOVIEPY_MODULE
-    if _MOVIEPY_FAILED:
-        raise RuntimeError(
-            "moviepy==1.0.3 no está disponible. Instalalo manualmente para publicar videos."
-        )
-    try:
-        import moviepy.editor as mpe  # type: ignore
-
-        _MOVIEPY_MODULE = mpe
-        return mpe
-    except Exception:
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "moviepy==1.0.3"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            import moviepy.editor as mpe  # type: ignore
-
-            _MOVIEPY_MODULE = mpe
-            return mpe
-        except Exception as exc:  # pragma: no cover - depende del sistema
-            _MOVIEPY_FAILED = True
-            raise RuntimeError(
-                "Error al instalar moviepy==1.0.3. Instalalo manualmente para subir videos."
-            ) from exc
 
 
-def _run_ffprobe(path: Path) -> tuple[bool, Optional[str]]:
-    """Intenta validar un archivo de video usando ffprobe, si está disponible."""
-
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(path),
-    ]
-    try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        return True, None
-    except FileNotFoundError:
-        return False, "ffprobe_not_found"
-    except subprocess.CalledProcessError as exc:
-        return False, f"ffprobe_error: {exc}"
-
-
-def _validate_image(path: Path) -> None:
-    if Image is None:
-        raise InvalidMediaError(path, "missing_dependency: Pillow")
-    try:
-        with Image.open(path) as img:
-            img.verify()
-    except Exception as exc:
-        raise InvalidMediaError(path, f"image_error: {exc}") from exc
-
-
-def _validate_video(path: Path) -> None:
-    try:
-        module = _ensure_moviepy()
-    except RuntimeError as exc:
-        ok_ffprobe, ffprobe_reason = _run_ffprobe(path)
-        if ok_ffprobe:
-            return
-        reason = ffprobe_reason or "missing_dependency: moviepy==1.0.3"
-        raise InvalidMediaError(path, reason) from exc
-
-    clip = None
-    try:
-        clip = module.VideoFileClip(str(path))
-        if getattr(clip, "duration", 0) == 0:
-            raise InvalidMediaError(path, "video_error: duración inválida")
-    except InvalidMediaError:
-        raise
-    except Exception as exc:
-        ok_ffprobe, ffprobe_reason = _run_ffprobe(path)
-        if ok_ffprobe:
-            return
-        reason = ffprobe_reason or f"video_error: {exc}"
-        raise InvalidMediaError(path, reason) from exc
-    finally:
-        if clip is not None:
-            try:
-                clip.close()
-            except Exception:
-                pass
-
-
-def _validate_media_file(path: Path) -> None:
-    suffix = path.suffix.lower()
-    if suffix in _IMAGE_EXTS:
-        _validate_image(path)
-    elif suffix in _VIDEO_EXTS:
-        _validate_video(path)
-    else:
-        raise InvalidMediaError(path, "unsupported_extension")
-
-
-def _prepare_video(path: Path) -> Path:
-    if path.suffix.lower() == ".mp4":
-        return path
-    try:
-        module = _ensure_moviepy()
-    except RuntimeError as exc:
-        raise InvalidMediaError(path, "missing_dependency: moviepy==1.0.3") from exc
-    output = PROCESSED_MEDIA_DIR / f"{path.stem}_{_hash_for_path(path)}.mp4"
-    if output.exists() and output.stat().st_mtime >= path.stat().st_mtime:
-        return output
-    output.parent.mkdir(parents=True, exist_ok=True)
-    clip = None
-    target = None
-    temp_audio = output.with_suffix(".temp-audio.m4a")
-    try:
-        clip = module.VideoFileClip(str(path))
-        target = clip
-        if getattr(clip, "h", 0) and clip.h > 1080:
-            target = clip.resize(height=1080)
-        target.write_videofile(
-            str(output),
-            codec="libx264",
-            audio_codec="aac",
-            temp_audiofile=str(temp_audio),
-            remove_temp=True,
-            bitrate="3500k",
-            preset="medium",
-            threads=max(os.cpu_count() or 2, 2),
-            logger=None,
-        )
-    except Exception as exc:
-        raise InvalidMediaError(path, f"video_conversion_error: {exc}") from exc
-    finally:
-        if target is not None:
-            try:
-                target.close()
-            except Exception:
-                pass
-        if clip is not None and target is not clip:
-            try:
-                clip.close()
-            except Exception:
-                pass
-        if temp_audio.exists():
-            try:
-                temp_audio.unlink()
-            except Exception:
-                pass
-    return output
-
-
-def _prepare_image(path: Path) -> Path:
-    if path.suffix.lower() != ".webp":
-        return path
-    if Image is None:
-        raise InvalidMediaError(path, "missing_dependency: Pillow")
-    output = PROCESSED_MEDIA_DIR / f"{path.stem}_{_hash_for_path(path)}.jpg"
-    if output.exists() and output.stat().st_mtime >= path.stat().st_mtime:
-        return output
-    output.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with Image.open(path) as img:
-            img = img.convert("RGB")
-            img.save(output, "JPEG", quality=92)
-    except Exception as exc:
-        raise InvalidMediaError(path, f"image_conversion_error: {exc}") from exc
-    return output
-
-
-def _prepare_media(path: Path) -> Path:
-    _validate_media_file(path)
-    suffix = path.suffix.lower()
-    if suffix in _VIDEO_EXTS:
-        return _prepare_video(path)
-    if suffix == ".webp":
-        return _prepare_image(path)
-    return path
 
 
 def _format_upload_error(kind: str, exc: Exception) -> str:
@@ -538,9 +338,23 @@ def _publish_story(alias: str, client, username: str, job: PublishJob, summary: 
     for media_path in job.media_paths:
         if STOP_EVENT.is_set():
             break
+        info = job.media_info.get(str(media_path))
+        thumb = info.get("thumb_path") if info else None
+        if media_path.suffix.lower() in _VIDEO_EXTS and not thumb:
+            summary.omitted += 1
+            reason = "thumb_error:thumbnail_incompleto"
+            summary.messages.append(f"⏭️ {media_path.name} omitido: {reason}")
+            logger.warning("Thumbnail no disponible para %s", media_path)
+            _append_publish_log(alias, username, job, False, f"omitido:{media_path.name}:{reason}")
+            continue
         try:
             if media_path.suffix.lower() in _VIDEO_EXTS:
-                result = client.video_upload_to_story(str(media_path), caption=caption, links=links or None)
+                result = client.video_upload_to_story(
+                    str(media_path),
+                    caption=caption,
+                    links=links or None,
+                    thumbnail=thumb,
+                )
             else:
                 result = client.photo_upload_to_story(str(media_path), caption=caption, links=links or None)
             summary.uploaded += 1
@@ -570,8 +384,22 @@ def _publish_post(alias: str, client, username: str, job: PublishJob, summary: P
             result = client.album_upload([str(p) for p in job.media_paths], caption=caption, usertags=usertags)
         else:
             media = job.media_paths[0]
+            info = job.media_info.get(str(media))
+            thumb = info.get("thumb_path") if info else None
+            if media.suffix.lower() in _VIDEO_EXTS and not thumb:
+                summary.omitted += 1
+                reason = "thumb_error:thumbnail_incompleto"
+                summary.messages.append(f"⏭️ {media.name} omitido: {reason}")
+                logger.warning("Thumbnail no disponible para %s", media)
+                _append_publish_log(alias, username, job, False, f"omitido:{media.name}:{reason}")
+                return
             if media.suffix.lower() in _VIDEO_EXTS:
-                result = client.video_upload(str(media), caption=caption, usertags=usertags)
+                result = client.video_upload(
+                    str(media),
+                    caption=caption,
+                    usertags=usertags,
+                    thumbnail=thumb,
+                )
             else:
                 result = client.photo_upload(str(media), caption=caption, usertags=usertags)
         summary.uploaded += 1
@@ -727,31 +555,30 @@ def run_from_menu(alias: str) -> None:
     original_names = [path.name for path in job.media_paths]
     validated_media: List[Path] = []
     omitted: List[tuple[Path, str]] = []
+    job.media_info = {}
     for media_path in job.media_paths:
-        try:
-            validated_media.append(_prepare_media(media_path))
-        except InvalidMediaError as exc:
-            warn(str(exc))
-            omitted.append((media_path, exc.reason))
-        except RuntimeError as exc:
-            warn(str(exc))
-            omitted.append((media_path, str(exc)))
+        result = prepare_media_for_upload(media_path, job.kind, output_dir=PROCESSED_MEDIA_DIR)
+        if not result.get("ok"):
+            reason = result.get("reason", "normalization_failed")
+            warn(f"{media_path.name}: {reason}")
+            omitted.append((media_path, reason))
+            continue
+        normalized = Path(result["media_path"])
+        job.media_info[str(normalized)] = result
+        validated_media.append(normalized)
     job.media_paths = validated_media
     job.omitted_media = omitted
 
     if job.cover_path:
         cover_path = job.cover_path
-        try:
-            _validate_media_file(cover_path)
-            job.cover_path = _prepare_image(cover_path)
-        except InvalidMediaError as exc:
-            warn(f"Portada omitida ({cover_path.name}): {exc.reason}")
-            job.omitted_media.append((cover_path, exc.reason))
+        result = normalize_image(cover_path, target="reel_cover", output_dir=PROCESSED_MEDIA_DIR)
+        if not result.get("ok"):
+            reason = result.get("reason", "cover_normalization_failed")
+            warn(f"Portada omitida ({cover_path.name}): {reason}")
+            job.omitted_media.append((cover_path, reason))
             job.cover_path = None
-        except RuntimeError as exc:
-            warn(str(exc))
-            job.omitted_media.append((cover_path, str(exc)))
-            job.cover_path = None
+        else:
+            job.cover_path = Path(result["media_path"])
 
     if not job.media_paths:
         warn("No hay archivos válidos para publicar. Revisá los formatos e intentá nuevamente.")
