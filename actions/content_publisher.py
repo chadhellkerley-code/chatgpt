@@ -9,6 +9,7 @@ import os
 import random
 import threading
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
@@ -32,6 +33,23 @@ from utils import ask, ask_int, ask_multiline, ok, press_enter, warn
 from media_norm import normalize_image, prepare_media_for_upload
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_quiet_dependencies() -> None:
+    """Silence noisy third-party warnings during publicaciones."""
+
+    warnings.filterwarnings("ignore", category=UserWarning, module=r"moviepy\..*")
+    warnings.filterwarnings("ignore", category=UserWarning, module=r"imageio\..*")
+    warnings.filterwarnings("ignore", category=UserWarning, module=r"PIL\..*")
+
+    os.environ.setdefault("MOVIEPY_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("IMAGEIO_FFMPEG_LOG_LEVEL", "error")
+
+    for name in ("moviepy", "imageio", "PIL", "instagrapi"):
+        logging.getLogger(name).setLevel(logging.ERROR)
+
+
+_configure_quiet_dependencies()
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "storage" / "data"
