@@ -95,6 +95,8 @@ def _write_client_env(root: Path) -> None:
 _HIDDEN_IMPORTS = [
     "accounts",
     "actions.hashtag_mode",
+    "actions.content_publisher",
+    "actions.interactions",
     "app",
     "config",
     "ig",

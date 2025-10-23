@@ -304,6 +304,28 @@ def _launch_hashtag_mode(alias: str) -> None:
     hashtag_mode.run_from_menu(chosen)
 
 
+def _launch_content_publisher(alias: str) -> None:
+    try:
+        from actions import content_publisher
+    except Exception as exc:  # pragma: no cover - módulo opcional
+        warn(f"No se pudo iniciar el módulo de publicaciones: {exc}")
+        press_enter()
+        return
+
+    content_publisher.run_from_menu(alias)
+
+
+def _launch_interactions(alias: str) -> None:
+    try:
+        from actions import interactions
+    except Exception as exc:  # pragma: no cover - módulo opcional
+        warn(f"No se pudo iniciar el módulo de interacciones: {exc}")
+        press_enter()
+        return
+
+    interactions.run_from_menu(alias)
+
+
 def _login_and_save_session(account: Dict, password: str) -> bool:
     """Login con instagrapi y guarda sesión en storage/sessions."""
 
@@ -387,7 +409,9 @@ def menu_accounts():
         print("4) Iniciar sesión y guardar sesiónid (auto en TODAS del alias)")
         print("5) Iniciar sesión y guardar sesión ID (seleccionar cuenta)")
         print("6) Modo de exploración automática por hashtag (nuevo)")
-        print("7) Volver\n")
+        print("7) 📤 Subir contenidos (Historias / Post / Reels)")
+        print("8) 🎯 Interacciones (Comentar / Ver & Like Reels)")
+        print("9) Volver\n")
 
         op = ask("Opción: ").strip()
         if op == "1":
@@ -503,6 +527,10 @@ def menu_accounts():
         elif op == "6":
             _launch_hashtag_mode(alias)
         elif op == "7":
+            _launch_content_publisher(alias)
+        elif op == "8":
+            _launch_interactions(alias)
+        elif op == "9":
             break
         else:
             warn("Opción inválida.")
