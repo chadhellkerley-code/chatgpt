@@ -56,7 +56,8 @@ class InvalidMediaError(Exception):
     """Error controlado cuando un archivo multimedia no es válido."""
 
     def __init__(self, path: Path, reason: str) -> None:
-        super().__init__(reason)
+        message = f"{path.name}: {reason}"
+        super().__init__(message)
         self.path = path
         self.reason = reason
 
@@ -247,48 +248,61 @@ def _ensure_moviepy():
             ) from exc
 
 
-def _run_ffprobe(path: Path) -> bool:
+def _run_ffprobe(path: Path) -> tuple[bool, Optional[str]]:
     """Intenta validar un archivo de video usando ffprobe, si está disponible."""
 
-    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)]
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
     try:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        return True
+        return True, None
     except FileNotFoundError:
-        return False
-    except subprocess.CalledProcessError:
-        return False
+        return False, "ffprobe_not_found"
+    except subprocess.CalledProcessError as exc:
+        return False, f"ffprobe_error: {exc}"
 
 
 def _validate_image(path: Path) -> None:
     if Image is None:
-        return
+        raise InvalidMediaError(path, "missing_dependency: Pillow")
     try:
         with Image.open(path) as img:
             img.verify()
     except Exception as exc:
-        raise InvalidMediaError(path, f"Imagen inválida o corrupta: {exc}") from exc
+        raise InvalidMediaError(path, f"image_error: {exc}") from exc
 
 
 def _validate_video(path: Path) -> None:
     try:
         module = _ensure_moviepy()
     except RuntimeError as exc:
-        if _run_ffprobe(path):
+        ok_ffprobe, ffprobe_reason = _run_ffprobe(path)
+        if ok_ffprobe:
             return
-        raise InvalidMediaError(path, str(exc)) from exc
+        reason = ffprobe_reason or "missing_dependency: moviepy==1.0.3"
+        raise InvalidMediaError(path, reason) from exc
 
     clip = None
     try:
         clip = module.VideoFileClip(str(path))
         if getattr(clip, "duration", 0) == 0:
-            raise InvalidMediaError(path, "El video no contiene fotogramas válidos.")
+            raise InvalidMediaError(path, "video_error: duración inválida")
     except InvalidMediaError:
         raise
     except Exception as exc:
-        if _run_ffprobe(path):
+        ok_ffprobe, ffprobe_reason = _run_ffprobe(path)
+        if ok_ffprobe:
             return
-        raise InvalidMediaError(path, f"Video inválido o corrupto: {exc}") from exc
+        reason = ffprobe_reason or f"video_error: {exc}"
+        raise InvalidMediaError(path, reason) from exc
     finally:
         if clip is not None:
             try:
@@ -303,12 +317,17 @@ def _validate_media_file(path: Path) -> None:
         _validate_image(path)
     elif suffix in _VIDEO_EXTS:
         _validate_video(path)
+    else:
+        raise InvalidMediaError(path, "unsupported_extension")
 
 
 def _prepare_video(path: Path) -> Path:
-    module = _ensure_moviepy()
     if path.suffix.lower() == ".mp4":
         return path
+    try:
+        module = _ensure_moviepy()
+    except RuntimeError as exc:
+        raise InvalidMediaError(path, "missing_dependency: moviepy==1.0.3") from exc
     output = PROCESSED_MEDIA_DIR / f"{path.stem}_{_hash_for_path(path)}.mp4"
     if output.exists() and output.stat().st_mtime >= path.stat().st_mtime:
         return output
@@ -333,7 +352,7 @@ def _prepare_video(path: Path) -> Path:
             logger=None,
         )
     except Exception as exc:
-        raise RuntimeError(f"No se pudo convertir el video {path.name}: {exc}") from exc
+        raise InvalidMediaError(path, f"video_conversion_error: {exc}") from exc
     finally:
         if target is not None:
             try:
@@ -357,9 +376,7 @@ def _prepare_image(path: Path) -> Path:
     if path.suffix.lower() != ".webp":
         return path
     if Image is None:
-        raise RuntimeError(
-            "Se necesita Pillow>=8.1.1 para convertir imágenes .webp antes de publicarlas."
-        )
+        raise InvalidMediaError(path, "missing_dependency: Pillow")
     output = PROCESSED_MEDIA_DIR / f"{path.stem}_{_hash_for_path(path)}.jpg"
     if output.exists() and output.stat().st_mtime >= path.stat().st_mtime:
         return output
@@ -369,7 +386,7 @@ def _prepare_image(path: Path) -> Path:
             img = img.convert("RGB")
             img.save(output, "JPEG", quality=92)
     except Exception as exc:
-        raise RuntimeError(f"No se pudo convertir la imagen {path.name}: {exc}") from exc
+        raise InvalidMediaError(path, f"image_conversion_error: {exc}") from exc
     return output
 
 

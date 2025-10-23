@@ -5,12 +5,15 @@ from __future__ import annotations
 import csv
 import logging
 import random
+import re
 import time
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Iterable, List, Sequence
+from typing import Callable, Iterable, List, Optional, Sequence
+
+from json import JSONDecodeError
 
 from accounts import get_account, list_all, mark_connected, prompt_login
 from config import SETTINGS
@@ -33,6 +36,46 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "storage" / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 INTERACTIONS_LOG = DATA_DIR / "interactions_log.csv"
+
+try:  # pragma: no cover - dependerá del runtime real
+    import requests
+
+    REQUEST_ERRORS = (requests.exceptions.RequestException,)
+except Exception:  # pragma: no cover - requests siempre está pero mantenemos fallback
+    REQUEST_ERRORS = ()
+
+_SHORTCODE_RE = re.compile(r"/(?:p|reel|tv)/([A-Za-z0-9_-]{5,})")
+_REEL_RE = re.compile(r"/(?:reel|clips)/([A-Za-z0-9_-]{5,})")
+_STORY_RE = re.compile(r"/stories/[^/]+/([0-9]+)")
+
+
+def _is_transient(exc: Exception) -> bool:
+    if isinstance(exc, JSONDecodeError):
+        return True
+    if isinstance(exc, REQUEST_ERRORS):
+        return True
+    if isinstance(exc, KeyError) and exc.args and exc.args[0] == "data":
+        return True
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status and status >= 500:
+        return True
+    return False
+
+
+def _execute_with_retry(operation: Callable[[], object], attempts: int = 3) -> object:
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except Exception as exc:  # pragma: no cover - dependiente de red/API
+            last_exc = exc
+            if attempt >= attempts or not _is_transient(exc):
+                raise
+            backoff = 2 * attempt + random.uniform(0.0, 1.5)
+            sleep_with_stop(max(1, int(backoff)))
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Operación sin resultado")
 
 
 @dataclass
@@ -196,6 +239,62 @@ def _normalize_hashtag(hashtag: str) -> str:
     return hashtag.lstrip("#").strip()
 
 
+def _safe_media_pk_from_url(client, url: str) -> Optional[str]:
+    try:
+        return client.media_pk_from_url(url)
+    except Exception as exc:
+        logger.debug("media_pk_from_url falló: %s", exc)
+        match = _SHORTCODE_RE.search(url) or _REEL_RE.search(url)
+        if not match:
+            return None
+        code = match.group(1)
+        try:
+            return client.media_pk_from_code(code)
+        except Exception as inner_exc:
+            logger.debug("media_pk_from_code falló: %s", inner_exc)
+            return None
+
+
+def _safe_story_pk_from_url(client, url: str) -> Optional[str]:
+    try:
+        return client.story_pk_from_url(url)
+    except Exception as exc:
+        logger.debug("story_pk_from_url falló: %s", exc)
+        match = _STORY_RE.search(url)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _safe_user_stories(client, user_id: str):
+    stories = _try_methods(
+        client,
+        (
+            "user_stories",
+            "user_stories_v1",
+            "user_reels",
+            "user_story_feed",
+        ),
+        user_id,
+    )
+    return stories or []
+
+
+def _safe_user_medias(client, user_id: str, limit: int):
+    medias = _try_methods(
+        client,
+        (
+            "user_medias",
+            "user_medias_v1",
+            "user_feed",
+            "user_medias_paginated",
+        ),
+        user_id,
+        amount=limit,
+    )
+    return list(medias or [])[:limit]
+
+
 def _try_methods(client, method_names: Iterable[str], *args, amount: int | None = None):
     """Ejecuta el primer método disponible del cliente manejando firmas variadas."""
 
@@ -268,6 +367,7 @@ def _targets_from_hashtag(client, hashtag: str, limit: int, kind: str):
                     "hashtag_medias_top",
                     "hashtag_medias_top_v1",
                     "hashtag_medias",
+                    "hashtag_medias_v1",
                 ),
                 hashtag,
                 amount=amount,
@@ -285,7 +385,7 @@ def _targets_from_hashtag(client, hashtag: str, limit: int, kind: str):
                     continue
                 seen_users.add(user_id)
                 try:
-                    stories = client.user_stories(user_id) or []
+                    stories = _safe_user_stories(client, user_id) or []
                 except Exception as story_exc:
                     logger.debug("Historias no disponibles para usuario %s: %s", user_id, story_exc)
                     continue
@@ -318,25 +418,68 @@ def _targets_from_urls(client, entries: Sequence[str], kind: str):
                 continue
             if value.startswith("http"):
                 if kind == "story":
-                    pk = client.story_pk_from_url(value)
+                    pk = _safe_story_pk_from_url(client, value)
                     if pk:
                         results.append(pk)
+                    else:
+                        logger.warning("No se pudo resolver la historia: %s", value)
                 else:
-                    pk = client.media_pk_from_url(value)
+                    pk = _safe_media_pk_from_url(client, value)
                     if pk:
                         results.append(pk)
+                    else:
+                        logger.warning("No se pudo resolver el enlace: %s", value)
             else:
                 user = value.lstrip("@")
                 user_id = client.user_id_from_username(user)
                 if kind == "story":
-                    stories = client.user_stories(user_id) or []
+                    stories = _safe_user_stories(client, user_id)
+                    if not stories:
+                        logger.warning("No hay historias disponibles para @%s", user)
                     results.extend(stories)
                 else:
-                    medias = client.user_medias(user_id, amount=12) or []
+                    medias = _safe_user_medias(client, user_id, limit=12)
+                    if not medias:
+                        logger.warning("No hay publicaciones recientes para @%s", user)
                     results.extend(medias)
         except Exception as exc:
             logger.warning("No se pudo resolver %s: %s", value, exc, exc_info=False)
     return results
+
+
+def _comment_story_target(client, target, comment: str) -> None:
+    pk = target.pk if hasattr(target, "pk") else target
+    last_error: Optional[Exception] = None
+    for name in ("story_comment", "story_comment_v1", "story_comment_v2"):
+        method = getattr(client, name, None)
+        if not callable(method):
+            continue
+        try:
+            method(pk, comment)
+            return
+        except AttributeError as exc:
+            last_error = exc
+            continue
+        except Exception:
+            raise
+    fallback = getattr(client, "media_comment", None)
+    if callable(fallback):
+        try:
+            fallback(pk, comment)
+            return
+        except Exception as exc:
+            last_error = exc
+    if last_error and not isinstance(last_error, AttributeError):
+        raise last_error
+    raise NotImplementedError("missing_method: story_comment")
+
+
+def _comment_media_target(client, target, comment: str) -> None:
+    pk = target.pk if hasattr(target, "pk") else target
+    method = getattr(client, "media_comment", None)
+    if not callable(method):
+        raise NotImplementedError("missing_method: media_comment")
+    method(pk, comment)
 
 
 def _comment_on_targets(alias: str, username: str, client, targets, templates, delay_range, limit, kind: str) -> InteractionSummary:
@@ -348,22 +491,28 @@ def _comment_on_targets(alias: str, username: str, client, targets, templates, d
             break
         template = random.choice(templates)
         comment = _expand_spintax(template)
+        target_display = getattr(target, "code", getattr(target, "pk", str(target)))
         try:
-            if kind == "story":
-                client.story_comment(target.pk if hasattr(target, "pk") else target, comment)
-                target_display = getattr(target, "pk", str(target))
-            else:
-                pk = target.pk if hasattr(target, "pk") else target
-                client.media_comment(pk, comment)
-                target_display = getattr(target, "code", pk)
+            def _operation() -> None:
+                if kind == "story":
+                    _comment_story_target(client, target, comment)
+                else:
+                    _comment_media_target(client, target, comment)
+
+            _execute_with_retry(_operation)
             summary.performed += 1
             _append_interaction_log(alias, username, f"comentario_{kind}", target_display, True, comment[:80])
             logger.info("@%s comentó %s", username, target_display)
+        except NotImplementedError as exc:
+            summary.errors += 1
+            detail = f"Función no disponible para este destino: {exc}"
+            summary.messages.append(detail)
+            _append_interaction_log(alias, username, f"comentario_{kind}", target_display, False, detail)
         except Exception as exc:
             summary.errors += 1
             detail = f"Error comentando: {exc}"
             summary.messages.append(detail)
-            _append_interaction_log(alias, username, f"comentario_{kind}", str(target), False, detail)
+            _append_interaction_log(alias, username, f"comentario_{kind}", target_display, False, detail)
             if should_retry_proxy(exc):
                 record_proxy_failure(username, exc)
         delay = random.randint(delay_range[0], delay_range[1]) if delay_range[1] else delay_range[0]
@@ -376,10 +525,10 @@ def _comment_on_targets(alias: str, username: str, client, targets, templates, d
 
 def _fetch_reels(client, source: str, hashtag: str, amount: int):
     try:
-        if source == "hashtag":
-            reels = _targets_from_hashtag(client, hashtag, amount, "reel")
-        else:
-            reels = _try_methods(
+        def _operation():
+            if source == "hashtag":
+                return _targets_from_hashtag(client, hashtag, amount, "reel")
+            return _try_methods(
                 client,
                 (
                     "explore_reels",
@@ -391,11 +540,13 @@ def _fetch_reels(client, source: str, hashtag: str, amount: int):
                 ),
                 amount=max(amount * 3, 15),
             )
+
+        reels = _execute_with_retry(_operation) or []
         filtered = [
             media
-            for media in (reels or [])
-            if "clip" in getattr(media, "product_type", "").lower()
-            or getattr(media, "media_type", "").lower() == "clip"
+            for media in reels
+            if "clip" in str(getattr(media, "product_type", "")).lower()
+            or getattr(media, "media_type", None) in (2, "clip")
         ]
         return list(filtered)[:amount]
     except Exception as exc:
