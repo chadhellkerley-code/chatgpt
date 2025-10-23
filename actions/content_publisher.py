@@ -27,6 +27,7 @@ from runtime import (
 )
 from session_store import has_session, load_into
 from ui import Fore, banner, full_line, style_text
+from sdk_sanitize import clean_kwargs, ensure_list
 from utils import ask, ask_int, ask_multiline, ok, press_enter, warn
 from media_norm import normalize_image, prepare_media_for_upload
 
@@ -322,7 +323,7 @@ def _resolve_usertags(client, usernames: Sequence[str]):
         tags.append(
             Usertag(user=UserShort(pk=user_id, username=username), x=random.random(), y=random.random())
         )
-    return tags or None
+    return tags
 
 
 def _publish_story(alias: str, client, username: str, job: PublishJob, summary: PublishSummary) -> None:
@@ -348,15 +349,19 @@ def _publish_story(alias: str, client, username: str, job: PublishJob, summary: 
             _append_publish_log(alias, username, job, False, f"omitido:{media_path.name}:{reason}")
             continue
         try:
+            current_links = ensure_list(links)
+            common_kwargs = clean_kwargs(
+                client.video_upload_to_story
+                if media_path.suffix.lower() in _VIDEO_EXTS
+                else client.photo_upload_to_story,
+                caption=caption,
+                links=current_links,
+                thumbnail=thumb,
+            )
             if media_path.suffix.lower() in _VIDEO_EXTS:
-                result = client.video_upload_to_story(
-                    str(media_path),
-                    caption=caption,
-                    links=links or None,
-                    thumbnail=thumb,
-                )
+                result = client.video_upload_to_story(str(media_path), **common_kwargs)
             else:
-                result = client.photo_upload_to_story(str(media_path), caption=caption, links=links or None)
+                result = client.photo_upload_to_story(str(media_path), **common_kwargs)
             summary.uploaded += 1
             summary.media_ids.append(getattr(result, "pk", ""))
             logger.info("@%s publicó historia %s", username, media_path.name)
@@ -378,10 +383,15 @@ def _publish_story(alias: str, client, username: str, job: PublishJob, summary: 
 
 def _publish_post(alias: str, client, username: str, job: PublishJob, summary: PublishSummary) -> None:
     caption = _validate_caption("post", job.caption)
-    usertags = _resolve_usertags(client, job.tags)
+    usertags = ensure_list(_resolve_usertags(client, job.tags))
     try:
         if len(job.media_paths) > 1:
-            result = client.album_upload([str(p) for p in job.media_paths], caption=caption, usertags=usertags)
+            album_kwargs = clean_kwargs(
+                client.album_upload,
+                caption=caption,
+                usertags=usertags,
+            )
+            result = client.album_upload([str(p) for p in job.media_paths], **album_kwargs)
         else:
             media = job.media_paths[0]
             info = job.media_info.get(str(media))
@@ -394,14 +404,20 @@ def _publish_post(alias: str, client, username: str, job: PublishJob, summary: P
                 _append_publish_log(alias, username, job, False, f"omitido:{media.name}:{reason}")
                 return
             if media.suffix.lower() in _VIDEO_EXTS:
-                result = client.video_upload(
-                    str(media),
+                video_kwargs = clean_kwargs(
+                    client.video_upload,
                     caption=caption,
                     usertags=usertags,
                     thumbnail=thumb,
                 )
+                result = client.video_upload(str(media), **video_kwargs)
             else:
-                result = client.photo_upload(str(media), caption=caption, usertags=usertags)
+                photo_kwargs = clean_kwargs(
+                    client.photo_upload,
+                    caption=caption,
+                    usertags=usertags,
+                )
+                result = client.photo_upload(str(media), **photo_kwargs)
         summary.uploaded += 1
         media_pk = getattr(result, "pk", "")
         summary.media_ids.append(media_pk)
@@ -428,13 +444,16 @@ def _publish_reel(alias: str, client, username: str, job: PublishJob, summary: P
     caption = _validate_caption("reel", job.caption)
     media = job.media_paths[0]
     cover = str(job.cover_path) if job.cover_path else None
+    usertags = ensure_list(_resolve_usertags(client, job.tags))
     try:
-        result = client.clip_upload(
-            str(media),
+        clip_kwargs = clean_kwargs(
+            client.clip_upload,
             caption=caption,
+            usertags=usertags,
             thumbnail=cover,
             share_to_feed=job.share_to_feed,
         )
+        result = client.clip_upload(str(media), **clip_kwargs)
         summary.uploaded += 1
         summary.media_ids.append(getattr(result, "pk", ""))
         logger.info("@%s publicó reel %s", username, media.name)
