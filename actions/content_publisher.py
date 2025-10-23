@@ -52,6 +52,15 @@ _MOVIEPY_MODULE = None
 _MOVIEPY_FAILED = False
 
 
+class InvalidMediaError(Exception):
+    """Error controlado cuando un archivo multimedia no es válido."""
+
+    def __init__(self, path: Path, reason: str) -> None:
+        super().__init__(reason)
+        self.path = path
+        self.reason = reason
+
+
 @dataclass
 class PublishJob:
     kind: str  # "story", "post", "reel"
@@ -66,6 +75,7 @@ class PublishJob:
     delay_mode: str = "simultaneous"  # simultaneous | staggered
     delay_min: int = 0
     delay_max: int = 0
+    omitted_media: List[tuple[Path, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -73,6 +83,7 @@ class PublishSummary:
     username: str
     uploaded: int = 0
     errors: int = 0
+    omitted: int = 0
     media_ids: List[str] = field(default_factory=list)
     messages: List[str] = field(default_factory=list)
 
@@ -236,6 +247,64 @@ def _ensure_moviepy():
             ) from exc
 
 
+def _run_ffprobe(path: Path) -> bool:
+    """Intenta validar un archivo de video usando ffprobe, si está disponible."""
+
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return True
+    except FileNotFoundError:
+        return False
+    except subprocess.CalledProcessError:
+        return False
+
+
+def _validate_image(path: Path) -> None:
+    if Image is None:
+        return
+    try:
+        with Image.open(path) as img:
+            img.verify()
+    except Exception as exc:
+        raise InvalidMediaError(path, f"Imagen inválida o corrupta: {exc}") from exc
+
+
+def _validate_video(path: Path) -> None:
+    try:
+        module = _ensure_moviepy()
+    except RuntimeError as exc:
+        if _run_ffprobe(path):
+            return
+        raise InvalidMediaError(path, str(exc)) from exc
+
+    clip = None
+    try:
+        clip = module.VideoFileClip(str(path))
+        if getattr(clip, "duration", 0) == 0:
+            raise InvalidMediaError(path, "El video no contiene fotogramas válidos.")
+    except InvalidMediaError:
+        raise
+    except Exception as exc:
+        if _run_ffprobe(path):
+            return
+        raise InvalidMediaError(path, f"Video inválido o corrupto: {exc}") from exc
+    finally:
+        if clip is not None:
+            try:
+                clip.close()
+            except Exception:
+                pass
+
+
+def _validate_media_file(path: Path) -> None:
+    suffix = path.suffix.lower()
+    if suffix in _IMAGE_EXTS:
+        _validate_image(path)
+    elif suffix in _VIDEO_EXTS:
+        _validate_video(path)
+
+
 def _prepare_video(path: Path) -> Path:
     module = _ensure_moviepy()
     if path.suffix.lower() == ".mp4":
@@ -305,6 +374,7 @@ def _prepare_image(path: Path) -> Path:
 
 
 def _prepare_media(path: Path) -> Path:
+    _validate_media_file(path)
     suffix = path.suffix.lower()
     if suffix in _VIDEO_EXTS:
         return _prepare_video(path)
@@ -315,7 +385,7 @@ def _prepare_media(path: Path) -> Path:
 
 def _format_upload_error(kind: str, exc: Exception) -> str:
     return (
-        f"Error al subir contenido ({kind}). Verificá el formato del archivo o la conexión de la cuenta seleccionada. "
+        f"❌ Error al subir contenido ({kind}). Verificá el formato del archivo o la conexión de la cuenta seleccionada. "
         f"Detalle: {exc}"
     )
 
@@ -460,6 +530,7 @@ def _publish_story(alias: str, client, username: str, job: PublishJob, summary: 
             summary.media_ids.append(getattr(result, "pk", ""))
             logger.info("@%s publicó historia %s", username, media_path.name)
             _append_publish_log(alias, username, job, True, media_path.name)
+            summary.messages.append(f"✅ {media_path.name} publicado correctamente")
         except Exception as exc:
             summary.errors += 1
             message = _format_upload_error("historia", exc)
@@ -496,6 +567,8 @@ def _publish_post(alias: str, client, username: str, job: PublishJob, summary: P
                 logger.warning("No se pudo publicar el primer comentario: %s", exc)
         logger.info("@%s publicó post con %s archivos", username, len(job.media_paths))
         _append_publish_log(alias, username, job, True, f"post:{len(job.media_paths)}")
+        names = ", ".join(path.name for path in job.media_paths)
+        summary.messages.append(f"✅ Post publicado ({names})")
     except Exception as exc:
         summary.errors += 1
         message = _format_upload_error("post", exc)
@@ -521,6 +594,7 @@ def _publish_reel(alias: str, client, username: str, job: PublishJob, summary: P
         summary.media_ids.append(getattr(result, "pk", ""))
         logger.info("@%s publicó reel %s", username, media.name)
         _append_publish_log(alias, username, job, True, media.name)
+        summary.messages.append(f"✅ Reel publicado ({media.name})")
     except Exception as exc:
         summary.errors += 1
         message = _format_upload_error("reel", exc)
@@ -543,6 +617,13 @@ def _run_job_for_account(alias: str, username: str, job: PublishJob, queue: Queu
         return
 
     try:
+        if job.omitted_media:
+            for path, reason in job.omitted_media:
+                summary.omitted += 1
+                summary.messages.append(f"⏭️ {path.name} omitido: {reason}")
+                _append_publish_log(alias, username, job, False, f"omitido:{path.name}:{reason}")
+        if not job.media_paths:
+            return
         if job.kind == "story":
             _publish_story(alias, client, username, job, summary)
         elif job.kind == "post":
@@ -567,12 +648,14 @@ def _print_summary(job: PublishJob, summaries: List[PublishSummary], start_time:
     elapsed = time.perf_counter() - start_time
     total_ok = sum(s.uploaded for s in summaries)
     total_err = sum(s.errors for s in summaries)
+    total_omit = sum(s.omitted for s in summaries)
 
     print(full_line(color=Fore.MAGENTA))
-    print(style_text("=== PUBLICACIÓN FINALIZADA ===", color=Fore.YELLOW, bold=True))
+    print(style_text("=== Resumen de publicación ===", color=Fore.YELLOW, bold=True))
     print(style_text(f"Tipo: {job.kind}", color=Fore.CYAN, bold=True))
-    print(style_text(f"Total exitosos: {total_ok}", color=Fore.GREEN, bold=True))
-    print(style_text(f"Errores: {total_err}", color=Fore.RED if total_err else Fore.GREEN, bold=True))
+    print(style_text(f"✔️ Exitosos: {total_ok}", color=Fore.GREEN, bold=True))
+    print(style_text(f"❌ Fallidos: {total_err}", color=Fore.RED if total_err else Fore.GREEN, bold=True))
+    print(style_text(f"⏭️ Omitidos: {total_omit}", color=Fore.YELLOW if total_omit else Fore.GREEN, bold=True))
     print(style_text(
         f"Tiempo total: {int(elapsed // 60):02d}:{int(elapsed % 60):02d}",
         color=Fore.WHITE,
@@ -580,8 +663,14 @@ def _print_summary(job: PublishJob, summaries: List[PublishSummary], start_time:
     ))
     print(full_line(color=Fore.MAGENTA))
     for summary in summaries:
-        color = Fore.GREEN if summary.errors == 0 else Fore.YELLOW
-        print(style_text(f"@{summary.username}: {summary.uploaded} OK / {summary.errors} errores", color=color, bold=True))
+        color = Fore.GREEN if summary.errors == 0 and summary.omitted == 0 else Fore.YELLOW
+        print(
+            style_text(
+                f"@{summary.username}: {summary.uploaded} OK / {summary.errors} errores / {summary.omitted} omitidos",
+                color=color,
+                bold=True,
+            )
+        )
         for message in summary.messages:
             print(f"  - {message}")
     print(full_line(color=Fore.MAGENTA))
@@ -619,12 +708,36 @@ def run_from_menu(alias: str) -> None:
         return
 
     original_names = [path.name for path in job.media_paths]
-    try:
-        job.media_paths = [_prepare_media(path) for path in job.media_paths]
-        if job.cover_path:
-            job.cover_path = _prepare_image(job.cover_path)
-    except RuntimeError as exc:
-        warn(str(exc))
+    validated_media: List[Path] = []
+    omitted: List[tuple[Path, str]] = []
+    for media_path in job.media_paths:
+        try:
+            validated_media.append(_prepare_media(media_path))
+        except InvalidMediaError as exc:
+            warn(str(exc))
+            omitted.append((media_path, exc.reason))
+        except RuntimeError as exc:
+            warn(str(exc))
+            omitted.append((media_path, str(exc)))
+    job.media_paths = validated_media
+    job.omitted_media = omitted
+
+    if job.cover_path:
+        cover_path = job.cover_path
+        try:
+            _validate_media_file(cover_path)
+            job.cover_path = _prepare_image(cover_path)
+        except InvalidMediaError as exc:
+            warn(f"Portada omitida ({cover_path.name}): {exc.reason}")
+            job.omitted_media.append((cover_path, exc.reason))
+            job.cover_path = None
+        except RuntimeError as exc:
+            warn(str(exc))
+            job.omitted_media.append((cover_path, str(exc)))
+            job.cover_path = None
+
+    if not job.media_paths:
+        warn("No hay archivos válidos para publicar. Revisá los formatos e intentá nuevamente.")
         press_enter()
         return
 
@@ -636,6 +749,10 @@ def run_from_menu(alias: str) -> None:
         print(f"Caption: {job.caption[:80]}{'…' if len(job.caption) > 80 else ''}")
     if job.overlay_text:
         print(f"Texto overlay: {job.overlay_text[:80]}{'…' if len(job.overlay_text) > 80 else ''}")
+    if job.omitted_media:
+        print(style_text("Archivos omitidos:", color=Fore.YELLOW, bold=True))
+        for path, reason in job.omitted_media:
+            print(f" - {path.name}: {reason}")
     confirm = ask("¿Confirmar publicación? (s/N): ").strip().lower()
     if confirm != "s":
         warn("Se canceló la publicación.")

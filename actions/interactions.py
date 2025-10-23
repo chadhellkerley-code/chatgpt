@@ -10,7 +10,7 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
-from typing import List, Sequence
+from typing import Iterable, List, Sequence
 
 from accounts import get_account, list_all, mark_connected, prompt_login
 from config import SETTINGS
@@ -196,24 +196,83 @@ def _normalize_hashtag(hashtag: str) -> str:
     return hashtag.lstrip("#").strip()
 
 
+def _try_methods(client, method_names: Iterable[str], *args, amount: int | None = None):
+    """Ejecuta el primer método disponible del cliente manejando firmas variadas."""
+
+    last_error: Exception | None = None
+    for name in method_names:
+        method = getattr(client, name, None)
+        if not callable(method):
+            continue
+        try:
+            if amount is None:
+                result = method(*args)
+            else:
+                try:
+                    result = method(*args, amount=amount)
+                except TypeError:
+                    try:
+                        result = method(*args, amount)
+                    except TypeError:
+                        try:
+                            result = method(*args, count=amount)
+                        except TypeError:
+                            result = method(*args)
+        except AttributeError as exc:
+            last_error = exc
+            logger.debug("Método %s no disponible: %s", name, exc)
+            continue
+        except Exception as exc:
+            last_error = exc
+            logger.debug("Método %s falló: %s", name, exc)
+            continue
+        if result:
+            return result
+    if last_error:
+        logger.debug("Último error intentando métodos %s: %s", list(method_names), last_error)
+    return []
+
+
 def _targets_from_hashtag(client, hashtag: str, limit: int, kind: str):
     hashtag = _normalize_hashtag(hashtag)
     if not hashtag:
         return []
+    amount = max(limit * 3, 40)
     try:
-        amount = max(limit * 3, 30)
         if kind == "reel":
-            try:
-                reels = client.hashtag_medias_reels_v1(hashtag, amount=amount) or []
-            except AttributeError:
-                medias = client.hashtag_medias_recent(hashtag, amount=amount) or []
-                reels = [
-                    media
-                    for media in medias
-                    if "clip" in getattr(media, "product_type", "").lower()
-                ]
-            return list(reels)[:limit]
-        medias = client.hashtag_medias_recent(hashtag, amount=amount) or []
+            reels = _try_methods(
+                client,
+                (
+                    "hashtag_medias_reels_v1",
+                    "hashtag_medias_reels",
+                    "hashtag_medias_recent",
+                    "hashtag_medias_recent_v1",
+                    "hashtag_medias",
+                ),
+                hashtag,
+                amount=amount,
+            )
+            filtered = [
+                media
+                for media in reels
+                if "clip" in getattr(media, "product_type", "").lower()
+                or getattr(media, "media_type", "").lower() == "clip"
+            ]
+            return list(filtered)[:limit]
+        medias = list(
+            _try_methods(
+                client,
+                (
+                    "hashtag_medias_recent",
+                    "hashtag_medias_recent_v1",
+                    "hashtag_medias_top",
+                    "hashtag_medias_top_v1",
+                    "hashtag_medias",
+                ),
+                hashtag,
+                amount=amount,
+            )
+        )
         if kind == "story":
             collected = []
             seen_users: set[str] = set()
@@ -232,12 +291,12 @@ def _targets_from_hashtag(client, hashtag: str, limit: int, kind: str):
                     continue
                 for story in stories:
                     collected.append(story)
-                    if len(collected) >= limit:
+                    if len(collected) >= limit or STOP_EVENT.is_set():
                         break
-                if len(collected) >= limit:
+                if len(collected) >= limit or STOP_EVENT.is_set():
                     break
             return collected
-        return list(medias)[:limit]
+        return medias[:limit]
     except Exception as exc:
         logger.warning("No se pudo obtener el hashtag #%s: %s", hashtag, exc, exc_info=False)
         return []
@@ -320,11 +379,25 @@ def _fetch_reels(client, source: str, hashtag: str, amount: int):
         if source == "hashtag":
             reels = _targets_from_hashtag(client, hashtag, amount, "reel")
         else:
-            try:
-                reels = client.explore_reels(amount=max(amount * 2, 12)) or []
-            except AttributeError:
-                reels = client.reels(amount=max(amount * 2, 12)) or []
-        return list(reels)[:amount]
+            reels = _try_methods(
+                client,
+                (
+                    "explore_reels",
+                    "discover_reels",
+                    "discover_media",
+                    "discover_medias",
+                    "reels_trending",
+                    "reels",
+                ),
+                amount=max(amount * 3, 15),
+            )
+        filtered = [
+            media
+            for media in (reels or [])
+            if "clip" in getattr(media, "product_type", "").lower()
+            or getattr(media, "media_type", "").lower() == "clip"
+        ]
+        return list(filtered)[:amount]
     except Exception as exc:
         logger.warning("No se pudieron obtener reels (%s): %s", source, exc, exc_info=False)
         return []
@@ -493,7 +566,7 @@ def _run_comment_flow(alias: str) -> None:
             press_enter()
             return
     else:
-        hashtag = ask("Hashtag (sin #): ").strip()
+        hashtag = _normalize_hashtag(ask("Hashtag (sin #): ").strip())
         if not hashtag:
             warn("Debés indicar un hashtag.")
             press_enter()
@@ -519,7 +592,7 @@ def _run_comment_flow(alias: str) -> None:
         if source == "u":
             warn("No hay objetivos para comentar.")
         else:
-            warn("No se encontraron publicaciones para este hashtag.")
+            warn(f"No se encontraron publicaciones para el hashtag seleccionado: #{hashtag}")
         press_enter()
         return
 
@@ -582,7 +655,7 @@ def _run_reel_flow(alias: str) -> None:
     source = "hashtag" if source_choice != "2" else "explore"
     hashtag = ""
     if source == "hashtag":
-        hashtag = ask("Hashtag (sin #): ").strip()
+        hashtag = _normalize_hashtag(ask("Hashtag (sin #): ").strip())
     amount = ask_int("Cantidad de reels por cuenta: ", min_value=1, default=5)
     like = ask("¿Dar like? (s/N): ").strip().lower() == "s"
     delay_min = ask_int("Delay mínimo entre reels (seg): ", min_value=0, default=5)
@@ -605,7 +678,7 @@ def _run_reel_flow(alias: str) -> None:
 
     if not reels_by_account:
         if source == "hashtag":
-            warn("No se encontraron reels para este hashtag.")
+            warn(f"No se encontraron reels para el hashtag seleccionado: #{hashtag}")
         else:
             warn("No se pudieron obtener reels de explorar.")
         press_enter()
