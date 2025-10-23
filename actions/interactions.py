@@ -6,6 +6,7 @@ import csv
 import logging
 import random
 import time
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
@@ -191,23 +192,52 @@ def _prepare_comments() -> List[str]:
     return lines
 
 
+def _normalize_hashtag(hashtag: str) -> str:
+    return hashtag.lstrip("#").strip()
+
+
 def _targets_from_hashtag(client, hashtag: str, limit: int, kind: str):
-    hashtag = hashtag.lstrip("#").strip()
+    hashtag = _normalize_hashtag(hashtag)
     if not hashtag:
         return []
     try:
-        if kind == "story":
-            stories = client.hashtag_stories(hashtag) or []
-            return list(stories)[:limit]
-        medias = client.hashtag_medias_recent(hashtag, amount=max(limit * 2, 10)) or []
+        amount = max(limit * 3, 30)
         if kind == "reel":
-            filtered = []
+            try:
+                reels = client.hashtag_medias_reels_v1(hashtag, amount=amount) or []
+            except AttributeError:
+                medias = client.hashtag_medias_recent(hashtag, amount=amount) or []
+                reels = [
+                    media
+                    for media in medias
+                    if "clip" in getattr(media, "product_type", "").lower()
+                ]
+            return list(reels)[:limit]
+        medias = client.hashtag_medias_recent(hashtag, amount=amount) or []
+        if kind == "story":
+            collected = []
+            seen_users: set[str] = set()
             for media in medias:
-                product_type = getattr(media, "product_type", "").lower()
-                if "clip" in product_type or product_type == "igtv":
-                    filtered.append(media)
-            medias = filtered
-        return medias[:limit]
+                if STOP_EVENT.is_set():
+                    break
+                user = getattr(media, "user", None)
+                user_id = getattr(user, "pk", None) or getattr(user, "pk_id", None) or getattr(user, "id", None)
+                if not user_id or user_id in seen_users:
+                    continue
+                seen_users.add(user_id)
+                try:
+                    stories = client.user_stories(user_id) or []
+                except Exception as story_exc:
+                    logger.debug("Historias no disponibles para usuario %s: %s", user_id, story_exc)
+                    continue
+                for story in stories:
+                    collected.append(story)
+                    if len(collected) >= limit:
+                        break
+                if len(collected) >= limit:
+                    break
+            return collected
+        return list(medias)[:limit]
     except Exception as exc:
         logger.warning("No se pudo obtener el hashtag #%s: %s", hashtag, exc, exc_info=False)
         return []
@@ -290,11 +320,66 @@ def _fetch_reels(client, source: str, hashtag: str, amount: int):
         if source == "hashtag":
             reels = _targets_from_hashtag(client, hashtag, amount, "reel")
         else:
-            reels = client.discover_reels() or []
+            try:
+                reels = client.explore_reels(amount=max(amount * 2, 12)) or []
+            except AttributeError:
+                reels = client.reels(amount=max(amount * 2, 12)) or []
         return list(reels)[:amount]
     except Exception as exc:
         logger.warning("No se pudieron obtener reels (%s): %s", source, exc, exc_info=False)
         return []
+
+
+def _comment_worker(
+    alias: str,
+    username: str,
+    client,
+    targets,
+    templates,
+    delay_range,
+    limit,
+    kind: str,
+    queue: Queue,
+) -> None:
+    try:
+        summary = _comment_on_targets(
+            alias,
+            username,
+            client,
+            targets,
+            templates,
+            delay_range,
+            limit,
+            kind,
+        )
+    except Exception as exc:
+        summary = InteractionSummary(username=username, performed=0, errors=1, messages=[str(exc)])
+    queue.put(summary)
+
+
+def _reels_worker(
+    alias: str,
+    username: str,
+    client,
+    reels,
+    like: bool,
+    delay_range,
+    view_range,
+    queue: Queue,
+) -> None:
+    try:
+        summary = _view_like_reels(
+            alias,
+            username,
+            client,
+            reels,
+            like,
+            delay_range,
+            view_range,
+        )
+    except Exception as exc:
+        summary = InteractionSummary(username=username, performed=0, errors=1, messages=[str(exc)])
+    queue.put(summary)
 
 
 def _view_like_reels(alias: str, username: str, client, reels, like: bool, delay_range, view_range) -> InteractionSummary:
@@ -431,32 +516,45 @@ def _run_comment_flow(alias: str) -> None:
         targets_by_account[username] = (client, targets)
 
     if not targets_by_account:
-        warn("No hay objetivos para comentar.")
+        if source == "u":
+            warn("No hay objetivos para comentar.")
+        else:
+            warn("No se encontraron publicaciones para este hashtag.")
         press_enter()
         return
 
     ensure_logging(quiet=SETTINGS.quiet, log_dir=SETTINGS.log_dir, log_file=SETTINGS.log_file)
     reset_stop_event()
-    listener = start_q_listener("Presioná Q para detener las interacciones.", logger)
+    listener = start_q_listener("Presioná Q y Enter para detener las interacciones.", logger)
     start_time = time.perf_counter()
     queue: Queue = Queue()
+    threads: List[threading.Thread] = []
 
     try:
         for username, payload in targets_by_account.items():
             if STOP_EVENT.is_set():
                 break
             client, targets = payload
-            summary = _comment_on_targets(
-                alias,
-                username,
-                client,
-                targets,
-                templates,
-                (delay_min, delay_max),
-                limit,
-                destination,
+            worker = threading.Thread(
+                target=_comment_worker,
+                args=(
+                    alias,
+                    username,
+                    client,
+                    targets,
+                    templates,
+                    (delay_min, delay_max),
+                    limit,
+                    destination,
+                    queue,
+                ),
+                daemon=True,
+                name=f"comment-{username}",
             )
-            queue.put(summary)
+            worker.start()
+            threads.append(worker)
+        for worker in threads:
+            worker.join()
     finally:
         request_stop("interacciones detenidas")
         listener.join(timeout=0.2)
@@ -506,31 +604,44 @@ def _run_reel_flow(alias: str) -> None:
         reels_by_account[username] = (client, reels)
 
     if not reels_by_account:
-        warn("No se encontraron reels para procesar.")
+        if source == "hashtag":
+            warn("No se encontraron reels para este hashtag.")
+        else:
+            warn("No se pudieron obtener reels de explorar.")
         press_enter()
         return
 
     ensure_logging(quiet=SETTINGS.quiet, log_dir=SETTINGS.log_dir, log_file=SETTINGS.log_file)
     reset_stop_event()
-    listener = start_q_listener("Presioná Q para detener la acción.", logger)
+    listener = start_q_listener("Presioná Q y Enter para detener la acción.", logger)
     start_time = time.perf_counter()
     queue: Queue = Queue()
+    threads: List[threading.Thread] = []
 
     try:
         for username, payload in reels_by_account.items():
             if STOP_EVENT.is_set():
                 break
             client, reels = payload
-            summary = _view_like_reels(
-                alias,
-                username,
-                client,
-                reels,
-                like,
-                (delay_min, delay_max),
-                (view_min, view_max),
+            worker = threading.Thread(
+                target=_reels_worker,
+                args=(
+                    alias,
+                    username,
+                    client,
+                    reels,
+                    like,
+                    (delay_min, delay_max),
+                    (view_min, view_max),
+                    queue,
+                ),
+                daemon=True,
+                name=f"reels-{username}",
             )
-            queue.put(summary)
+            worker.start()
+            threads.append(worker)
+        for worker in threads:
+            worker.join()
     finally:
         request_stop("reels finalizados")
         listener.join(timeout=0.2)
@@ -548,7 +659,7 @@ def run_from_menu(alias: str) -> None:
         print(full_line())
         print("1) Comentar (historias / posts / reels)")
         print("2) Ver & Like Reels")
-        print("3) ↩️ Volver")
+        print("3) Volver")
         option = ask("Opción: ").strip()
         if option == "1":
             _run_comment_flow(alias)

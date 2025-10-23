@@ -42,7 +42,7 @@ def _format_rows(rows: list[dict]) -> list[str]:
     if not table:
         return []
 
-    min_widths = [24, 26, 26, 32]
+    min_widths = [24, 30, 30, 36]
     widths = [0] * len(table[0])
     for row in table:
         for idx, cell in enumerate(row):

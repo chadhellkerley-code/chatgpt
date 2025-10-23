@@ -409,8 +409,8 @@ def menu_accounts():
         print("4) Iniciar sesión y guardar sesiónid (auto en TODAS del alias)")
         print("5) Iniciar sesión y guardar sesión ID (seleccionar cuenta)")
         print("6) Modo de exploración automática por hashtag (nuevo)")
-        print("7) 📤 Subir contenidos (Historias / Post / Reels)")
-        print("8) 🎯 Interacciones (Comentar / Ver & Like Reels)")
+        print("7) Subir contenidos (Historias / Post / Reels)")
+        print("8) Interacciones (Comentar / Ver & Like Reels)")
         print("9) Volver\n")
 
         op = ask("Opción: ").strip()

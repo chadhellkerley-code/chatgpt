@@ -5,7 +5,10 @@ from __future__ import annotations
 import csv
 import hashlib
 import logging
+import os
 import random
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -34,9 +37,19 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "storage" / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 PUBLISH_LOG = DATA_DIR / "publish_log.csv"
+PROCESSED_MEDIA_DIR = DATA_DIR / "processed_media"
+PROCESSED_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
-_IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 _VIDEO_EXTS = {".mp4", ".mov", ".m4v"}
+
+try:  # pragma: no cover - depende del entorno del operador
+    from PIL import Image  # type: ignore
+except Exception:  # noqa: S110 - si Pillow no está instalado se gestiona más adelante
+    Image = None  # type: ignore
+
+_MOVIEPY_MODULE = None
+_MOVIEPY_FAILED = False
 
 
 @dataclass
@@ -174,7 +187,7 @@ def _prompt_media_paths(kind: str) -> List[Path]:
             continue
         suffix = path.suffix.lower()
         if suffix not in _IMAGE_EXTS | _VIDEO_EXTS:
-            warn("Formato no soportado (usa jpg/png/mp4/mov).")
+            warn("Formato no soportado (usa jpg/png/mp4/mov/webp).")
             continue
         paths.append(path)
 
@@ -184,6 +197,127 @@ def _prompt_media_paths(kind: str) -> List[Path]:
         warn("Para reels se usará sólo el primer archivo indicado.")
         paths = paths[:1]
     return paths
+
+
+def _hash_for_path(path: Path) -> str:
+    stat = path.stat()
+    payload = f"{path.resolve()}::{stat.st_size}::{stat.st_mtime}".encode("utf-8")
+    return hashlib.md5(payload).hexdigest()[:10]
+
+
+def _ensure_moviepy():
+    global _MOVIEPY_MODULE, _MOVIEPY_FAILED
+    if _MOVIEPY_MODULE is not None:
+        return _MOVIEPY_MODULE
+    if _MOVIEPY_FAILED:
+        raise RuntimeError(
+            "moviepy==1.0.3 no está disponible. Instalalo manualmente para publicar videos."
+        )
+    try:
+        import moviepy.editor as mpe  # type: ignore
+
+        _MOVIEPY_MODULE = mpe
+        return mpe
+    except Exception:
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "moviepy==1.0.3"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            import moviepy.editor as mpe  # type: ignore
+
+            _MOVIEPY_MODULE = mpe
+            return mpe
+        except Exception as exc:  # pragma: no cover - depende del sistema
+            _MOVIEPY_FAILED = True
+            raise RuntimeError(
+                "Error al instalar moviepy==1.0.3. Instalalo manualmente para subir videos."
+            ) from exc
+
+
+def _prepare_video(path: Path) -> Path:
+    module = _ensure_moviepy()
+    if path.suffix.lower() == ".mp4":
+        return path
+    output = PROCESSED_MEDIA_DIR / f"{path.stem}_{_hash_for_path(path)}.mp4"
+    if output.exists() and output.stat().st_mtime >= path.stat().st_mtime:
+        return output
+    output.parent.mkdir(parents=True, exist_ok=True)
+    clip = None
+    target = None
+    temp_audio = output.with_suffix(".temp-audio.m4a")
+    try:
+        clip = module.VideoFileClip(str(path))
+        target = clip
+        if getattr(clip, "h", 0) and clip.h > 1080:
+            target = clip.resize(height=1080)
+        target.write_videofile(
+            str(output),
+            codec="libx264",
+            audio_codec="aac",
+            temp_audiofile=str(temp_audio),
+            remove_temp=True,
+            bitrate="3500k",
+            preset="medium",
+            threads=max(os.cpu_count() or 2, 2),
+            logger=None,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"No se pudo convertir el video {path.name}: {exc}") from exc
+    finally:
+        if target is not None:
+            try:
+                target.close()
+            except Exception:
+                pass
+        if clip is not None and target is not clip:
+            try:
+                clip.close()
+            except Exception:
+                pass
+        if temp_audio.exists():
+            try:
+                temp_audio.unlink()
+            except Exception:
+                pass
+    return output
+
+
+def _prepare_image(path: Path) -> Path:
+    if path.suffix.lower() != ".webp":
+        return path
+    if Image is None:
+        raise RuntimeError(
+            "Se necesita Pillow>=8.1.1 para convertir imágenes .webp antes de publicarlas."
+        )
+    output = PROCESSED_MEDIA_DIR / f"{path.stem}_{_hash_for_path(path)}.jpg"
+    if output.exists() and output.stat().st_mtime >= path.stat().st_mtime:
+        return output
+    output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with Image.open(path) as img:
+            img = img.convert("RGB")
+            img.save(output, "JPEG", quality=92)
+    except Exception as exc:
+        raise RuntimeError(f"No se pudo convertir la imagen {path.name}: {exc}") from exc
+    return output
+
+
+def _prepare_media(path: Path) -> Path:
+    suffix = path.suffix.lower()
+    if suffix in _VIDEO_EXTS:
+        return _prepare_video(path)
+    if suffix == ".webp":
+        return _prepare_image(path)
+    return path
+
+
+def _format_upload_error(kind: str, exc: Exception) -> str:
+    return (
+        f"Error al subir contenido ({kind}). Verificá el formato del archivo o la conexión de la cuenta seleccionada. "
+        f"Detalle: {exc}"
+    )
 
 
 def _prompt_publish_job(kind: str) -> Optional[PublishJob]:
@@ -328,9 +462,9 @@ def _publish_story(alias: str, client, username: str, job: PublishJob, summary: 
             _append_publish_log(alias, username, job, True, media_path.name)
         except Exception as exc:
             summary.errors += 1
-            message = f"Historia {media_path.name}: {exc}"
+            message = _format_upload_error("historia", exc)
             summary.messages.append(message)
-            logger.warning(message)
+            logger.warning("%s", message)
             if should_retry_proxy(exc):
                 record_proxy_failure(username, exc)
             _append_publish_log(alias, username, job, False, message)
@@ -364,9 +498,9 @@ def _publish_post(alias: str, client, username: str, job: PublishJob, summary: P
         _append_publish_log(alias, username, job, True, f"post:{len(job.media_paths)}")
     except Exception as exc:
         summary.errors += 1
-        message = f"Post falló: {exc}"
+        message = _format_upload_error("post", exc)
         summary.messages.append(message)
-        logger.warning(message)
+        logger.warning("%s", message)
         if should_retry_proxy(exc):
             record_proxy_failure(username, exc)
         _append_publish_log(alias, username, job, False, message)
@@ -389,9 +523,9 @@ def _publish_reel(alias: str, client, username: str, job: PublishJob, summary: P
         _append_publish_log(alias, username, job, True, media.name)
     except Exception as exc:
         summary.errors += 1
-        message = f"Reel falló: {exc}"
+        message = _format_upload_error("reel", exc)
         summary.messages.append(message)
-        logger.warning(message)
+        logger.warning("%s", message)
         if should_retry_proxy(exc):
             record_proxy_failure(username, exc)
         _append_publish_log(alias, username, job, False, message)
@@ -484,10 +618,20 @@ def run_from_menu(alias: str) -> None:
         press_enter()
         return
 
+    original_names = [path.name for path in job.media_paths]
+    try:
+        job.media_paths = [_prepare_media(path) for path in job.media_paths]
+        if job.cover_path:
+            job.cover_path = _prepare_image(job.cover_path)
+    except RuntimeError as exc:
+        warn(str(exc))
+        press_enter()
+        return
+
     print(full_line())
     print(style_text("Resumen de publicación", color=Fore.CYAN, bold=True))
     print(f"Cuentas seleccionadas: {', '.join('@'+u for u in ready)}")
-    print(f"Archivos: {', '.join(path.name for path in job.media_paths)}")
+    print(f"Archivos: {', '.join(original_names)}")
     if job.caption:
         print(f"Caption: {job.caption[:80]}{'…' if len(job.caption) > 80 else ''}")
     if job.overlay_text:
