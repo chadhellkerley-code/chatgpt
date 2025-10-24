@@ -61,7 +61,7 @@ def _coerce_path(value: str | None, default: Path) -> Path:
 
 @dataclass(frozen=True)
 class Settings:
-    max_per_account: int = 10
+    max_per_account: int = 50
     max_concurrency: int = 5
     delay_min: int = 45
     delay_max: int = 55
@@ -80,7 +80,7 @@ class Settings:
 
 
 def _validated_ranges(values: Dict[str, str]) -> Tuple[int, int, int, int]:
-    max_per_account = _coerce_int(values.get("MAX_PER_ACCOUNT"), 10)
+    max_per_account = _coerce_int(values.get("MAX_PER_ACCOUNT"), 50)
     if max_per_account < 2:
         logging.warning("MAX_PER_ACCOUNT debe ser >=2. Se ajusta a 2.")
         max_per_account = 2
