@@ -1,6 +1,8 @@
 import logging
 import time
+import unicodedata
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Dict, List
 
 from accounts import get_account, list_all, mark_connected, prompt_login
@@ -22,7 +24,7 @@ from runtime import (
     start_q_listener,
 )
 from session_store import has_session, load_into
-from storage import get_auto_state, save_auto_state
+from storage import get_auto_state, log_conversation_status, save_auto_state
 from ui import Fore, full_line, style_text
 from utils import ask, ask_int, ask_multiline, banner, ok, press_enter, warn
 
@@ -31,6 +33,71 @@ logger = logging.getLogger(__name__)
 DEFAULT_PROMPT = "Respondé cordial, breve y como humano."
 PROMPT_KEY = "autoresponder_system_prompt"
 ACTIVE_ALIAS: str | None = None
+
+_POSITIVE_KEYWORDS = (
+    "si",
+    "quiero saber mas",
+    "me interesa",
+    "interesado",
+)
+_NEGATIVE_KEYWORDS = (
+    "no",
+    "ya tengo",
+    "no me interesa",
+    "no gracias",
+)
+
+
+def _normalize_text_for_match(value: str) -> str:
+    normalized = unicodedata.normalize("NFD", value.lower())
+    return "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+
+
+def _contains_token(text: str, token: str) -> bool:
+    token = token.strip()
+    if not token:
+        return False
+    if " " in token:
+        return token in text
+    return (
+        text == token
+        or text.startswith(token + " ")
+        or text.endswith(" " + token)
+        or f" {token} " in text
+    )
+
+
+def _classify_response(message: str) -> str | None:
+    norm = _normalize_text_for_match(message)
+    if not norm:
+        return None
+    for keyword in _POSITIVE_KEYWORDS:
+        if _contains_token(norm, keyword):
+            return "Interesado"
+    for keyword in _NEGATIVE_KEYWORDS:
+        if _contains_token(norm, keyword):
+            return "No interesado"
+    return None
+
+
+def _resolve_username(client, thread, target_user_id: int) -> str:
+    try:
+        for participant in getattr(thread, "users", []) or []:
+            pk = getattr(participant, "pk", None) or getattr(participant, "id", None)
+            if pk == target_user_id:
+                username = getattr(participant, "username", None)
+                if username:
+                    return username
+    except Exception:
+        pass
+    try:
+        info = client.user_info(target_user_id)
+        username = getattr(info, "username", None)
+        if username:
+            return username
+    except Exception:
+        pass
+    return str(target_user_id)
 
 
 @dataclass
@@ -371,6 +438,14 @@ def _process_inbox(
                 for msg in reversed(messages)
             ]
         )
+        recipient_username = _resolve_username(client, thread, last.user_id) or ""
+        status = _classify_response(last.text or "")
+        if status and recipient_username:
+            msg_ts = getattr(last, "timestamp", None)
+            ts_value = None
+            if isinstance(msg_ts, datetime):
+                ts_value = int(msg_ts.timestamp())
+            log_conversation_status(user, recipient_username, status, timestamp=ts_value)
         reply = _gen_response(api_key, system_prompt, convo)
         client.direct_send(reply, [last.user_id])
         state[user][thread_id] = last.id

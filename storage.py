@@ -21,6 +21,7 @@ STO.mkdir(exist_ok=True)
 SENT = STO / "sent_log.jsonl"
 AUTO = STO / "autoresponder_state.json"
 STATE = STO / "state.json"
+CONVERSATIONS = STO / "conversation_events.jsonl"
 EXPORTS = STO / "exports"
 EXPORTS.mkdir(exist_ok=True)
 
@@ -91,8 +92,41 @@ def _iter_records() -> Iterator[dict]:
 def _status_from_record(entry: dict) -> str:
     detail = (entry.get("detail") or "").strip()
     if detail:
+        lowered = detail.lower()
+        if "fall" in lowered or "error" in lowered:
+            return "Envío fallido"
+        if "interes" in lowered:
+            return "Interesado"
+        if "sin respuesta" in lowered:
+            return "Sin respuesta"
         return detail
-    return "Mensaje enviado" if entry.get("ok") else "Error"
+    return "Mensaje enviado" if entry.get("ok") else "Envío fallido"
+
+
+def _iter_conversation_events() -> Iterator[dict]:
+    if not CONVERSATIONS.exists():
+        return iter(())
+
+    def _generator() -> Iterator[dict]:
+        for line in CONVERSATIONS.read_text(encoding="utf-8").splitlines():
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            ts = obj.get("ts")
+            if ts is None:
+                continue
+            try:
+                dt = datetime.fromtimestamp(float(ts), tz=ZoneInfo("UTC")).astimezone(TZ)
+            except Exception:
+                continue
+            obj["local_dt"] = dt
+            yield obj
+
+    return _generator()
 
 
 def conversation_rows(
@@ -128,6 +162,33 @@ def conversation_rows(
         previous = latest.get(key)
         if previous is None or previous["timestamp"] <= local_dt:
             latest[key] = payload
+    for event in _iter_conversation_events():
+        local_dt: datetime | None = event.get("local_dt")
+        if not local_dt:
+            continue
+        if start and local_dt < start:
+            continue
+        if end and local_dt > end:
+            continue
+        account = str(event.get("account", ""))
+        if account_key and account.lower().lstrip("@") != account_key:
+            continue
+        recipient = str(event.get("to", ""))
+        key = (account, recipient)
+        status = str(event.get("status", "")).strip() or "Mensaje enviado"
+        payload = {
+            "timestamp": local_dt,
+            "account": account,
+            "recipient": recipient,
+            "status": status,
+        }
+        previous = latest.get(key)
+        if previous is None or previous["timestamp"] <= local_dt:
+            latest[key] = payload
+    cutoff = datetime.now(TZ) - timedelta(hours=48)
+    for payload in latest.values():
+        if payload["status"] == "Mensaje enviado" and payload["timestamp"] <= cutoff:
+            payload["status"] = "Sin respuesta"
     rows = sorted(latest.values(), key=lambda item: item["timestamp"], reverse=True)
     return rows
 
@@ -241,6 +302,22 @@ def log_sent(account: str, username: str, okflag: bool, detail: str = ""):
     with SENT.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     _increment_daily(bool(okflag))
+
+
+def log_conversation_status(
+    account: str, username: str, status: str, *, timestamp: int | None = None
+) -> None:
+    status = status.strip()
+    if not status:
+        return
+    record = {
+        "ts": int(timestamp or time.time()),
+        "account": account,
+        "to": username,
+        "status": status,
+    }
+    with CONVERSATIONS.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def already_contacted(username: str) -> bool:

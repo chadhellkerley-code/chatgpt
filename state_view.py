@@ -34,24 +34,16 @@ def _parse_date(value: str) -> Optional[datetime]:
 
 
 def _format_rows(rows: list[dict]) -> list[str]:
-    table = [["Fecha y hora", "Cuenta emisora", "Cuenta receptora", "Estado"]]
+    rendered: list[str] = []
     for row in rows:
         ts = row["timestamp"].strftime("%Y-%m-%d %H:%M")
-        table.append([ts, f"@{row['account']}", f"@{row['recipient']}", row["status"]])
-
-    if not table:
-        return []
-
-    min_widths = [24, 30, 30, 36]
-    widths = [0] * len(table[0])
-    for row in table:
-        for idx, cell in enumerate(row):
-            widths[idx] = max(widths[idx], len(str(cell)))
-    widths = [max(width, min_widths[idx]) for idx, width in enumerate(widths)]
-
-    rendered: list[str] = []
-    for row in table:
-        rendered.append("  ".join(str(cell).ljust(widths[idx]) for idx, cell in enumerate(row)))
+        account = row["account"].lstrip("@")
+        recipient = row["recipient"].lstrip("@")
+        status = row["status"]
+        line = (
+            f"📅 {ts} | 📨 Emisor: @{account} | 📩 Receptor: @{recipient} | 💬 Estado: {status}"
+        )
+        rendered.append(line)
     return rendered
 
 

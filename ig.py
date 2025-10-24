@@ -252,7 +252,9 @@ def _build_accounts_for_alias(alias: str) -> list[Dict]:
     return verified
 
 
-def _schedule_inputs(settings, concurrency_override: Optional[int]) -> tuple[int, int, int, int, list[str]]:
+def _schedule_inputs(
+    settings, concurrency_override: Optional[int]
+) -> Optional[tuple[int, int, int, int, list[str]]]:
     alias = ask("Alias/grupo: ").strip() or "default"
     listname = ask("Nombre de la lista (text/leads/<nombre>.txt): ").strip()
 
@@ -262,8 +264,16 @@ def _schedule_inputs(settings, concurrency_override: Optional[int]) -> tuple[int
         1,
         default=per_acc_default,
     )
-    if per_acc_input < 2:
-        warn("El mínimo recomendado es 2 por cuenta. Se ajusta automáticamente.")
+    if per_acc_input < 2 or per_acc_input > 50:
+        print(
+            style_text(
+                "⚠️ El límite de envío es entre 2 y 50 mensajes. Ajustá la cantidad e intentá nuevamente.",
+                color=Fore.YELLOW,
+                bold=True,
+            )
+        )
+        press_enter()
+        return None
     if per_acc_input > settings.max_per_account:
         warn(f"Se ajusta a MAX_PER_ACCOUNT ({settings.max_per_account}).")
     per_acc = max(2, min(per_acc_input, settings.max_per_account))
@@ -327,6 +337,9 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
     _reset_live_counters()
     settings = SETTINGS
 
+    inputs = _schedule_inputs(settings, concurrency_override)
+    if inputs is None:
+        return
     (
         alias,
         listname,
@@ -335,7 +348,7 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
         delay_min,
         delay_max,
         templates,
-    ) = _schedule_inputs(settings, concurrency_override)
+    ) = inputs
 
     accounts = _build_accounts_for_alias(alias)
     if not accounts:
