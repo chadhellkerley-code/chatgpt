@@ -1,6 +1,8 @@
 import logging
 import time
 import unicodedata
+import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List
@@ -46,6 +48,44 @@ _NEGATIVE_KEYWORDS = (
     "no me interesa",
     "no gracias",
 )
+
+
+def _format_handle(value: str | None) -> str:
+    if not value:
+        return "@-"
+    value = value.strip()
+    if value.startswith("@"):
+        return value
+    return f"@{value}"
+
+
+def _print_response_summary(index: int, sender: str, recipient: str, success: bool) -> None:
+    icon = "✔️" if success else "❌"
+    status = "OK" if success else "ERROR"
+    print(
+        f"[{icon}] Respuesta {index} | Emisor: {_format_handle(sender)} | "
+        f"Receptor: {_format_handle(recipient)} | Estado: {status}"
+    )
+
+
+@contextmanager
+def _suppress_console_noise() -> None:
+    root = logging.getLogger()
+    stream_handlers: list[logging.Handler] = [
+        handler
+        for handler in root.handlers
+        if isinstance(handler, logging.StreamHandler)
+    ]
+    original_levels = [handler.level for handler in stream_handlers]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            for handler in stream_handlers:
+                handler.setLevel(logging.CRITICAL + 1)
+            yield
+        finally:
+            for handler, level in zip(stream_handlers, original_levels):
+                handler.setLevel(level)
 
 
 def _normalize_text_for_match(value: str) -> str:
@@ -105,11 +145,23 @@ class BotStats:
     alias: str
     responded: int = 0
     errors: int = 0
+    responses: int = 0
     accounts: set[str] = field(default_factory=set)
 
-    def record_success(self, account: str) -> None:
-        self.responded += 1
+    def _bump_responses(self, account: str) -> int:
+        self.responses += 1
         self.accounts.add(account)
+        return self.responses
+
+    def record_success(self, account: str) -> int:
+        index = self._bump_responses(account)
+        self.responded += 1
+        return index
+
+    def record_response_error(self, account: str) -> int:
+        index = self._bump_responses(account)
+        self.errors += 1
+        return index
 
     def record_error(self, account: str) -> None:
         self.errors += 1
@@ -438,7 +490,7 @@ def _process_inbox(
                 for msg in reversed(messages)
             ]
         )
-        recipient_username = _resolve_username(client, thread, last.user_id) or ""
+        recipient_username = _resolve_username(client, thread, last.user_id) or str(last.user_id)
         status = _classify_response(last.text or "")
         if status and recipient_username:
             msg_ts = getattr(last, "timestamp", None)
@@ -446,19 +498,19 @@ def _process_inbox(
             if isinstance(msg_ts, datetime):
                 ts_value = int(msg_ts.timestamp())
             log_conversation_status(user, recipient_username, status, timestamp=ts_value)
-        reply = _gen_response(api_key, system_prompt, convo)
-        client.direct_send(reply, [last.user_id])
+        try:
+            reply = _gen_response(api_key, system_prompt, convo)
+            client.direct_send(reply, [last.user_id])
+        except Exception as exc:
+            setattr(exc, "_autoresponder_sender", user)
+            setattr(exc, "_autoresponder_recipient", recipient_username)
+            setattr(exc, "_autoresponder_message_attempt", True)
+            raise
         state[user][thread_id] = last.id
         save_auto_state(state)
-        stats.record_success(user)
+        index = stats.record_success(user)
         logger.info("Respuesta enviada por @%s en hilo %s", user, thread_id)
-        print(
-            style_text(
-                f"[{stats.alias}] Respuestas: {stats.responded} | Errores: {stats.errors}",
-                color=Fore.CYAN,
-                bold=True,
-            )
-        )
+        _print_response_summary(index, user, recipient_username, True)
 
 
 def _print_bot_summary(stats: BotStats) -> None:
@@ -521,33 +573,40 @@ def _activate_bot() -> None:
     )
 
     try:
-        while not STOP_EVENT.is_set() and active_accounts:
-            for user in list(active_accounts):
-                if STOP_EVENT.is_set():
-                    break
-                try:
-                    client = _client_for(user)
-                except Exception as exc:
-                    stats.record_error(user)
-                    _handle_account_issue(user, exc, active_accounts)
-                    continue
+        with _suppress_console_noise():
+            while not STOP_EVENT.is_set() and active_accounts:
+                for user in list(active_accounts):
+                    if STOP_EVENT.is_set():
+                        break
+                    try:
+                        client = _client_for(user)
+                    except Exception as exc:
+                        stats.record_error(user)
+                        _handle_account_issue(user, exc, active_accounts)
+                        continue
 
-                try:
-                    _process_inbox(client, user, state, api_key, system_prompt, stats)
-                except KeyboardInterrupt:
-                    raise
-                except Exception as exc:  # pragma: no cover - depende de SDK/insta
-                    stats.record_error(user)
-                    logger.warning(
-                        "Error en auto-responder para @%s: %s",
-                        user,
-                        exc,
-                        exc_info=not settings.quiet,
-                    )
-                    _handle_account_issue(user, exc, active_accounts)
+                    try:
+                        _process_inbox(client, user, state, api_key, system_prompt, stats)
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as exc:  # pragma: no cover - depende de SDK/insta
+                        if getattr(exc, "_autoresponder_message_attempt", False):
+                            index = stats.record_response_error(user)
+                            sender = getattr(exc, "_autoresponder_sender", user)
+                            recipient = getattr(exc, "_autoresponder_recipient", "-")
+                            _print_response_summary(index, sender, recipient, False)
+                        else:
+                            stats.record_error(user)
+                        logger.warning(
+                            "Error en auto-responder para @%s: %s",
+                            user,
+                            exc,
+                            exc_info=not settings.quiet,
+                        )
+                        _handle_account_issue(user, exc, active_accounts)
 
-            if active_accounts and not STOP_EVENT.is_set():
-                sleep_with_stop(delay)
+                if active_accounts and not STOP_EVENT.is_set():
+                    sleep_with_stop(delay)
 
         if not active_accounts:
             warn("No quedan cuentas activas; el bot se detiene.")
