@@ -18,6 +18,7 @@ from proxy_manager import apply_proxy_to_client, record_proxy_failure, should_re
 from session_store import has_session, load_into
 from storage import TZ
 from utils import ask
+from ui import banner
 
 _STATUS_FALLO = "FALLO"
 _STATUS_DESCONOCIDO = "DESCONOCIDO"
@@ -95,6 +96,12 @@ _NO_INTEREST = (
     "stop",
 )
 
+@dataclass
+class ThreadSnapshot:
+    timestamp: datetime
+    emitter: str
+    recipient: str
+    status: str
 
 @dataclass
 class CachedState:
@@ -103,6 +110,11 @@ class CachedState:
     other_username: str
     message_ts: int
 
+class ConversationCache:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._conn = sqlite3.connect(str(path))
+        self._ensure()
 
 @dataclass
 class ThreadSnapshot:
@@ -657,6 +669,7 @@ def _print_summary(summary: Counter) -> None:
 def menu_conversation_state() -> None:
     cache = ConversationCache(_DB_PATH)
     try:
+        banner()
         snapshots, summary = _cached_snapshots(cache)
         if not snapshots:
             snapshots, summary = _render_snapshots(cache)
