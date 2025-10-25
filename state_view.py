@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import sqlite3
 import unicodedata
+import csv
+import math
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -35,6 +37,7 @@ _ALLOWED_STATUSES = {
 _DB_PATH = Path(__file__).resolve().parent / "storage" / "conversation_state.db"
 _THREAD_LIMIT = 40
 _CONTEXT_MESSAGES = 12
+_PAGE_SIZE = 20
 
 _POSITIVE_NOW = (
     "lo quiero",
@@ -179,6 +182,27 @@ class ConversationCache:
             self._conn.close()
         except Exception:
             pass
+
+    def delete_between(self, start_ts: int, end_ts: int) -> int:
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM conversation_state WHERE message_ts BETWEEN ? AND ?",
+                (start_ts, end_ts),
+            )
+        return cur.rowcount or 0
+
+    def iter_all(self) -> Iterable[tuple[str, str, str, int, int]]:
+        cur = self._conn.execute(
+            "SELECT account, other_username, status, message_ts, updated_at FROM conversation_state"
+        )
+        for row in cur.fetchall():
+            yield (
+                row[0],
+                row[1],
+                row[2],
+                int(row[3] or 0),
+                int(row[4] or 0),
+            )
 
 
 def _format_handle(value: str) -> str:
@@ -472,21 +496,106 @@ def _gather_snapshots(cache: ConversationCache) -> list[ThreadSnapshot]:
     return snapshots
 
 
-def _render_snapshots(cache: ConversationCache) -> tuple[list[str], Counter]:
+def _render_snapshots(cache: ConversationCache) -> tuple[list[ThreadSnapshot], Counter]:
     snapshots = _gather_snapshots(cache)
     snapshots.sort(key=lambda snap: snap.timestamp, reverse=True)
     summary = Counter()
-    lines: list[str] = []
     for snap in snapshots:
         summary[snap.status] += 1
-        formatted = (
-            f"[{snap.timestamp.strftime('%Y-%m-%d %H:%M')}] "
-            f"Emisor:{_format_handle(snap.emitter)}  "
-            f"Receptor:{_format_handle(snap.recipient)}  "
-            f"Estado:{snap.status}"
+    return snapshots, summary
+
+
+def _truncate(value: str, width: int) -> str:
+    if len(value) <= width:
+        return value.ljust(width)
+    if width <= 1:
+        return value[:width]
+    return value[: width - 1] + "…"
+
+
+def _format_rows(snapshots: list[ThreadSnapshot]) -> list[tuple[str, str, str, str]]:
+    rows: list[tuple[str, str, str, str]] = []
+    for snap in snapshots:
+        rows.append(
+            (
+                snap.timestamp.strftime("%Y-%m-%d %H:%M"),
+                _format_handle(snap.emitter),
+                _format_handle(snap.recipient),
+                snap.status,
+            )
         )
-        lines.append(formatted)
-    return lines, summary
+    return rows
+
+
+def _print_table(rows: list[tuple[str, str, str, str]], page: int) -> tuple[int, int]:
+    total = len(rows)
+    total_pages = max(1, math.ceil(total / _PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * _PAGE_SIZE
+    end = start + _PAGE_SIZE
+    page_rows = rows[start:end]
+
+    headers = ("Fecha y hora", "Emisor", "Receptor", "Estado")
+    widths = [17, 22, 22, 18]
+
+    print("\n" + "=" * 72)
+    header_line = " | ".join(_truncate(h, w) for h, w in zip(headers, widths))
+    print(header_line)
+    print("-" * 72)
+
+    if not page_rows:
+        print("(Sin conversaciones registradas)")
+    else:
+        for row in page_rows:
+            print(" | ".join(_truncate(cell, width) for cell, width in zip(row, widths)))
+
+    print("-" * 72)
+    print(f"Página {page + 1} de {total_pages}  (Total: {total})")
+    return total_pages, page
+
+
+def _handle_delete(cache: ConversationCache) -> None:
+    print("Ingrese el rango de fechas a eliminar (formato YYYY-MM-DD). Deje vacío para cancelar.")
+    start_str = ask("Desde: ").strip()
+    if not start_str:
+        print("Operación cancelada.")
+        return
+    end_str = ask("Hasta: ").strip()
+    if not end_str:
+        print("Operación cancelada.")
+        return
+    try:
+        start_dt = datetime.strptime(start_str, "%Y-%m-%d").replace(tzinfo=TZ)
+        end_dt = datetime.strptime(end_str, "%Y-%m-%d").replace(tzinfo=TZ) + timedelta(days=1) - timedelta(seconds=1)
+    except ValueError:
+        print("Fechas inválidas. Utilice el formato YYYY-MM-DD.")
+        return
+    if end_dt < start_dt:
+        print("El rango es inválido (la fecha final es anterior a la inicial).")
+        return
+    removed = cache.delete_between(int(start_dt.timestamp()), int(end_dt.timestamp()))
+    print(f"Se eliminaron {removed} registros.")
+
+
+def _handle_export(rows: list[tuple[str, str, str, str]]) -> None:
+    if not rows:
+        print("No hay datos para exportar.")
+        return
+    target_dir = Path.home() / "Desktop"
+    if not target_dir.exists():
+        target_dir = Path.cwd()
+    filename = f"estado_conversacion_{datetime.now(TZ).strftime('%Y%m%d_%H%M%S')}.csv"
+    export_path = target_dir / filename
+    try:
+        with export_path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["fecha_hora", "emisor", "receptor", "estado"])
+            for row in rows:
+                writer.writerow(row)
+    except Exception as exc:
+        print(f"No se pudo generar el CSV: {exc}")
+        return
+    print(f"CSV guardado en: {export_path}")
 
 
 def _print_summary(summary: Counter) -> None:
@@ -499,16 +608,44 @@ def _print_summary(summary: Counter) -> None:
 def menu_conversation_state() -> None:
     cache = ConversationCache(_DB_PATH)
     try:
+        snapshots, summary = _render_snapshots(cache)
+        rows = _format_rows(snapshots)
+        page = 0
         while True:
-            lines, summary = _render_snapshots(cache)
-            for line in lines:
-                print(line)
-            print("R = refrescar; Q = salir con resumen.")
+            total_pages, page = _print_table(rows, page)
+            print("1) página anterior")
+            print("2) página siguiente")
+            print("3) borrar todos los datos")
+            print("4) descargar CSV")
+            print("5) actualizar")
+            print("6) volver")
+
             choice = ask("> ").strip().lower()
-            if choice in {"", "r"}:
-                continue
-            if choice == "q":
+            if choice == "1":
+                if page > 0:
+                    page -= 1
+                else:
+                    print("Ya estás en la primera página.")
+            elif choice == "2":
+                if page + 1 < total_pages:
+                    page += 1
+                else:
+                    print("Ya estás en la última página.")
+            elif choice == "3":
+                _handle_delete(cache)
+                snapshots, summary = _render_snapshots(cache)
+                rows = _format_rows(snapshots)
+                page = 0
+            elif choice == "4":
+                _handle_export(rows)
+            elif choice in {"", "5"}:
+                snapshots, summary = _render_snapshots(cache)
+                rows = _format_rows(snapshots)
+                page = 0
+            elif choice == "6":
                 _print_summary(summary)
                 break
+            else:
+                print("Opción no válida. Seleccione un número del 1 al 6.")
     finally:
         cache.close()
