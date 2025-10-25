@@ -140,6 +140,14 @@ class ConversationCache:
                 self._conn.execute(
                     "ALTER TABLE conversation_state ADD COLUMN message_ts INTEGER NOT NULL DEFAULT 0"
                 )
+            if "emitter" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE conversation_state ADD COLUMN emitter TEXT NOT NULL DEFAULT ''"
+                )
+            if "recipient" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE conversation_state ADD COLUMN recipient TEXT NOT NULL DEFAULT ''"
+                )
         except Exception:
             pass
 
@@ -162,19 +170,34 @@ class ConversationCache:
         other_username: str,
         message_ts: int,
         updated_at: int,
+        emitter: str,
+        recipient: str,
     ) -> None:
         status = status if status in _ALLOWED_STATUSES else _STATUS_DESCONOCIDO
+        emitter = emitter or account
+        recipient = recipient or other_username or account
         with self._conn:
             self._conn.execute(
                 """
-                INSERT INTO conversation_state (account, thread_id, last_item, status, other_username, message_ts, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO conversation_state (account, thread_id, last_item, status, other_username, message_ts, updated_at, emitter, recipient)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account, thread_id)
                 DO UPDATE SET last_item=excluded.last_item, status=excluded.status,
                               other_username=excluded.other_username, message_ts=excluded.message_ts,
-                              updated_at=excluded.updated_at
+                              updated_at=excluded.updated_at, emitter=excluded.emitter,
+                              recipient=excluded.recipient
                 """,
-                (account, thread_id, last_item, status, other_username, message_ts, updated_at),
+                (
+                    account,
+                    thread_id,
+                    last_item,
+                    status,
+                    other_username,
+                    message_ts,
+                    updated_at,
+                    emitter,
+                    recipient,
+                ),
             )
 
     def close(self) -> None:
@@ -191,9 +214,12 @@ class ConversationCache:
             )
         return cur.rowcount or 0
 
-    def iter_all(self) -> Iterable[tuple[str, str, str, int, int]]:
+    def iter_all(self) -> Iterable[tuple[str, str, str, int, int, str, str]]:
         cur = self._conn.execute(
-            "SELECT account, other_username, status, message_ts, updated_at FROM conversation_state"
+            """
+            SELECT account, other_username, status, message_ts, updated_at, emitter, recipient
+            FROM conversation_state
+            """
         )
         for row in cur.fetchall():
             yield (
@@ -202,7 +228,30 @@ class ConversationCache:
                 row[2],
                 int(row[3] or 0),
                 int(row[4] or 0),
+                row[5] or "",
+                row[6] or "",
             )
+
+    def cached_snapshots(self) -> list[ThreadSnapshot]:
+        snapshots: list[ThreadSnapshot] = []
+        for account, other_user, status, message_ts, updated_at, emitter, recipient in self.iter_all():
+            ts_source = message_ts or updated_at
+            if ts_source:
+                timestamp = datetime.fromtimestamp(ts_source, TZ)
+            else:
+                timestamp = datetime.now(TZ)
+            emitter_val = emitter or account
+            recipient_val = recipient or other_user or account
+            snapshots.append(
+                ThreadSnapshot(
+                    timestamp=timestamp,
+                    emitter=emitter_val,
+                    recipient=recipient_val,
+                    status=status if status in _ALLOWED_STATUSES else _STATUS_DESCONOCIDO,
+                )
+            )
+        snapshots.sort(key=lambda snap: snap.timestamp, reverse=True)
+        return snapshots
 
 
 def _format_handle(value: str) -> str:
@@ -346,37 +395,27 @@ def _snapshot_from_thread(client, account: str, thread, cache: ConversationCache
         return None
 
     timestamp = _thread_timestamp(thread, last_message)
-    message_ts_val = int(timestamp.timestamp())
+    message_ts_actual = int(timestamp.timestamp())
     cache_entry = cache.lookup(account, thread_id)
+    other_username: str
+    status: str
+    message_ts_for_age = message_ts_actual
+    store_message_ts = message_ts_actual
     if cache_entry and cache_entry.last_item == last_item_id:
         status = cache_entry.status
         other_username = cache_entry.other_username
-        cached_ts = cache_entry.message_ts or message_ts_val
-        if cache_entry.message_ts != message_ts_val:
-            cache.store(
-                account,
-                thread_id,
-                last_item_id,
-                status,
-                other_username,
-                message_ts_val,
-                int(now.timestamp()),
-            )
-        message_ts_val = cached_ts
+        cached_ts = cache_entry.message_ts or message_ts_actual
+        message_ts_for_age = cached_ts
+        if cache_entry.message_ts != message_ts_actual:
+            store_message_ts = message_ts_actual
+        else:
+            store_message_ts = cached_ts
         if (
             status == "MENSAJE_ENVIADO"
-            and now - datetime.fromtimestamp(message_ts_val, TZ) >= timedelta(hours=48)
+            and now - datetime.fromtimestamp(message_ts_for_age, TZ) >= timedelta(hours=48)
         ):
             status = "SIN_RESPUESTA_48H"
-            cache.store(
-                account,
-                thread_id,
-                last_item_id,
-                status,
-                other_username,
-                message_ts_val,
-                int(now.timestamp()),
-            )
+            store_message_ts = message_ts_for_age
     else:
         other_username = _other_username(
             client,
@@ -385,25 +424,27 @@ def _snapshot_from_thread(client, account: str, thread, cache: ConversationCache
             cache_entry.other_username if cache_entry else "-",
         )
         status = _classify_messages(messages, client.user_id, now)
-        cache.store(
-            account,
-            thread_id,
-            last_item_id,
-            status,
-            other_username,
-            message_ts_val,
-            int(now.timestamp()),
-        )
+        store_message_ts = message_ts_actual
 
     other_username = other_username or "-"
-    emitter: str
-    recipient: str
     if str(getattr(last_message, "user_id", "")) == str(client.user_id):
         emitter = account
         recipient = other_username
     else:
         emitter = other_username
         recipient = account
+
+    cache.store(
+        account,
+        thread_id,
+        last_item_id,
+        status,
+        other_username,
+        store_message_ts,
+        int(now.timestamp()),
+        emitter,
+        recipient,
+    )
 
     return ThreadSnapshot(timestamp=timestamp, emitter=emitter, recipient=recipient, status=status)
 
@@ -499,6 +540,14 @@ def _gather_snapshots(cache: ConversationCache) -> list[ThreadSnapshot]:
 def _render_snapshots(cache: ConversationCache) -> tuple[list[ThreadSnapshot], Counter]:
     snapshots = _gather_snapshots(cache)
     snapshots.sort(key=lambda snap: snap.timestamp, reverse=True)
+    summary = Counter()
+    for snap in snapshots:
+        summary[snap.status] += 1
+    return snapshots, summary
+
+
+def _cached_snapshots(cache: ConversationCache) -> tuple[list[ThreadSnapshot], Counter]:
+    snapshots = cache.cached_snapshots()
     summary = Counter()
     for snap in snapshots:
         summary[snap.status] += 1
@@ -608,7 +657,9 @@ def _print_summary(summary: Counter) -> None:
 def menu_conversation_state() -> None:
     cache = ConversationCache(_DB_PATH)
     try:
-        snapshots, summary = _render_snapshots(cache)
+        snapshots, summary = _cached_snapshots(cache)
+        if not snapshots:
+            snapshots, summary = _render_snapshots(cache)
         rows = _format_rows(snapshots)
         page = 0
         while True:
@@ -633,7 +684,7 @@ def menu_conversation_state() -> None:
                     print("Ya estás en la última página.")
             elif choice == "3":
                 _handle_delete(cache)
-                snapshots, summary = _render_snapshots(cache)
+                snapshots, summary = _cached_snapshots(cache)
                 rows = _format_rows(snapshots)
                 page = 0
             elif choice == "4":
