@@ -283,19 +283,28 @@ def _load_sessions_on_boot() -> Tuple[int, int, List[str]]:
         except Exception as exc:
             if account.get("proxy_url"):
                 record_proxy_failure(username, exc)
-
-        if hasattr(client, "set_settings"):
-            try:
-                client.set_settings(data)
-            except Exception:
-                # seguimos; se intentará iniciar sesión igualmente
-                pass
+        try:
+            client.load_settings(str(path))
+        except Exception as exc:
+            errors += 1
+            mark_connected(username, False)
+            print(f"⚠️ No se pudo cargar la sesión desde: {path.name}")
+            if binding and account.get("proxy_url"):
+                record_proxy_failure(username, exc)
+            continue
 
         try:
             if hasattr(client, "login_by_sessionid"):
                 client.login_by_sessionid(session_id)
-            else:
-                raise RuntimeError("login_by_sessionid no disponible en el cliente instagrapi.")
+        except Exception as exc:
+            errors += 1
+            mark_connected(username, False)
+            print(f"⚠️ @{username}: sesión expirada, iniciá sesión nuevamente.")
+            if binding and should_retry_proxy(exc):
+                record_proxy_failure(username, exc)
+            continue
+
+        try:
             client.get_timeline_feed()
         except Exception as exc:
             errors += 1
@@ -306,6 +315,10 @@ def _load_sessions_on_boot() -> Tuple[int, int, List[str]]:
             continue
 
         mark_connected(username, True)
+        try:
+            account["connected"] = True
+        except Exception:
+            pass
         loaded += 1
         loaded_users.append(username)
 
