@@ -256,14 +256,7 @@ def _load_sessions_on_boot() -> Tuple[int, int, List[str]]:
         pass
 
     try:
-        from instagrapi import Client
-    except Exception:
-        print("🔄 Sesiones restauradas: 0")
-        return 0, len(found_files), []
-
-    try:
         from accounts import list_all, mark_connected
-        from proxy_manager import apply_proxy_to_client, record_proxy_failure, should_retry_proxy
     except Exception:
         print("🔄 Sesiones restauradas: 0")
         return 0, len(found_files), []
@@ -349,44 +342,6 @@ def _load_sessions_on_boot() -> Tuple[int, int, List[str]]:
             errors += 1
             mark_connected(username, False)
             print(f"⚠️ Sesión de @{username} inválida, por favor volvé a iniciar sesión.")
-            continue
-
-        client = Client()
-        binding = None
-        try:
-            binding = apply_proxy_to_client(client, username, account, reason="sesion")
-        except Exception as exc:
-            if account.get("proxy_url"):
-                record_proxy_failure(username, exc)
-        try:
-            client.load_settings(str(path))
-        except Exception as exc:
-            errors += 1
-            mark_connected(username, False)
-            print(f"⚠️ No se pudo cargar la sesión desde: {path.name}")
-            if binding and account.get("proxy_url"):
-                record_proxy_failure(username, exc)
-            continue
-
-        try:
-            if hasattr(client, "login_by_sessionid"):
-                client.login_by_sessionid(session_id)
-        except Exception as exc:
-            errors += 1
-            mark_connected(username, False)
-            print(f"⚠️ @{username}: sesión expirada, iniciá sesión nuevamente.")
-            if binding and should_retry_proxy(exc):
-                record_proxy_failure(username, exc)
-            continue
-
-        try:
-            client.get_timeline_feed()
-        except Exception as exc:
-            errors += 1
-            mark_connected(username, False)
-            print(f"⚠️ @{username}: sesión expirada, iniciá sesión nuevamente.")
-            if binding and should_retry_proxy(exc):
-                record_proxy_failure(username, exc)
             continue
 
         mark_connected(username, True)
