@@ -38,20 +38,27 @@ def _client_alias() -> str | None:
 
 def _client_session_dir() -> Path | None:
     root = _client_sessions_root()
-    alias = _client_alias()
-    if not root or not alias:
+    if not root:
         return None
-    return root / alias
+    alias = _client_alias()
+    if alias:
+        return root / alias
+    return root
 
 
 def _client_candidates(username: str) -> List[Path]:
     directory = _client_session_dir()
     if not directory:
         return []
-    return [
+    candidates: List[Path] = [
         directory / f"session_{username}.json",
         directory / f"{username}.json",
     ]
+    root = _client_sessions_root()
+    if root and root != directory:
+        candidates.append(root / f"session_{username}.json")
+        candidates.append(root / f"{username}.json")
+    return candidates
 
 
 def session_candidates(username: str) -> list[Path]:
@@ -81,6 +88,10 @@ def ensure_dirs() -> None:
     client_dir = _client_session_dir()
     if client_dir:
         client_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        root = _client_sessions_root()
+        if root:
+            root.mkdir(parents=True, exist_ok=True)
 
 
 def save_from(client, username: str) -> Path:
@@ -107,6 +118,45 @@ def remove(username: str) -> None:
                 path.unlink()
         except Exception:
             pass
+
+
+def list_saved_sessions() -> dict[str, Path]:
+    """Devuelve un mapeo username -> Path con las sesiones detectadas."""
+
+    def _directories() -> Iterable[Path]:
+        yielded = set()
+        for directory in _session_dirs():
+            if directory not in yielded:
+                yielded.add(directory)
+                yield directory
+        client_dir = _client_session_dir()
+        if client_dir and client_dir not in yielded:
+            yielded.add(client_dir)
+            yield client_dir
+        root = _client_sessions_root()
+        if root and root not in yielded:
+            yielded.add(root)
+            yield root
+
+    found: dict[str, Path] = {}
+    for directory in _directories():
+        try:
+            entries = list(directory.glob("*.json"))
+        except Exception:
+            continue
+        for path in entries:
+            if not path.is_file():
+                continue
+            stem = path.stem
+            if stem.startswith("session_"):
+                username = stem[len("session_") :]
+            else:
+                username = stem
+            username = username.strip().lstrip("@").lower()
+            if not username or username in found:
+                continue
+            found[username] = path
+    return found
 
 
 def validate(client, username: str) -> bool:

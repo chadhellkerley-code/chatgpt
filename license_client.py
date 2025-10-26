@@ -63,7 +63,7 @@ def _prepare_client_environment(record: Dict[str, str]) -> None:
     alias = record.get("client_alias") or record.get("client_slug") or record.get("client_name")
     alias = _slugify(alias)
     base_dir = Path(sys.argv[0]).resolve().parent
-    sessions_root = base_dir / "sessions"
+    sessions_root = base_dir / "Station ID"
     os.environ.setdefault("CLIENT_DISTRIBUTION", "1")
     os.environ["CLIENT_SESSIONS_ROOT"] = str(sessions_root)
     os.environ["CLIENT_ALIAS"] = alias
@@ -74,7 +74,7 @@ def _bootstrap_sessions(record: Dict[str, str]) -> None:
     try:
         from accounts import list_all, mark_connected
         from proxy_manager import apply_proxy_to_client, record_proxy_failure, should_retry_proxy
-        from session_store import ensure_dirs, has_session, load_into
+        from session_store import ensure_dirs, list_saved_sessions, load_into
     except Exception:
         return
 
@@ -84,17 +84,30 @@ def _bootstrap_sessions(record: Dict[str, str]) -> None:
         return
 
     ensure_dirs()
+    saved = list_saved_sessions()
+    if not saved:
+        return
+
     accounts = list_all()
     if not accounts:
         return
 
-    for account in accounts:
-        username = account.get("username")
-        if not username:
-            continue
-        if not has_session(username):
-            mark_connected(username, False)
-            continue
+    accounts_map = {
+        (account.get("username") or "").strip().lstrip("@").lower(): account
+        for account in accounts
+        if account.get("username")
+    }
+
+    matched_usernames = [user for user in saved.keys() if user in accounts_map]
+    if not matched_usernames:
+        return
+
+    print(f"📦 Detectadas {len(matched_usernames)} sesiones guardadas.")
+    print("🔄 Restaurando sesiones activas...")
+
+    for username_key in sorted(matched_usernames):
+        account = accounts_map[username_key]
+        username = account["username"]
         client = Client()
         binding = None
         try:
@@ -102,16 +115,38 @@ def _bootstrap_sessions(record: Dict[str, str]) -> None:
         except Exception as exc:
             if account.get("proxy_url"):
                 record_proxy_failure(username, exc)
+
         try:
             load_into(client, username)
+        except FileNotFoundError:
+            mark_connected(username, False)
+            print(f"⚠️ Sesión de @{username} inválida, por favor volvé a iniciar sesión.")
+            continue
+        except Exception:
+            mark_connected(username, False)
+            print(f"⚠️ Sesión de @{username} inválida, por favor volvé a iniciar sesión.")
+            continue
+
+        try:
             client.get_timeline_feed()
         except Exception as exc:
             mark_connected(username, False)
-            print(f"⚠️ La sesión de @{username} ha expirado. Iniciá sesión nuevamente para reactivarla.")
+            print(f"⚠️ @{username}: sesión expirada, iniciá sesión nuevamente.")
             if binding and should_retry_proxy(exc):
                 record_proxy_failure(username, exc)
         else:
             mark_connected(username, True)
+            print(f"✅ @{username} cargada correctamente.")
+
+    for username_key, account in accounts_map.items():
+        if username_key not in matched_usernames:
+            mark_connected(account["username"], False)
+
+    refreshed = list_all()
+    total_accounts = len(refreshed)
+    active_accounts = sum(1 for it in refreshed if it.get("connected"))
+    if total_accounts:
+        print(f"Cuentas conectadas: {total_accounts} | Activas: {active_accounts}")
 
 
 def launch_with_license() -> None:
