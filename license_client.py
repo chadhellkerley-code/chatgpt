@@ -14,11 +14,39 @@ from typing import Dict, Iterable, List, Tuple
 
 
 def _initial_app_root() -> Path:
+    """Determina un directorio estable para guardar datos del cliente."""
+
+    candidates: List[Path] = []
+
+    if sys.argv and sys.argv[0]:
+        try:
+            candidates.append(Path(os.path.abspath(sys.argv[0])).resolve().parent)
+        except Exception:
+            pass
+
+    # Distribuciones congeladas (PyInstaller/zipapp) exponen ``sys.executable``
+    # apuntando al binario real en el bundle. Solo lo usamos cuando realmente
+    # estamos en modo congelado para evitar rutas del intérprete del sistema
+    # (por ejemplo, /usr/bin).
+    if getattr(sys, "frozen", False):
+        executable = getattr(sys, "executable", None)
+        if executable:
+            try:
+                candidates.append(Path(executable).resolve().parent)
+            except Exception:
+                pass
+
+    for candidate in candidates:
+        if candidate and candidate.exists():
+            return candidate
+
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
-        return Path(meipass).resolve()
-    if sys.argv and sys.argv[0]:
-        return Path(os.path.abspath(sys.argv[0])).resolve().parent
+        try:
+            return Path(meipass).resolve()
+        except Exception:
+            pass
+
     return Path(__file__).resolve().parent
 
 
