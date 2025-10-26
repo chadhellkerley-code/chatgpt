@@ -99,6 +99,12 @@ _NO_INTEREST = (
     "stop",
 )
 
+@dataclass
+class ThreadSnapshot:
+    timestamp: datetime
+    emitter: str
+    recipient: str
+    status: str
 
 @dataclass
 class CachedState:
@@ -107,6 +113,11 @@ class CachedState:
     other_username: str
     message_ts: int
 
+class ConversationCache:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._conn = sqlite3.connect(str(path))
+        self._ensure()
 
 @dataclass
 class ThreadSnapshot:
