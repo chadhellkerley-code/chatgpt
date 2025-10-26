@@ -10,12 +10,28 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Iterable, List, Tuple
 
 from licensekit import validate_license_payload
 from ui import Fore, banner, full_line, style_text
 
 PAYLOAD_NAME = "storage/license_payload.json"
+
+SESSION_PATTERNS = [
+    "session_*.json",
+    "v1_settings_*.json",
+    "settings_*.json",
+    "*.session.json",
+]
+
+CANDIDATE_SESSION_DIRS = [
+    "Station ID",
+    "session_id",
+    "station_id",
+    "Session ID",
+]
+
+_DEBUG_ROOT_PRINTED = False
 
 
 def _resource_path(relative: str) -> Path:
@@ -60,41 +76,89 @@ def _slugify(value: str, fallback: str = "cliente") -> str:
     return value or fallback
 
 
+def _get_app_root() -> Path:
+    """Determina el directorio raíz del bundle/ejecutable."""
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return Path(meipass).resolve()
+    if sys.argv and sys.argv[0]:
+        return Path(os.path.abspath(sys.argv[0])).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _resolve_sessions_dir() -> Path:
+    base_dir = _get_app_root()
+    for name in CANDIDATE_SESSION_DIRS:
+        candidate = base_dir / name
+        if candidate.is_dir():
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+    target = base_dir / "Station ID"
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _iter_session_files(sess_dir: Path) -> Iterable[Path]:
+    seen: set[str] = set()
+    for pattern in SESSION_PATTERNS:
+        for path in glob.glob(str(sess_dir / pattern)):
+            base = os.path.basename(path)
+            if base in seen:
+                continue
+            seen.add(base)
+            candidate = Path(path)
+            if candidate.is_file():
+                yield candidate
+        for path in glob.glob(str(sess_dir / "*" / pattern)):
+            base = os.path.basename(path)
+            if base in seen:
+                continue
+            seen.add(base)
+            candidate = Path(path)
+            if candidate.is_file():
+                yield candidate
+
+
 def _prepare_client_environment(record: Dict[str, str]) -> None:
     alias = record.get("client_alias") or record.get("client_slug") or record.get("client_name")
     alias = _slugify(alias)
-    base_dir = Path(sys.argv[0]).resolve().parent
-    sessions_root = base_dir / "Station ID"
+    sessions_root = _resolve_sessions_dir()
     os.environ.setdefault("CLIENT_DISTRIBUTION", "1")
     os.environ["CLIENT_SESSIONS_ROOT"] = str(sessions_root)
     os.environ["CLIENT_ALIAS"] = alias
     os.environ["LICENSE_ALREADY_VALIDATED"] = "1"
 
 
-def _load_sessions_on_boot() -> None:
-    app_root = os.path.dirname(os.path.abspath(sys.argv[0]))
-    sessions_dir = os.path.join(app_root, "Station ID")
-    os.makedirs(sessions_dir, exist_ok=True)
+def _load_sessions_on_boot() -> Tuple[int, int, List[str]]:
+    global _DEBUG_ROOT_PRINTED
 
-    session_paths = sorted(glob.glob(os.path.join(sessions_dir, "session_*.json")))
-    if not session_paths:
-        return
+    sessions_dir = _resolve_sessions_dir()
+    found_files = list(_iter_session_files(sessions_dir))
+    print(f"📦 Sesiones detectadas en '{sessions_dir.name}': {len(found_files)}")
+    try:
+        names_preview = ", ".join(path.name for path in found_files[:5])
+        if len(found_files) > 5:
+            names_preview += ", ..."
+        if names_preview:
+            print(f"🗂️ Archivos: {names_preview}")
+    except Exception:
+        pass
 
     try:
         from instagrapi import Client
     except Exception:
-        return
+        print("🔄 Sesiones restauradas: 0")
+        return 0, len(found_files), []
 
     try:
         from accounts import list_all, mark_connected
         from proxy_manager import apply_proxy_to_client, record_proxy_failure, should_retry_proxy
     except Exception:
-        return
+        print("🔄 Sesiones restauradas: 0")
+        return 0, len(found_files), []
 
     accounts = list_all()
-    if not accounts:
-        return
-
     account_map = {
         (acct.get("username") or "").strip().lstrip("@").lower(): acct
         for acct in accounts
@@ -106,45 +170,67 @@ def _load_sessions_on_boot() -> None:
         if username:
             mark_connected(username, False)
 
-    print(f'📦 Detectadas {len(session_paths)} sesiones en "Station ID". Restaurando…')
-    print("🔄 Restaurando sesiones activas…")
+    loaded = 0
+    errors = 0
+    loaded_users: List[str] = []
 
-    for path in session_paths:
+    for path in found_files:
         try:
-            with open(path, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
+            data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            print(f"⚠️ No se pudo cargar la sesión desde: {os.path.basename(path)}")
+            errors += 1
+            print(f"⚠️ No se pudo cargar la sesión desde: {path.name}")
             continue
 
-        raw_username = (data.get("username") or "").strip().lstrip("@")
-        if not raw_username:
-            stem = os.path.splitext(os.path.basename(path))[0]
-            raw_username = stem[len("session_") :] if stem.startswith("session_") else stem
-        username = raw_username.strip().lstrip("@")
+        username = (
+            (data.get("username") or data.get("user") or data.get("account") or "")
+            .strip()
+            .lstrip("@")
+        )
         if not username:
-            print(f"⚠️ No se pudo cargar la sesión desde: {os.path.basename(path)}")
+            stem = path.stem
+            for prefix in ("session_", "v1_settings_", "settings_"):
+                if stem.startswith(prefix):
+                    username = stem[len(prefix) :]
+                    break
+            if not username:
+                username = stem
+        username = username.strip().lstrip("@")
+        if not username:
+            errors += 1
+            print(f"⚠️ No se pudo cargar la sesión desde: {path.name}")
             continue
 
         lower_username = username.lower()
         account = account_map.get(lower_username)
         if not account:
-            print(f"⚠️ Sesión de @{username} no está asociada a una cuenta guardada.")
+            errors += 1
+            print(f"⚠️ Sesión de @{username} no vinculada a una cuenta guardada.")
             continue
 
-        session_id = data.get("sessionid")
-        cookies = data.get("cookies") or {}
-        if not session_id:
-            session_id = cookies.get("sessionid") or cookies.get("session_id")
+        raw_cookies = data.get("cookies") or {}
+        cookies: Dict[str, str] = {}
+        if isinstance(raw_cookies, dict):
+            cookies = {str(k): raw_cookies[k] for k in raw_cookies if raw_cookies[k]}
+        elif isinstance(raw_cookies, list):
+            for item in raw_cookies:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                value = item.get("value")
+                if name and value:
+                    cookies[str(name)] = value
 
-        required_missing = [key for key in ("device", "uuid") if not data.get(key)]
+        session_id = (
+            data.get("sessionid")
+            or cookies.get("sessionid")
+            or cookies.get("session_id")
+            or (data.get("authorization_data") or {}).get("sessionid")
+        )
         if not session_id:
-            required_missing.append("sessionid")
-        if not cookies:
-            required_missing.append("cookies")
-        if required_missing:
+            errors += 1
             mark_connected(username, False)
-            print(f"⚠️ No se pudo cargar la sesión desde: {os.path.basename(path)}")
+            print(f"⚠️ Sesión de @{username} inválida, por favor volvé a iniciar sesión.")
             continue
 
         client = Client()
@@ -155,11 +241,21 @@ def _load_sessions_on_boot() -> None:
             if account.get("proxy_url"):
                 record_proxy_failure(username, exc)
 
+        if hasattr(client, "set_settings"):
+            try:
+                client.set_settings(data)
+            except Exception:
+                # seguimos; se intentará iniciar sesión igualmente
+                pass
+
         try:
-            client.set_settings(data)
-            client.login_by_sessionid(session_id)
+            if hasattr(client, "login_by_sessionid"):
+                client.login_by_sessionid(session_id)
+            else:
+                raise RuntimeError("login_by_sessionid no disponible en el cliente instagrapi.")
             client.get_timeline_feed()
         except Exception as exc:
+            errors += 1
             mark_connected(username, False)
             print(f"⚠️ @{username}: sesión expirada, iniciá sesión nuevamente.")
             if binding and should_retry_proxy(exc):
@@ -167,13 +263,17 @@ def _load_sessions_on_boot() -> None:
             continue
 
         mark_connected(username, True)
-        print(f"✅ @{username} cargada correctamente.")
+        loaded += 1
+        loaded_users.append(username)
 
-    refreshed = list_all()
-    total_accounts = len(refreshed)
-    active_accounts = sum(1 for it in refreshed if it.get("connected"))
-    if total_accounts:
-        print(f"Cuentas conectadas: {total_accounts} | Activas: {active_accounts}")
+    if found_files and loaded == 0 and not _DEBUG_ROOT_PRINTED:
+        _DEBUG_ROOT_PRINTED = True
+        print(f"ROOT={_get_app_root()}")
+        print(f"SESS_DIR={sessions_dir}")
+        print(f"EXISTS={sessions_dir.exists()}")
+
+    print(f"🔄 Sesiones restauradas: {loaded}")
+    return loaded, errors, loaded_users
 
 
 def launch_with_license() -> None:
