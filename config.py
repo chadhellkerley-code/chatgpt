@@ -12,8 +12,9 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 from dotenv import dotenv_values, load_dotenv
+from paths import runtime_base
 
-_ROOT = Path(__file__).resolve().parent
+_ROOT = runtime_base(Path(__file__).resolve().parent)
 _ENV_FILENAMES = (".env", ".env.local")
 _CONFIG_FILE = _ROOT / "storage" / "config.json"
 _LICENSE_PAYLOAD = _ROOT / "storage" / "license_payload.json"

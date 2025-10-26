@@ -9,7 +9,10 @@ import re
 from pathlib import Path
 from typing import Iterable, List
 
-_BASE = Path(__file__).resolve().parent
+from paths import runtime_base
+
+_BASE = runtime_base(Path(__file__).resolve().parent)
+_BASE.mkdir(parents=True, exist_ok=True)
 _OLD_DIR = _BASE / ".sessions"
 _NEW_DIR = _BASE / "storage" / "sessions"
 _CLIENT_ALIAS_RE = re.compile(r"[^a-z0-9_-]+")

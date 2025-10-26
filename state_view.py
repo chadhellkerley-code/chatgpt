@@ -19,6 +19,7 @@ from session_store import has_session, load_into
 from storage import TZ
 from utils import ask
 from ui import banner
+from paths import runtime_base
 
 _STATUS_FALLO = "FALLO"
 _STATUS_DESCONOCIDO = "DESCONOCIDO"
@@ -35,7 +36,9 @@ _ALLOWED_STATUSES = {
     _STATUS_DESCONOCIDO,
 }
 
-_DB_PATH = Path(__file__).resolve().parent / "storage" / "conversation_state.db"
+_BASE = runtime_base(Path(__file__).resolve().parent)
+_DB_PATH = _BASE / "storage" / "conversation_state.db"
+_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 _THREAD_LIMIT = 40
 _CONTEXT_MESSAGES = 12
 _PAGE_SIZE = 20

@@ -12,6 +12,18 @@ import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
+
+def _initial_app_root() -> Path:
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return Path(meipass).resolve()
+    if sys.argv and sys.argv[0]:
+        return Path(os.path.abspath(sys.argv[0])).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+os.environ.setdefault("APP_DATA_ROOT", str(_initial_app_root()))
+
 from licensekit import validate_license_payload
 from ui import Fore, banner, full_line, style_text
 
@@ -79,12 +91,7 @@ def _slugify(value: str, fallback: str = "cliente") -> str:
 def _get_app_root() -> Path:
     """Determina el directorio raíz del bundle/ejecutable."""
 
-    meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        return Path(meipass).resolve()
-    if sys.argv and sys.argv[0]:
-        return Path(os.path.abspath(sys.argv[0])).resolve().parent
-    return Path(__file__).resolve().parent
+    return _initial_app_root()
 
 
 def _resolve_sessions_dir() -> Path:
@@ -123,11 +130,13 @@ def _iter_session_files(sess_dir: Path) -> Iterable[Path]:
 def _prepare_client_environment(record: Dict[str, str]) -> None:
     alias = record.get("client_alias") or record.get("client_slug") or record.get("client_name")
     alias = _slugify(alias)
+    app_root = _get_app_root()
     sessions_root = _resolve_sessions_dir()
     os.environ.setdefault("CLIENT_DISTRIBUTION", "1")
     os.environ["CLIENT_SESSIONS_ROOT"] = str(sessions_root)
     os.environ["CLIENT_ALIAS"] = alias
     os.environ["LICENSE_ALREADY_VALIDATED"] = "1"
+    os.environ["APP_DATA_ROOT"] = str(app_root)
 
 
 def _ensure_account_record(username: str, accounts: List[Dict]) -> Dict | None:
