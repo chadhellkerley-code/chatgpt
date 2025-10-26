@@ -127,16 +127,54 @@ def _iter_session_files(sess_dir: Path) -> Iterable[Path]:
                 yield candidate
 
 
+def _migrate_legacy_data(app_root: Path, data_root: Path) -> None:
+    """Replica datos existentes cuando cambiamos el directorio base."""
+
+    if data_root == app_root:
+        return
+
+    legacy_candidates = [
+        app_root / "data",
+        app_root / "storage",
+        app_root / "conversation_state.db",
+    ]
+
+    for candidate in legacy_candidates:
+        try:
+            if not candidate.exists():
+                continue
+            target = data_root / candidate.name
+            if candidate.is_file():
+                if not target.exists():
+                    target.write_bytes(candidate.read_bytes())
+                continue
+            target.mkdir(parents=True, exist_ok=True)
+            for child in candidate.glob("**/*"):
+                if not child.is_file():
+                    continue
+                relative = child.relative_to(candidate)
+                destination = target / relative
+                if destination.exists():
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(child.read_bytes())
+        except Exception:
+            continue
+
+
 def _prepare_client_environment(record: Dict[str, str]) -> None:
     alias = record.get("client_alias") or record.get("client_slug") or record.get("client_name")
     alias = _slugify(alias)
     app_root = _get_app_root()
     sessions_root = _resolve_sessions_dir()
+    data_root = sessions_root / alias if alias else sessions_root
+    data_root.mkdir(parents=True, exist_ok=True)
+    _migrate_legacy_data(app_root, data_root)
     os.environ.setdefault("CLIENT_DISTRIBUTION", "1")
     os.environ["CLIENT_SESSIONS_ROOT"] = str(sessions_root)
     os.environ["CLIENT_ALIAS"] = alias
     os.environ["LICENSE_ALREADY_VALIDATED"] = "1"
-    os.environ["APP_DATA_ROOT"] = str(app_root)
+    os.environ["APP_DATA_ROOT"] = str(data_root)
 
 
 def _ensure_account_record(username: str, accounts: List[Dict]) -> Dict | None:
