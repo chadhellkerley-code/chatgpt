@@ -258,40 +258,28 @@ def _schedule_inputs(
     alias = ask("Alias/grupo: ").strip() or "default"
     listname = ask("Nombre de la lista (text/leads/<nombre>.txt): ").strip()
 
-    per_acc_default = min(settings.max_per_account, 50)
+    per_acc_default = max(1, settings.max_per_account)
     per_acc_input = ask_int(
         f"¿Cuántos mensajes por cuenta? [{per_acc_default}]: ",
         1,
         default=per_acc_default,
     )
-    if per_acc_input < 2 or per_acc_input > 50:
-        print(
-            style_text(
-                "⚠️ El límite de envío es entre 2 y 50 mensajes. Ajustá la cantidad e intentá nuevamente.",
-                color=Fore.YELLOW,
-                bold=True,
-            )
-        )
-        press_enter()
-        return None
-    if per_acc_input > settings.max_per_account:
-        warn(f"Se ajusta a MAX_PER_ACCOUNT ({settings.max_per_account}).")
-    per_acc = max(2, min(per_acc_input, settings.max_per_account))
+    if per_acc_input < 1:
+        warn("La cantidad mínima por cuenta es 1. Se ajusta a 1.")
+    per_acc = max(1, per_acc_input)
 
     if concurrency_override is not None:
         concurr_input = max(1, concurrency_override)
         print(f"Concurrencia forzada: {concurr_input}")
     else:
         concurr_input = ask_int(
-            f"Cuentas en simultáneo? [hasta {settings.max_concurrency}]: ",
+            f"Cuentas en simultáneo? [{settings.max_concurrency}]: ",
             1,
             default=settings.max_concurrency,
         )
     if concurr_input < 1:
         warn("La concurrencia mínima es 1. Se ajusta a 1.")
-    if concurr_input > settings.max_concurrency:
-        warn(f"Se ajusta a MAX_CONCURRENCY ({settings.max_concurrency}).")
-    concurr = max(1, min(concurr_input, settings.max_concurrency))
+    concurr = max(1, concurr_input)
 
     dmin_default = max(10, settings.delay_min)
     dmin_input = ask_int(
