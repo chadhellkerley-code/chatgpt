@@ -6,8 +6,9 @@ import csv
 import logging
 import random
 import re
-import time
 import threading
+import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
@@ -32,6 +33,17 @@ from ui import Fore, banner, full_line, style_text
 from utils import ask, ask_int, ask_multiline, enable_quiet_mode, ok, press_enter, warn
 
 logger = logging.getLogger(__name__)
+_CLIENT_LOGGERS = (
+    "urllib3",
+    "requests",
+    "httpx",
+    "instagrapi",
+    "instagrapi.mixins",
+    "PIL",
+    "PIL.Image",
+    "PIL.ImageFile",
+    "moviepy",
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "storage" / "data"
@@ -48,6 +60,80 @@ except Exception:  # pragma: no cover - requests siempre está pero mantenemos f
 _SHORTCODE_RE = re.compile(r"/(?:p|reel|tv)/([A-Za-z0-9_-]{5,})")
 _REEL_RE = re.compile(r"/(?:reel|clips)/([A-Za-z0-9_-]{5,})")
 _STORY_RE = re.compile(r"/stories/[^/]+/([0-9]+)")
+
+
+def _apply_client_quiet_mode() -> None:
+    if not SETTINGS.client_distribution:
+        return
+    warnings.filterwarnings("ignore")
+    for name in _CLIENT_LOGGERS:
+        logging.getLogger(name).setLevel(logging.ERROR)
+
+
+def _short_message(text: object, limit: int = 100) -> str:
+    raw = str(text or "").strip().replace("\n", " ")
+    compact = " ".join(raw.split())
+    if len(compact) > limit:
+        return compact[: limit - 1].rstrip() + "…"
+    return compact
+
+
+def _report_account_error(username: str, error: Exception | str) -> None:
+    message = _short_message(error)
+    if SETTINGS.client_distribution:
+        print(f"⚠️ Error al procesar la cuenta @{username}: {message}")
+    else:
+        warn(message)
+
+
+def _report_account_notice(username: str, message: str) -> None:
+    note = _short_message(message)
+    if SETTINGS.client_distribution:
+        print(f"⚠️ @{username}: {note}")
+    else:
+        warn(f"@{username} {note}")
+
+
+def _append_summary_message(summary: "InteractionSummary", detail: str) -> None:
+    summary.messages.append(_short_message(detail))
+
+
+def _format_units(count: int, singular: str, plural: str | None = None) -> str:
+    label = singular if count == 1 else (plural or singular + "s")
+    return f"{count} {label}"
+
+
+def _client_summary_block(summary: "InteractionSummary") -> List[str]:
+    if summary.errors == 0:
+        action = summary.action
+        count = _format_units(summary.performed, "comentario")
+        if action == "comment_story":
+            line = f"✅ @{summary.username} comentó correctamente {count} en historias."
+        elif action == "comment_post":
+            line = f"✅ @{summary.username} comentó correctamente {count} en posts."
+        elif action == "comment_reel":
+            line = f"✅ @{summary.username} comentó correctamente {count} en reels."
+        elif action == "reels_like":
+            reels = _format_units(summary.performed, "reel")
+            line = f"✅ @{summary.username} dio like a {reels}."
+        elif action == "reels_view":
+            reels = _format_units(summary.performed, "reel")
+            line = f"✅ @{summary.username} visualizó {reels}."
+        else:
+            acciones = _format_units(summary.performed, "acción")
+            line = f"✅ @{summary.username} completó {acciones}."
+        return [line]
+
+    detail = summary.messages[0] if summary.messages else "No se completaron acciones."
+    if summary.performed:
+        acciones = _format_units(summary.performed, "acción")
+        line = f"⚠️ @{summary.username}: {detail} ({acciones} completadas, {_format_units(summary.errors, 'error')})."
+    else:
+        line = f"⚠️ @{summary.username}: {detail}"
+    lines = [ _short_message(line) ]
+    for extra in summary.messages[1:]:
+        lines.append(f"   - {_short_message(extra)}")
+    return lines
 
 
 def _is_transient(exc: Exception) -> bool:
@@ -85,6 +171,7 @@ class InteractionSummary:
     performed: int = 0
     errors: int = 0
     messages: List[str] = field(default_factory=list)
+    action: str = ""
 
 
 def _client_for(username: str):
@@ -138,7 +225,7 @@ def _ensure_account_ready(username: str) -> bool:
         _client_for(username)
         return True
     except Exception as exc:
-        warn(str(exc))
+        _report_account_error(username, exc)
         if ask("¿Reintentar login ahora? (s/N): ").strip().lower() == "s":
             if prompt_login(username):
                 return _ensure_account_ready(username)
@@ -475,6 +562,7 @@ def _comment_media_target(client, target, comment: str) -> None:
 
 def _comment_on_targets(alias: str, username: str, client, targets, templates, delay_range, limit, kind: str) -> InteractionSummary:
     summary = InteractionSummary(username=username)
+    summary.action = f"comment_{kind}"
     for idx, target in enumerate(targets, start=1):
         if STOP_EVENT.is_set():
             break
@@ -497,12 +585,12 @@ def _comment_on_targets(alias: str, username: str, client, targets, templates, d
         except NotImplementedError as exc:
             summary.errors += 1
             detail = f"Función no disponible para este destino: {exc}"
-            summary.messages.append(detail)
+            _append_summary_message(summary, detail)
             _append_interaction_log(alias, username, f"comentario_{kind}", target_display, False, detail)
         except Exception as exc:
             summary.errors += 1
             detail = f"Error comentando: {exc}"
-            summary.messages.append(detail)
+            _append_summary_message(summary, detail)
             _append_interaction_log(alias, username, f"comentario_{kind}", target_display, False, detail)
             if should_retry_proxy(exc):
                 record_proxy_failure(username, exc)
@@ -578,7 +666,9 @@ def _comment_worker(
             kind,
         )
     except Exception as exc:
-        summary = InteractionSummary(username=username, performed=0, errors=1, messages=[str(exc)])
+        summary = InteractionSummary(username=username, performed=0, errors=1)
+        summary.action = f"comment_{kind}"
+        _append_summary_message(summary, str(exc))
     queue.put(summary)
 
 
@@ -603,12 +693,15 @@ def _reels_worker(
             view_range,
         )
     except Exception as exc:
-        summary = InteractionSummary(username=username, performed=0, errors=1, messages=[str(exc)])
+        summary = InteractionSummary(username=username, performed=0, errors=1)
+        summary.action = "reels_like" if like else "reels_view"
+        _append_summary_message(summary, str(exc))
     queue.put(summary)
 
 
 def _view_like_reels(alias: str, username: str, client, reels, like: bool, delay_range, view_range) -> InteractionSummary:
     summary = InteractionSummary(username=username)
+    summary.action = "reels_like" if like else "reels_view"
     for reel in reels:
         if STOP_EVENT.is_set():
             break
@@ -625,7 +718,7 @@ def _view_like_reels(alias: str, username: str, client, reels, like: bool, delay
         except Exception as exc:
             summary.errors += 1
             detail = f"Error en reel {pk}: {exc}"
-            summary.messages.append(detail)
+            _append_summary_message(summary, detail)
             _append_interaction_log(alias, username, "ver_reel", str(pk), False, detail)
             if should_retry_proxy(exc):
                 record_proxy_failure(username, exc)
@@ -652,6 +745,18 @@ def _print_summary(title: str, summaries: List[InteractionSummary], start: float
     total_ok = sum(s.performed for s in summaries)
     total_err = sum(s.errors for s in summaries)
 
+    if SETTINGS.client_distribution:
+        print(full_line(color=Fore.MAGENTA))
+        print(style_text(title, color=Fore.CYAN, bold=True))
+        print(style_text(f"Acciones exitosas: {total_ok}", color=Fore.GREEN, bold=True))
+        print(style_text(f"Errores: {total_err}", color=Fore.RED if total_err else Fore.GREEN, bold=True))
+        print(full_line(color=Fore.MAGENTA))
+        for summary in summaries:
+            for line in _client_summary_block(summary):
+                print(line)
+        print(full_line(color=Fore.MAGENTA))
+        return
+
     print(full_line(color=Fore.MAGENTA))
     print(style_text(title, color=Fore.CYAN, bold=True))
     print(style_text(f"Acciones exitosas: {total_ok}", color=Fore.GREEN, bold=True))
@@ -672,6 +777,7 @@ def _print_summary(title: str, summaries: List[InteractionSummary], start: float
 
 def _run_comment_flow(alias: str) -> None:
     enable_quiet_mode()
+    _apply_client_quiet_mode()
     banner()
     print(style_text("🎯 Interacciones - Comentarios", color=Fore.CYAN, bold=True))
     print(full_line())
@@ -730,14 +836,17 @@ def _run_comment_flow(alias: str) -> None:
         try:
             client = _client_for(username)
         except Exception as exc:
-            warn(str(exc))
+            _report_account_error(username, exc)
             continue
         if source == "u":
             targets = _targets_from_urls(client, entries, destination)
         else:
             targets = _targets_from_hashtag(client, hashtag, limit * 2, destination)
         if not targets:
-            warn(f"No se encontraron objetivos para @{username}.")
+            if source == "u":
+                _report_account_notice(username, "No se encontraron objetivos para los enlaces indicados.")
+            else:
+                _report_account_notice(username, "No se encontraron publicaciones para el hashtag seleccionado.")
             continue
         targets_by_account[username] = (client, targets)
 
@@ -793,6 +902,7 @@ def _run_comment_flow(alias: str) -> None:
 
 def _run_reel_flow(alias: str) -> None:
     enable_quiet_mode()
+    _apply_client_quiet_mode()
     banner()
     print(style_text("🎯 Interacciones - Ver & Like Reels", color=Fore.CYAN, bold=True))
     print(full_line())
@@ -826,11 +936,14 @@ def _run_reel_flow(alias: str) -> None:
         try:
             client = _client_for(username)
         except Exception as exc:
-            warn(str(exc))
+            _report_account_error(username, exc)
             continue
         reels = _fetch_reels(client, source, hashtag, amount)
         if not reels:
-            warn(f"No hay reels disponibles para @{username}.")
+            if source == "hashtag":
+                _report_account_notice(username, "No se pudieron obtener reels del hashtag seleccionado.")
+            else:
+                _report_account_notice(username, "No se encontraron reels recomendados para esta cuenta.")
             continue
         reels_by_account[username] = (client, reels)
 

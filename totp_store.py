@@ -17,10 +17,12 @@ import pyotp
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from paths import runtime_base
 
 logger = logging.getLogger(__name__)
 
-_BASE = Path(__file__).resolve().parent
+_BASE = runtime_base(Path(__file__).resolve().parent)
+_BASE.mkdir(parents=True, exist_ok=True)
 _STORE = _BASE / "storage" / "totp"
 _STORE.mkdir(parents=True, exist_ok=True)
 _MASTER_FILE = _STORE / ".master_key"
