@@ -130,6 +130,41 @@ def _prepare_client_environment(record: Dict[str, str]) -> None:
     os.environ["LICENSE_ALREADY_VALIDATED"] = "1"
 
 
+def _ensure_account_record(username: str, accounts: List[Dict]) -> Dict | None:
+    """Garantiza que exista un registro básico de cuenta para el usuario."""
+
+    normalized_username = username.lower()
+    for record in accounts:
+        existing = (record.get("username") or "").strip().lower()
+        if existing == normalized_username:
+            return record
+
+    try:
+        from accounts import _normalize_account as normalize_account  # type: ignore[attr-defined]
+        from accounts import _save as save_accounts  # type: ignore[attr-defined]
+    except Exception:
+        return None
+
+    alias = os.environ.get("CLIENT_ALIAS") or "default"
+    base_record = {
+        "username": username,
+        "alias": alias,
+        "active": True,
+        "connected": False,
+    }
+    try:
+        normalized = normalize_account(base_record)
+    except Exception:
+        normalized = base_record
+
+    accounts.append(normalized)
+    try:
+        save_accounts(accounts)
+    except Exception:
+        pass
+    return normalized
+
+
 def _load_sessions_on_boot() -> Tuple[int, int, List[str]]:
     global _DEBUG_ROOT_PRINTED
 
@@ -204,9 +239,17 @@ def _load_sessions_on_boot() -> Tuple[int, int, List[str]]:
         lower_username = username.lower()
         account = account_map.get(lower_username)
         if not account:
-            errors += 1
-            print(f"⚠️ Sesión de @{username} no vinculada a una cuenta guardada.")
-            continue
+            account = _ensure_account_record(username, accounts)
+            if account:
+                account_map[lower_username] = account
+                try:
+                    mark_connected(username, False)
+                except Exception:
+                    pass
+            else:
+                errors += 1
+                print(f"⚠️ Sesión de @{username} no vinculada a una cuenta guardada.")
+                continue
 
         raw_cookies = data.get("cookies") or {}
         cookies: Dict[str, str] = {}
