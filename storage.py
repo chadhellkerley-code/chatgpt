@@ -14,8 +14,10 @@ from zoneinfo import ZoneInfo
 from config import SETTINGS, read_env_local, update_env_local
 from ui import Fore, banner, full_line, style_text
 from utils import ask, ok, press_enter, warn
+from paths import runtime_base
 
-BASE = Path(__file__).resolve().parent
+BASE = runtime_base(Path(__file__).resolve().parent)
+BASE.mkdir(parents=True, exist_ok=True)
 STO = BASE / "storage"
 STO.mkdir(exist_ok=True)
 SENT = STO / "sent_log.jsonl"
