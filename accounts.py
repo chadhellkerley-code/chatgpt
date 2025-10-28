@@ -5,6 +5,8 @@ from __future__ import annotations
 import getpass
 import json
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -38,7 +40,12 @@ logger = logging.getLogger(__name__)
 
 _HEALTH_CACHE_TTL = timedelta(minutes=15)
 _HEALTH_CACHE: Dict[str, tuple[datetime, str]] = {}
+_HEALTH_CACHE_LOCK = Lock()
 _HEALTH_CACHE_FILE = DATA / "account_health.json"
+_HEALTH_REFRESH_PENDING: set[str] = set()
+_HEALTH_REFRESH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=3, thread_name_prefix="health-refresh"
+)
 
 
 def _load_health_cache_from_disk() -> None:
@@ -48,7 +55,7 @@ def _load_health_cache_from_disk() -> None:
         raw = json.loads(_HEALTH_CACHE_FILE.read_text(encoding="utf-8"))
     except Exception:
         return
-    now = datetime.utcnow()
+    entries: Dict[str, tuple[datetime, str]] = {}
     for key, entry in raw.items():
         if not isinstance(entry, dict):
             continue
@@ -60,16 +67,20 @@ def _load_health_cache_from_disk() -> None:
             ts = datetime.fromisoformat(ts_raw)
         except Exception:
             continue
-        if now - ts <= _HEALTH_CACHE_TTL:
-            _HEALTH_CACHE[key] = (ts, badge)
+        entries[key] = (ts, badge)
+    if not entries:
+        return
+    with _HEALTH_CACHE_LOCK:
+        _HEALTH_CACHE.update(entries)
 
 
 def _persist_health_cache() -> None:
     try:
-        serializable = {
-            key: {"timestamp": ts.isoformat(), "badge": badge}
-            for key, (ts, badge) in _HEALTH_CACHE.items()
-        }
+        with _HEALTH_CACHE_LOCK:
+            serializable = {
+                key: {"timestamp": ts.isoformat(), "badge": badge}
+                for key, (ts, badge) in _HEALTH_CACHE.items()
+            }
         _HEALTH_CACHE_FILE.write_text(
             json.dumps(serializable, ensure_ascii=False), encoding="utf-8"
         )
@@ -438,33 +449,66 @@ def _health_cache_key(username: str) -> str:
 def _invalidate_health(username: str) -> None:
     key = _health_cache_key(username)
     if key:
-        if key in _HEALTH_CACHE:
-            _HEALTH_CACHE.pop(key, None)
-            _persist_health_cache()
+        with _HEALTH_CACHE_LOCK:
+            if key in _HEALTH_CACHE:
+                _HEALTH_CACHE.pop(key, None)
+        _persist_health_cache()
 
 
-def _health_from_cache(username: str) -> str | None:
+def _health_cached(username: str) -> tuple[str | None, bool]:
     key = _health_cache_key(username)
     if not key:
-        return None
-    cached = _HEALTH_CACHE.get(key)
+        return None, True
+    with _HEALTH_CACHE_LOCK:
+        cached = _HEALTH_CACHE.get(key)
     if not cached:
-        return None
+        return None, True
     timestamp, badge = cached
-    if datetime.utcnow() - timestamp < _HEALTH_CACHE_TTL:
-        return badge
-    if key in _HEALTH_CACHE:
-        _HEALTH_CACHE.pop(key, None)
-        _persist_health_cache()
-    return None
+    expired = datetime.utcnow() - timestamp >= _HEALTH_CACHE_TTL
+    return badge, expired
 
 
 def _store_health(username: str, badge: str) -> str:
     key = _health_cache_key(username)
     if key:
-        _HEALTH_CACHE[key] = (datetime.utcnow(), badge)
+        with _HEALTH_CACHE_LOCK:
+            _HEALTH_CACHE[key] = (datetime.utcnow(), badge)
         _persist_health_cache()
     return badge
+
+
+def _badge_for_display(account: Dict) -> tuple[str, bool]:
+    username = account.get("username", "")
+    cached_badge, expired = _health_cached(username)
+    if cached_badge:
+        return cached_badge, expired
+    return "[🟡 En riesgo: unknown]", True
+
+
+def _schedule_health_refresh(accounts_to_refresh: List[Dict]) -> None:
+    for account in accounts_to_refresh:
+        username = account.get("username", "")
+        key = _health_cache_key(username)
+        if not key:
+            continue
+        with _HEALTH_CACHE_LOCK:
+            if key in _HEALTH_REFRESH_PENDING:
+                continue
+            _HEALTH_REFRESH_PENDING.add(key)
+
+        def _task(acc: Dict, cache_key: str, uname: str):
+            try:
+                badge = _compute_health_badge(acc)
+                _store_health(uname, badge)
+            finally:
+                with _HEALTH_CACHE_LOCK:
+                    _HEALTH_REFRESH_PENDING.discard(cache_key)
+
+        try:
+            _HEALTH_REFRESH_EXECUTOR.submit(_task, dict(account), key, username)
+        except Exception:
+            with _HEALTH_CACHE_LOCK:
+                _HEALTH_REFRESH_PENDING.discard(key)
 
 
 def _format_health_error(exc: Exception, ig_exceptions) -> str:
@@ -605,12 +649,8 @@ def _compute_health_badge(account: Dict) -> str:
 
 
 def _health_badge(account: Dict) -> str:
-    username = account.get("username", "")
-    cached = _health_from_cache(username)
-    if cached is not None:
-        return cached
     badge = _compute_health_badge(account)
-    return _store_health(username, badge)
+    return _store_health(account.get("username", ""), badge)
 
 
 def menu_accounts():
@@ -626,16 +666,21 @@ def menu_accounts():
         if not group:
             print("(no hay cuentas aún)")
         else:
+            pending_refresh: List[Dict] = []
             for it in group:
                 flag = em("🟢") if it.get("active") else em("⚪")
                 conn = "[conectada]" if it.get("connected") else "[no conectada]"
                 sess = "[sesión]" if has_session(it["username"]) else "[sin sesión]"
                 proxy_flag = _proxy_indicator(it)
                 totp_flag = _totp_indicator(it)
-                badge = _health_badge(it)
+                badge, needs_refresh = _badge_for_display(it)
+                if needs_refresh:
+                    pending_refresh.append(it)
                 print(
                     f" - @{it['username']} {conn} {sess} {flag} {proxy_flag}{totp_flag} • {badge}"
                 )
+            if pending_refresh:
+                _schedule_health_refresh(pending_refresh)
 
         print("\n1) Agregar cuenta")
         print("2) Eliminar cuenta")
