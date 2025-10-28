@@ -12,8 +12,9 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 from dotenv import dotenv_values, load_dotenv
+from paths import runtime_base
 
-_ROOT = Path(__file__).resolve().parent
+_ROOT = runtime_base(Path(__file__).resolve().parent)
 _ENV_FILENAMES = (".env", ".env.local")
 _CONFIG_FILE = _ROOT / "storage" / "config.json"
 _LICENSE_PAYLOAD = _ROOT / "storage" / "license_payload.json"
@@ -84,17 +85,11 @@ def _validated_ranges(values: Dict[str, str]) -> Tuple[int, int, int, int]:
     if max_per_account < 2:
         logging.warning("MAX_PER_ACCOUNT debe ser >=2. Se ajusta a 2.")
         max_per_account = 2
-    elif max_per_account > 50:
-        logging.warning("MAX_PER_ACCOUNT máximo 50. Se ajusta a 50.")
-        max_per_account = 50
 
     max_concurrency = _coerce_int(values.get("MAX_CONCURRENCY"), 5)
     if max_concurrency < 1:
         logging.warning("MAX_CONCURRENCY debe ser >=1. Se ajusta a 1.")
         max_concurrency = 1
-    elif max_concurrency > 20:
-        logging.warning("MAX_CONCURRENCY máximo 20. Se ajusta a 20.")
-        max_concurrency = 20
 
     delay_min = _coerce_int(values.get("DELAY_MIN"), 45)
     if delay_min < 10:
