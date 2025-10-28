@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import getpass
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -19,7 +20,7 @@ from proxy_manager import (
     should_retry_proxy,
     test_proxy_connection,
 )
-from session_store import has_session, remove as remove_session, save_from
+from session_store import has_session, load_into, remove as remove_session, save_from
 from totp_store import generate_code as generate_totp_code
 from totp_store import has_secret as has_totp_secret
 from totp_store import remove_secret as remove_totp_secret
@@ -34,6 +35,9 @@ DATA.mkdir(exist_ok=True)
 FILE = DATA / "accounts.json"
 
 logger = logging.getLogger(__name__)
+
+_HEALTH_CACHE_TTL = timedelta(minutes=15)
+_HEALTH_CACHE: Dict[str, tuple[datetime, str]] = {}
 
 
 def _normalize_account(record: Dict) -> Dict:
@@ -122,6 +126,7 @@ def update_account(username: str, updates: Dict) -> bool:
             updated.update(updates)
             items[idx] = _normalize_account(updated)
             _save(items)
+            _invalidate_health(username)
             return True
     return False
 
@@ -157,6 +162,7 @@ def add_account(username: str, alias: str, proxy: Optional[Dict] = None) -> bool
         record.update(proxy)
     items.append(_normalize_account(record))
     _save(items)
+    _invalidate_health(username)
     ok("Agregada.")
     return True
 
@@ -168,11 +174,13 @@ def remove_account(username: str) -> None:
     remove_session(username)
     remove_totp_secret(username)
     clear_proxy(username)
+    _invalidate_health(username)
     ok("Eliminada (si existía).")
 
 
 def set_active(username: str, is_active: bool = True) -> None:
     if update_account(username, {"active": is_active}):
+        _invalidate_health(username)
         ok("Actualizada.")
     else:
         warn("No existe.")
@@ -180,6 +188,7 @@ def set_active(username: str, is_active: bool = True) -> None:
 
 def mark_connected(username: str, connected: bool) -> None:
     update_account(username, {"connected": connected})
+    _invalidate_health(username)
 
 
 def _proxy_config_from_inputs(data: Dict) -> ProxyConfig:
@@ -382,6 +391,183 @@ def _totp_indicator(account: Dict) -> str:
     return f" {em('🔐')}" if account.get("has_totp") else ""
 
 
+def _health_cache_key(username: str) -> str:
+    return username.strip().lstrip("@").lower()
+
+
+def _invalidate_health(username: str) -> None:
+    key = _health_cache_key(username)
+    if key:
+        _HEALTH_CACHE.pop(key, None)
+
+
+def _health_from_cache(username: str) -> str | None:
+    key = _health_cache_key(username)
+    if not key:
+        return None
+    cached = _HEALTH_CACHE.get(key)
+    if not cached:
+        return None
+    timestamp, badge = cached
+    if datetime.utcnow() - timestamp < _HEALTH_CACHE_TTL:
+        return badge
+    _HEALTH_CACHE.pop(key, None)
+    return None
+
+
+def _store_health(username: str, badge: str) -> str:
+    key = _health_cache_key(username)
+    if key:
+        _HEALTH_CACHE[key] = (datetime.utcnow(), badge)
+    return badge
+
+
+def _format_health_error(exc: Exception, ig_exceptions) -> str:
+    msg = str(exc).lower()
+
+    def _has_attr(name: str):
+        return getattr(ig_exceptions, name, None) if ig_exceptions else None
+
+    login_types = tuple(
+        tp
+        for tp in (
+            _has_attr("ClientLoginRequired"),
+            _has_attr("LoginRequired"),
+            _has_attr("TwoFactorRequired"),
+        )
+        if tp is not None
+    )
+    if login_types and isinstance(exc, login_types):
+        return "[⚠️ Sesión expirada]"
+
+    challenge_type = _has_attr("ChallengeRequired")
+    if challenge_type and isinstance(exc, challenge_type):
+        return "[🟡 En riesgo: challenge]"
+
+    checkpoint_type = _has_attr("CheckpointRequired")
+    if checkpoint_type and isinstance(exc, checkpoint_type):
+        return "[🟡 En riesgo: checkpoint]"
+
+    proxy_block_type = _has_attr("ProxyAddressIsBlocked")
+    if proxy_block_type and isinstance(exc, proxy_block_type):
+        return "[🌐 Proxy caído]"
+
+    action_block_types = tuple(
+        tp
+        for tp in (
+            _has_attr("FeedbackRequired"),
+            _has_attr("SentryBlock"),
+        )
+        if tp is not None
+    )
+    if action_block_types and isinstance(exc, action_block_types):
+        return "[🟡 En riesgo: action_block]"
+
+    rate_limit_types = tuple(
+        tp
+        for tp in (
+            _has_attr("RateLimitError"),
+            _has_attr("PleaseWaitFewMinutes"),
+        )
+        if tp is not None
+    )
+    if rate_limit_types and isinstance(exc, rate_limit_types):
+        return "[🟡 En riesgo: rate_limit]"
+
+    disabled_types = tuple(
+        tp
+        for tp in (
+            _has_attr("UserNotFound"),
+            _has_attr("NotFoundError"),
+        )
+        if tp is not None
+    )
+    if disabled_types and isinstance(exc, disabled_types):
+        return "[🔴 Desactivada]"
+
+    if "proxy" in msg or "timed out" in msg or "dns" in msg or "connection" in msg:
+        if any(word in msg for word in ("refused", "timeout", "timed out", "timedout", "unreachable", "name or service")):
+            return "[🌐 Proxy caído]"
+
+    if "login required" in msg or "sessionid" in msg or "401" in msg:
+        return "[⚠️ Sesión expirada]"
+
+    if "challenge" in msg:
+        return "[🟡 En riesgo: challenge]"
+
+    if "checkpoint" in msg:
+        return "[🟡 En riesgo: checkpoint]"
+
+    if any(keyword in msg for keyword in ("few minutes", "rate limit", "try again later")):
+        return "[🟡 En riesgo: rate_limit]"
+
+    if "feedback" in msg or "action block" in msg or "sentry" in msg:
+        return "[🟡 En riesgo: action_block]"
+
+    if "disabled" in msg or "desactiv" in msg:
+        return "[🔴 Desactivada]"
+
+    return "[🟡 En riesgo: unknown]"
+
+
+def _compute_health_badge(account: Dict) -> str:
+    username = account.get("username", "").strip().lstrip("@")
+    if not username:
+        return "[🟡 En riesgo: unknown]"
+
+    if not has_session(username):
+        return "[⚠️ Sesión expirada]"
+
+    try:
+        from instagrapi import Client, exceptions as ig_exceptions
+    except Exception:
+        return "[🟡 En riesgo: unknown]"
+
+    try:
+        cl = Client()
+    except Exception as exc:
+        return _format_health_error(exc, None)
+
+    try:
+        apply_proxy_to_client(cl, username, account, reason="healthcheck")
+    except Exception as exc:
+        return _format_health_error(exc, None)
+
+    try:
+        load_into(cl, username)
+    except FileNotFoundError:
+        return "[⚠️ Sesión expirada]"
+    except Exception as exc:
+        return _format_health_error(exc, ig_exceptions)
+
+    info = None
+    try:
+        info = cl.account_info()
+    except Exception as exc:
+        badge = _format_health_error(exc, ig_exceptions)
+        if "unknown" not in badge:
+            return badge
+        try:
+            if getattr(cl, "user_id", None):
+                info = cl.user_info(cl.user_id)
+        except Exception as inner_exc:
+            return _format_health_error(inner_exc, ig_exceptions)
+
+    if info and getattr(info, "username", None):
+        return "[✅ OK]"
+
+    return "[🟡 En riesgo: unknown]"
+
+
+def _health_badge(account: Dict) -> str:
+    username = account.get("username", "")
+    cached = _health_from_cache(username)
+    if cached is not None:
+        return cached
+    badge = _compute_health_badge(account)
+    return _store_health(username, badge)
+
+
 def menu_accounts():
     while True:
         banner()
@@ -401,8 +587,9 @@ def menu_accounts():
                 sess = "[sesión]" if has_session(it["username"]) else "[sin sesión]"
                 proxy_flag = _proxy_indicator(it)
                 totp_flag = _totp_indicator(it)
+                badge = _health_badge(it)
                 print(
-                    f" - @{it['username']} {conn} {sess} {flag} {proxy_flag}{totp_flag}"
+                    f" - @{it['username']} {conn} {sess} {flag} {proxy_flag}{totp_flag} • {badge}"
                 )
 
         print("\n1) Agregar cuenta")
