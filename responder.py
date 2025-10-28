@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_PROMPT = "Respondé cordial, breve y como humano."
 PROMPT_KEY = "autoresponder_system_prompt"
 ACTIVE_ALIAS: str | None = None
-MAX_SYSTEM_PROMPT_CHARS = 5000
+MAX_SYSTEM_PROMPT_CHARS = 50000
 
 _GOHIGHLEVEL_FILE = runtime_base(Path(__file__).resolve().parent) / "storage" / "gohighlevel.json"
 _GOHIGHLEVEL_BASE = "https://rest.gohighlevel.com/v1"
