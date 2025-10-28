@@ -4,8 +4,10 @@ import os, csv, json
 from pathlib import Path
 from typing import List
 from utils import banner, title, ask, ask_int, press_enter, ok, warn
+from paths import runtime_base
 
-BASE = Path(__file__).resolve().parent
+BASE = runtime_base(Path(__file__).resolve().parent)
+BASE.mkdir(parents=True, exist_ok=True)
 TEXT = BASE / "text" / "leads"
 TEXT.mkdir(parents=True, exist_ok=True)
 
