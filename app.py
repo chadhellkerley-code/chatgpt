@@ -64,6 +64,13 @@ def _print_dashboard() -> None:
         last_reset,
     )
     print()
+    for text in current_menu_option_labels():
+        print(style_text(text))
+    print()
+    print(line)
+
+
+def current_menu_option_labels() -> list[str]:
     options = [
         f"1) {em('🔐')} Gestionar cuentas  ",
         f"2) {em('🗂️')} Gestionar leads (crear / importar CSV)  ",
@@ -74,14 +81,10 @@ def _print_dashboard() -> None:
     ]
     if not SETTINGS.client_distribution:
         options.append(f"7) {em('📦')} Entregar a cliente (licencia / ZIP)  ")
-        exit_label = f"8) {em('🚪')} Salir  "
+        options.append(f"8) {em('🚪')} Salir  ")
     else:
-        exit_label = f"7) {em('🚪')} Salir  "
-    options.append(exit_label)
-    for text in options:
-        print(style_text(text))
-    print()
-    print(line)
+        options.append(f"8) {em('🚪')} Salir  ")
+    return options
 
 
 def menu():
@@ -115,7 +118,7 @@ def menu():
             and not SETTINGS.client_distribution
         ):
             licensekit.menu_deliver()
-        elif op == "8" or (op == "7" and SETTINGS.client_distribution):
+        elif op == "8":
             print("Saliendo...")
             time.sleep(0.3)
             break
