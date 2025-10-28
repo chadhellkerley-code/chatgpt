@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import getpass
 import json
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -19,19 +22,73 @@ from proxy_manager import (
     should_retry_proxy,
     test_proxy_connection,
 )
-from session_store import has_session, remove as remove_session, save_from
+from session_store import has_session, load_into, remove as remove_session, save_from
 from totp_store import generate_code as generate_totp_code
 from totp_store import has_secret as has_totp_secret
 from totp_store import remove_secret as remove_totp_secret
 from totp_store import save_secret as save_totp_secret
 from utils import ask, banner, em, ok, press_enter, title, warn
+from paths import runtime_base
 
-BASE = Path(__file__).resolve().parent
+BASE = runtime_base(Path(__file__).resolve().parent)
+BASE.mkdir(parents=True, exist_ok=True)
 DATA = BASE / "data"
 DATA.mkdir(exist_ok=True)
 FILE = DATA / "accounts.json"
 
 logger = logging.getLogger(__name__)
+
+_HEALTH_CACHE_TTL = timedelta(minutes=15)
+_HEALTH_CACHE: Dict[str, tuple[datetime, str]] = {}
+_HEALTH_CACHE_LOCK = Lock()
+_HEALTH_CACHE_FILE = DATA / "account_health.json"
+_HEALTH_REFRESH_PENDING: set[str] = set()
+_HEALTH_REFRESH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=3, thread_name_prefix="health-refresh"
+)
+
+
+def _load_health_cache_from_disk() -> None:
+    if not _HEALTH_CACHE_FILE.exists():
+        return
+    try:
+        raw = json.loads(_HEALTH_CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    entries: Dict[str, tuple[datetime, str]] = {}
+    for key, entry in raw.items():
+        if not isinstance(entry, dict):
+            continue
+        ts_raw = entry.get("timestamp")
+        badge = entry.get("badge")
+        if not ts_raw or not badge:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_raw)
+        except Exception:
+            continue
+        entries[key] = (ts, badge)
+    if not entries:
+        return
+    with _HEALTH_CACHE_LOCK:
+        _HEALTH_CACHE.update(entries)
+
+
+def _persist_health_cache() -> None:
+    try:
+        with _HEALTH_CACHE_LOCK:
+            serializable = {
+                key: {"timestamp": ts.isoformat(), "badge": badge}
+                for key, (ts, badge) in _HEALTH_CACHE.items()
+            }
+        _HEALTH_CACHE_FILE.write_text(
+            json.dumps(serializable, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+_load_health_cache_from_disk()
 
 
 def _normalize_account(record: Dict) -> Dict:
@@ -120,6 +177,7 @@ def update_account(username: str, updates: Dict) -> bool:
             updated.update(updates)
             items[idx] = _normalize_account(updated)
             _save(items)
+            _invalidate_health(username)
             return True
     return False
 
@@ -155,6 +213,7 @@ def add_account(username: str, alias: str, proxy: Optional[Dict] = None) -> bool
         record.update(proxy)
     items.append(_normalize_account(record))
     _save(items)
+    _invalidate_health(username)
     ok("Agregada.")
     return True
 
@@ -166,11 +225,13 @@ def remove_account(username: str) -> None:
     remove_session(username)
     remove_totp_secret(username)
     clear_proxy(username)
+    _invalidate_health(username)
     ok("Eliminada (si existía).")
 
 
 def set_active(username: str, is_active: bool = True) -> None:
     if update_account(username, {"active": is_active}):
+        _invalidate_health(username)
         ok("Actualizada.")
     else:
         warn("No existe.")
@@ -178,6 +239,7 @@ def set_active(username: str, is_active: bool = True) -> None:
 
 def mark_connected(username: str, connected: bool) -> None:
     update_account(username, {"connected": connected})
+    _invalidate_health(username)
 
 
 def _proxy_config_from_inputs(data: Dict) -> ProxyConfig:
@@ -380,6 +442,217 @@ def _totp_indicator(account: Dict) -> str:
     return f" {em('🔐')}" if account.get("has_totp") else ""
 
 
+def _health_cache_key(username: str) -> str:
+    return username.strip().lstrip("@").lower()
+
+
+def _invalidate_health(username: str) -> None:
+    key = _health_cache_key(username)
+    if key:
+        with _HEALTH_CACHE_LOCK:
+            if key in _HEALTH_CACHE:
+                _HEALTH_CACHE.pop(key, None)
+        _persist_health_cache()
+
+
+def _health_cached(username: str) -> tuple[str | None, bool]:
+    key = _health_cache_key(username)
+    if not key:
+        return None, True
+    with _HEALTH_CACHE_LOCK:
+        cached = _HEALTH_CACHE.get(key)
+    if not cached:
+        return None, True
+    timestamp, badge = cached
+    expired = datetime.utcnow() - timestamp >= _HEALTH_CACHE_TTL
+    return badge, expired
+
+
+def _store_health(username: str, badge: str) -> str:
+    key = _health_cache_key(username)
+    if key:
+        with _HEALTH_CACHE_LOCK:
+            _HEALTH_CACHE[key] = (datetime.utcnow(), badge)
+        _persist_health_cache()
+    return badge
+
+
+def _badge_for_display(account: Dict) -> tuple[str, bool]:
+    username = account.get("username", "")
+    cached_badge, expired = _health_cached(username)
+    if cached_badge:
+        return cached_badge, expired
+    return "[🟡 En riesgo: unknown]", True
+
+
+def _schedule_health_refresh(accounts_to_refresh: List[Dict]) -> None:
+    for account in accounts_to_refresh:
+        username = account.get("username", "")
+        key = _health_cache_key(username)
+        if not key:
+            continue
+        with _HEALTH_CACHE_LOCK:
+            if key in _HEALTH_REFRESH_PENDING:
+                continue
+            _HEALTH_REFRESH_PENDING.add(key)
+
+        def _task(acc: Dict, cache_key: str, uname: str):
+            try:
+                badge = _compute_health_badge(acc)
+                _store_health(uname, badge)
+            finally:
+                with _HEALTH_CACHE_LOCK:
+                    _HEALTH_REFRESH_PENDING.discard(cache_key)
+
+        try:
+            _HEALTH_REFRESH_EXECUTOR.submit(_task, dict(account), key, username)
+        except Exception:
+            with _HEALTH_CACHE_LOCK:
+                _HEALTH_REFRESH_PENDING.discard(key)
+
+
+def _format_health_error(exc: Exception, ig_exceptions) -> str:
+    msg = str(exc).lower()
+
+    def _has_attr(name: str):
+        return getattr(ig_exceptions, name, None) if ig_exceptions else None
+
+    login_types = tuple(
+        tp
+        for tp in (
+            _has_attr("ClientLoginRequired"),
+            _has_attr("LoginRequired"),
+            _has_attr("TwoFactorRequired"),
+        )
+        if tp is not None
+    )
+    if login_types and isinstance(exc, login_types):
+        return "[⚠️ Sesión expirada]"
+
+    challenge_type = _has_attr("ChallengeRequired")
+    if challenge_type and isinstance(exc, challenge_type):
+        return "[🟡 En riesgo: challenge]"
+
+    checkpoint_type = _has_attr("CheckpointRequired")
+    if checkpoint_type and isinstance(exc, checkpoint_type):
+        return "[🟡 En riesgo: checkpoint]"
+
+    proxy_block_type = _has_attr("ProxyAddressIsBlocked")
+    if proxy_block_type and isinstance(exc, proxy_block_type):
+        return "[🌐 Proxy caído]"
+
+    action_block_types = tuple(
+        tp
+        for tp in (
+            _has_attr("FeedbackRequired"),
+            _has_attr("SentryBlock"),
+        )
+        if tp is not None
+    )
+    if action_block_types and isinstance(exc, action_block_types):
+        return "[🟡 En riesgo: action_block]"
+
+    rate_limit_types = tuple(
+        tp
+        for tp in (
+            _has_attr("RateLimitError"),
+            _has_attr("PleaseWaitFewMinutes"),
+        )
+        if tp is not None
+    )
+    if rate_limit_types and isinstance(exc, rate_limit_types):
+        return "[🟡 En riesgo: rate_limit]"
+
+    disabled_types = tuple(
+        tp
+        for tp in (
+            _has_attr("UserNotFound"),
+            _has_attr("NotFoundError"),
+        )
+        if tp is not None
+    )
+    if disabled_types and isinstance(exc, disabled_types):
+        return "[🔴 Desactivada]"
+
+    if "proxy" in msg or "timed out" in msg or "dns" in msg or "connection" in msg:
+        if any(word in msg for word in ("refused", "timeout", "timed out", "timedout", "unreachable", "name or service")):
+            return "[🌐 Proxy caído]"
+
+    if "login required" in msg or "sessionid" in msg or "401" in msg:
+        return "[⚠️ Sesión expirada]"
+
+    if "challenge" in msg:
+        return "[🟡 En riesgo: challenge]"
+
+    if "checkpoint" in msg:
+        return "[🟡 En riesgo: checkpoint]"
+
+    if any(keyword in msg for keyword in ("few minutes", "rate limit", "try again later")):
+        return "[🟡 En riesgo: rate_limit]"
+
+    if "feedback" in msg or "action block" in msg or "sentry" in msg:
+        return "[🟡 En riesgo: action_block]"
+
+    if "disabled" in msg or "desactiv" in msg:
+        return "[🔴 Desactivada]"
+
+    return "[🟡 En riesgo: unknown]"
+
+
+def _compute_health_badge(account: Dict) -> str:
+    username = account.get("username", "").strip().lstrip("@")
+    if not username:
+        return "[🟡 En riesgo: unknown]"
+
+    if not has_session(username):
+        return "[⚠️ Sesión expirada]"
+
+    try:
+        from instagrapi import Client, exceptions as ig_exceptions
+    except Exception:
+        return "[🟡 En riesgo: unknown]"
+
+    try:
+        cl = Client()
+    except Exception as exc:
+        return _format_health_error(exc, None)
+
+    try:
+        apply_proxy_to_client(cl, username, account, reason="healthcheck")
+    except Exception as exc:
+        return _format_health_error(exc, None)
+
+    try:
+        load_into(cl, username)
+    except FileNotFoundError:
+        return "[⚠️ Sesión expirada]"
+    except Exception as exc:
+        return _format_health_error(exc, ig_exceptions)
+
+    info = None
+    try:
+        info = cl.account_info()
+    except Exception as exc:
+        badge = _format_health_error(exc, ig_exceptions)
+        if "unknown" not in badge:
+            return badge
+        try:
+            if getattr(cl, "user_id", None):
+                info = cl.user_info(cl.user_id)
+        except Exception as inner_exc:
+            return _format_health_error(inner_exc, ig_exceptions)
+
+    if info and getattr(info, "username", None):
+        return "[✅ OK]"
+
+    return "[🟡 En riesgo: unknown]"
+
+
+def _health_badge(account: Dict) -> str:
+    badge = _compute_health_badge(account)
+    return _store_health(account.get("username", ""), badge)
+
+
 def menu_accounts():
     while True:
         banner()
@@ -393,15 +666,21 @@ def menu_accounts():
         if not group:
             print("(no hay cuentas aún)")
         else:
+            pending_refresh: List[Dict] = []
             for it in group:
                 flag = em("🟢") if it.get("active") else em("⚪")
                 conn = "[conectada]" if it.get("connected") else "[no conectada]"
                 sess = "[sesión]" if has_session(it["username"]) else "[sin sesión]"
                 proxy_flag = _proxy_indicator(it)
                 totp_flag = _totp_indicator(it)
+                badge, needs_refresh = _badge_for_display(it)
+                if needs_refresh:
+                    pending_refresh.append(it)
                 print(
-                    f" - @{it['username']} {conn} {sess} {flag} {proxy_flag}{totp_flag}"
+                    f" - @{it['username']} {conn} {sess} {flag} {proxy_flag}{totp_flag} • {badge}"
                 )
+            if pending_refresh:
+                _schedule_health_refresh(pending_refresh)
 
         print("\n1) Agregar cuenta")
         print("2) Eliminar cuenta")
