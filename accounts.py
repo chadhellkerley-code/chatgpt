@@ -25,8 +25,10 @@ from totp_store import has_secret as has_totp_secret
 from totp_store import remove_secret as remove_totp_secret
 from totp_store import save_secret as save_totp_secret
 from utils import ask, banner, em, ok, press_enter, title, warn
+from paths import runtime_base
 
-BASE = Path(__file__).resolve().parent
+BASE = runtime_base(Path(__file__).resolve().parent)
+BASE.mkdir(parents=True, exist_ok=True)
 DATA = BASE / "data"
 DATA.mkdir(exist_ok=True)
 FILE = DATA / "accounts.json"
