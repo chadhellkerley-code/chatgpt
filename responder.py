@@ -32,7 +32,14 @@ from runtime import (
 from session_store import has_session, load_into
 from storage import get_auto_state, log_conversation_status, save_auto_state
 from ui import Fore, full_line, style_text
-from utils import ask, ask_int, ask_multiline, banner, ok, press_enter, warn
+from utils import ask, ask_int, banner, ok, press_enter, warn
+
+try:  # pragma: no cover - depende de dependencia opcional
+    import requests
+    from requests import RequestException
+except Exception:  # pragma: no cover - fallback si requests no está
+    requests = None  # type: ignore
+    RequestException = Exception  # type: ignore
 
 try:  # pragma: no cover - depende de dependencia opcional
     import requests
@@ -47,6 +54,15 @@ DEFAULT_PROMPT = "Respondé cordial, breve y como humano."
 PROMPT_KEY = "autoresponder_system_prompt"
 ACTIVE_ALIAS: str | None = None
 MAX_SYSTEM_PROMPT_CHARS = 50000
+
+_GOHIGHLEVEL_FILE = runtime_base(Path(__file__).resolve().parent) / "storage" / "gohighlevel.json"
+_GOHIGHLEVEL_BASE = "https://rest.gohighlevel.com/v1"
+_PHONE_PATTERN = re.compile(r"(?<!\d)(?:\+?\d[\d\s().-]{7,}\d)")
+_EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+_GOHIGHLEVEL_STATE: Dict[str, dict] | None = None
+
+_PROMPT_STORAGE_DIR = runtime_base(Path(__file__).resolve().parent) / "data" / "autoresponder"
+_PROMPT_DEFAULT_ALIAS = "default"
 
 _GOHIGHLEVEL_FILE = runtime_base(Path(__file__).resolve().parent) / "storage" / "gohighlevel.json"
 _GOHIGHLEVEL_BASE = "https://rest.gohighlevel.com/v1"
@@ -240,7 +256,7 @@ def _gen_response(api_key: str, system_prompt: str, convo_text: str) -> str:
             model="gpt-4o-mini",
             input=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": convo_text[:6000]},
+                {"role": "user", "content": convo_text},
             ],
             temperature=0.6,
             max_output_tokens=180,
@@ -318,12 +334,50 @@ def _mask_key(value: str) -> str:
     return f"{value[:4]}…{value[-2:]}"
 
 
+def _system_prompt_file(alias: str | None = None) -> Path:
+    alias_key = (alias or _PROMPT_DEFAULT_ALIAS).strip() or _PROMPT_DEFAULT_ALIAS
+    safe_alias = re.sub(r"[^a-z0-9_.-]", "_", alias_key.lower())
+    return _PROMPT_STORAGE_DIR / safe_alias / "system_prompt.txt"
+
+
+def _normalize_system_prompt_text(value: str) -> str:
+    if not value:
+        return ""
+    return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _read_system_prompt_from_file(alias: str | None = None) -> str | None:
+    path = _system_prompt_file(alias)
+    if not path.exists():
+        return None
+    try:
+        return _normalize_system_prompt_text(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("No se pudo leer %s: %s", path, exc, exc_info=False)
+        return None
+
+
+def _persist_system_prompt(prompt: str, alias: str | None = None) -> str:
+    normalized = _normalize_system_prompt_text(prompt)
+    path = _system_prompt_file(alias)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(normalized, encoding="utf-8")
+    except Exception as exc:
+        logger.warning("No se pudo escribir %s: %s", path, exc, exc_info=False)
+    try:
+        update_app_config({PROMPT_KEY: normalized})
+    except Exception as exc:
+        logger.warning("No se pudo actualizar el system prompt en config: %s", exc, exc_info=False)
+    return normalized
+
+
 def _load_preferences() -> tuple[str, str]:
     env_values = read_env_local()
     api_key = env_values.get("OPENAI_API_KEY") or SETTINGS.openai_api_key or ""
     config_values = read_app_config()
-    prompt = config_values.get(PROMPT_KEY, "") or ""
-    prompt = prompt.strip() or DEFAULT_PROMPT
+    prompt = _read_system_prompt_from_file() or config_values.get(PROMPT_KEY, "") or ""
+    prompt = _normalize_system_prompt_text(prompt) or DEFAULT_PROMPT
     return api_key, prompt
 
 
@@ -586,27 +640,80 @@ def _configure_api_key() -> None:
 
 
 def _configure_prompt() -> None:
-    banner()
-    _, current_prompt = _load_preferences()
-    print(style_text("Configurar System Prompt", color=Fore.CYAN, bold=True))
-    print(style_text("Actual:", color=Fore.BLUE))
-    print(current_prompt or "(sin definir)")
-    print()
-    new_prompt = ask_multiline("Ingresá el nuevo System Prompt")
-    if not new_prompt:
-        warn("No se modificó el prompt.")
-        press_enter()
-        return
-    if len(new_prompt) > MAX_SYSTEM_PROMPT_CHARS:
-        warn(
-            f"El System Prompt no puede superar {MAX_SYSTEM_PROMPT_CHARS} caracteres. "
-            f"Recibido: {len(new_prompt)}."
-        )
-        press_enter()
-        return
-    update_app_config({PROMPT_KEY: new_prompt})
-    ok("System prompt guardado en storage/config.json")
-    press_enter()
+    while True:
+        banner()
+        _, current_prompt = _load_preferences()
+        print(style_text("Configurar System Prompt", color=Fore.CYAN, bold=True))
+        print(style_text("Actual:", color=Fore.BLUE))
+        print(current_prompt or "(sin definir)")
+        print()
+        print(f"Longitud actual: {len(current_prompt or '')} caracteres.")
+        print(full_line(color=Fore.BLUE))
+        print("1) Editar/pegar en consola (delimitador <<<END>>>)")
+        print("2) Cargar desde archivo .txt")
+        print("3) Ver primeros 400 caracteres")
+        print("4) Volver")
+        print(full_line(color=Fore.BLUE))
+        choice = ask("Opción: ").strip()
+
+        if choice == "1":
+            print(style_text(
+                "Pegá tu System Prompt y cerrá con una línea que diga <<<END>>>.",
+                color=Fore.CYAN,
+            ))
+            lines: list[str] = []
+            while True:
+                line = ask("› ")
+                if line.strip() == "<<<END>>>":
+                    break
+                lines.append(line.replace("\r", ""))
+            new_prompt = "\n".join(lines)
+            if not _normalize_system_prompt_text(new_prompt):
+                warn("No se modificó el prompt.")
+                press_enter()
+                continue
+            saved_prompt = _persist_system_prompt(new_prompt)
+            ok(f"System Prompt guardado. Longitud: {len(saved_prompt)} caracteres.")
+            press_enter()
+        elif choice == "2":
+            path_input = ask("Ruta del archivo .txt (vacío para cancelar): ").strip()
+            if not path_input:
+                warn("No se modificó el prompt.")
+                press_enter()
+                continue
+            file_path = Path(path_input).expanduser()
+            if not file_path.exists():
+                warn("El archivo especificado no existe.")
+                press_enter()
+                continue
+            try:
+                file_contents = file_path.read_text(encoding="utf-8")
+            except Exception as exc:
+                warn(f"No se pudo leer el archivo: {exc}")
+                press_enter()
+                continue
+            if not _normalize_system_prompt_text(file_contents):
+                warn("No se modificó el prompt.")
+                press_enter()
+                continue
+            saved_prompt = _persist_system_prompt(file_contents)
+            ok(f"System Prompt guardado. Longitud: {len(saved_prompt)} caracteres.")
+            press_enter()
+        elif choice == "3":
+            preview = (current_prompt or "")[:400]
+            print(style_text("Primeros 400 caracteres:", color=Fore.BLUE))
+            if not preview:
+                print("(sin definir)")
+            else:
+                print(preview)
+                if len(current_prompt or "") > 400:
+                    print(style_text("… (truncado)", color=Fore.YELLOW))
+            press_enter()
+        elif choice == "4":
+            break
+        else:
+            warn("Opción inválida.")
+            press_enter()
 
 
 def _available_aliases() -> List[str]:
