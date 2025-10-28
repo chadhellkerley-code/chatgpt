@@ -41,11 +41,25 @@ except Exception:  # pragma: no cover - fallback si requests no está
     requests = None  # type: ignore
     RequestException = Exception  # type: ignore
 
+try:  # pragma: no cover - depende de dependencia opcional
+    import requests
+    from requests import RequestException
+except Exception:  # pragma: no cover - fallback si requests no está
+    requests = None  # type: ignore
+    RequestException = Exception  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_PROMPT = "Respondé cordial, breve y como humano."
 PROMPT_KEY = "autoresponder_system_prompt"
 ACTIVE_ALIAS: str | None = None
+MAX_SYSTEM_PROMPT_CHARS = 50000
+
+_GOHIGHLEVEL_FILE = runtime_base(Path(__file__).resolve().parent) / "storage" / "gohighlevel.json"
+_GOHIGHLEVEL_BASE = "https://rest.gohighlevel.com/v1"
+_PHONE_PATTERN = re.compile(r"(?<!\d)(?:\+?\d[\d\s().-]{7,}\d)")
+_EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+_GOHIGHLEVEL_STATE: Dict[str, dict] | None = None
 
 _PROMPT_STORAGE_DIR = runtime_base(Path(__file__).resolve().parent) / "data" / "autoresponder"
 _PROMPT_DEFAULT_ALIAS = "default"
