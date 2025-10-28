@@ -5,7 +5,14 @@ import time
 
 from config import SETTINGS
 from storage import sent_totals_today
-from ui import Fore, full_line, print_daily_metrics, print_header, style_text
+from ui import (
+    Fore,
+    clear_console,
+    full_line,
+    print_daily_metrics,
+    print_header,
+    style_text,
+)
 from utils import ask, em, press_enter, warn
 
 
@@ -81,19 +88,26 @@ def menu():
     if licensekit and hasattr(licensekit, "enforce_startup_validation"):
         licensekit.enforce_startup_validation()
     while True:
+        clear_console()
         _print_dashboard()
         op = ask("Opción: ").strip()
         if op == "1" and accounts:
+            clear_console()
             accounts.menu_accounts()
         elif op == "2" and leads:
+            clear_console()
             leads.menu_leads()
         elif op == "3" and ig:
+            clear_console()
             ig.menu_send_rotating()
         elif op == "4" and storage:
+            clear_console()
             storage.menu_logs()
         elif op == "5" and responder:
+            clear_console()
             responder.menu_autoresponder()
         elif op == "6" and state_view:
+            clear_console()
             state_view.menu_conversation_state()
         elif (
             op == "7"
