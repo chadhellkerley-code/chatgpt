@@ -1,11 +1,14 @@
+import json
 import logging
+import re
 import time
 import unicodedata
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, List, Optional
 
 from accounts import get_account, list_all, mark_connected, prompt_login
 from config import (
@@ -17,6 +20,7 @@ from config import (
     update_env_local,
 )
 from proxy_manager import apply_proxy_to_client, record_proxy_failure, should_retry_proxy
+from paths import runtime_base
 from runtime import (
     STOP_EVENT,
     ensure_logging,
@@ -30,11 +34,25 @@ from storage import get_auto_state, log_conversation_status, save_auto_state
 from ui import Fore, full_line, style_text
 from utils import ask, ask_int, ask_multiline, banner, ok, press_enter, warn
 
+try:  # pragma: no cover - depende de dependencia opcional
+    import requests
+    from requests import RequestException
+except Exception:  # pragma: no cover - fallback si requests no está
+    requests = None  # type: ignore
+    RequestException = Exception  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_PROMPT = "Respondé cordial, breve y como humano."
 PROMPT_KEY = "autoresponder_system_prompt"
 ACTIVE_ALIAS: str | None = None
+MAX_SYSTEM_PROMPT_CHARS = 50000
+
+_GOHIGHLEVEL_FILE = runtime_base(Path(__file__).resolve().parent) / "storage" / "gohighlevel.json"
+_GOHIGHLEVEL_BASE = "https://rest.gohighlevel.com/v1"
+_PHONE_PATTERN = re.compile(r"(?<!\d)(?:\+?\d[\d\s().-]{7,}\d)")
+_EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+_GOHIGHLEVEL_STATE: Dict[str, dict] | None = None
 
 _POSITIVE_KEYWORDS = (
     "si",
@@ -309,6 +327,247 @@ def _load_preferences() -> tuple[str, str]:
     return api_key, prompt
 
 
+def _read_gohighlevel_state(refresh: bool = False) -> Dict[str, dict]:
+    global _GOHIGHLEVEL_STATE
+    if refresh or _GOHIGHLEVEL_STATE is None:
+        data: Dict[str, dict] = {"aliases": {}}
+        if _GOHIGHLEVEL_FILE.exists():
+            try:
+                loaded = json.loads(_GOHIGHLEVEL_FILE.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data.update(loaded)
+            except Exception:
+                data = {"aliases": {}}
+        if "aliases" not in data or not isinstance(data["aliases"], dict):
+            data["aliases"] = {}
+        _GOHIGHLEVEL_STATE = data
+    return _GOHIGHLEVEL_STATE
+
+
+def _write_gohighlevel_state(state: Dict[str, dict]) -> None:
+    state.setdefault("aliases", {})
+    _GOHIGHLEVEL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _GOHIGHLEVEL_FILE.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    _read_gohighlevel_state(refresh=True)
+
+
+def _normalize_alias_key(alias: str) -> str:
+    return alias.strip().lower()
+
+
+def _normalize_lead_id(lead: str) -> str:
+    return lead.strip().lower()
+
+
+def _get_gohighlevel_entry(alias: str) -> Dict[str, dict]:
+    state = _read_gohighlevel_state()
+    key = _normalize_alias_key(alias)
+    aliases: Dict[str, dict] = state.get("aliases", {})
+    entry = aliases.get(key)
+    if isinstance(entry, dict):
+        entry.setdefault("alias", alias.strip())
+        entry.setdefault("sent", {})
+        return entry
+    return {}
+
+
+def _set_gohighlevel_entry(alias: str, updates: Dict[str, object]) -> None:
+    alias = alias.strip()
+    if not alias:
+        warn("Alias inválido.")
+        return
+    state = _read_gohighlevel_state()
+    aliases: Dict[str, dict] = state.setdefault("aliases", {})
+    key = _normalize_alias_key(alias)
+    entry = aliases.get(key, {})
+    entry.setdefault("alias", alias)
+    entry.setdefault("sent", {})
+    entry.update({k: v for k, v in updates.items() if v is not None})
+    aliases[key] = entry
+    _write_gohighlevel_state(state)
+
+
+def _mask_gohighlevel_status(entry: Dict[str, object]) -> str:
+    api_key = str(entry.get("api_key") or "")
+    enabled = bool(entry.get("enabled"))
+    status = "🟢 Activo" if enabled else "⚪ Inactivo"
+    return f"{status} • API Key: {_mask_key(api_key) or '(sin definir)'}"
+
+
+def _gohighlevel_status_lines() -> List[str]:
+    state = _read_gohighlevel_state()
+    aliases: Dict[str, dict] = state.get("aliases", {})
+    if not aliases:
+        return ["(sin configuraciones)"]
+    rows: List[str] = []
+    for key in sorted(aliases.keys()):
+        entry = aliases[key]
+        label = str(entry.get("alias") or key)
+        rows.append(f" - {label}: {_mask_gohighlevel_status(entry)}")
+    return rows
+
+
+def _gohighlevel_summary_line() -> str:
+    state = _read_gohighlevel_state()
+    aliases: Dict[str, dict] = state.get("aliases", {})
+    if not aliases:
+        return "GoHighLevel: (sin configurar)"
+    active = sum(1 for entry in aliases.values() if entry.get("enabled"))
+    configured = sum(1 for entry in aliases.values() if entry.get("api_key"))
+    return f"GoHighLevel: {active} activos / {configured} configurados"
+
+
+def _gohighlevel_mark_sent(alias: str, lead: str, phone: str) -> None:
+    state = _read_gohighlevel_state()
+    aliases: Dict[str, dict] = state.setdefault("aliases", {})
+    key = _normalize_alias_key(alias)
+    entry = aliases.setdefault(key, {"alias": alias.strip(), "sent": {}})
+    entry.setdefault("sent", {})
+    entry["sent"][_normalize_lead_id(lead)] = {"phone": phone, "ts": int(time.time())}
+    aliases[key] = entry
+    _write_gohighlevel_state(state)
+
+
+def _gohighlevel_already_sent(alias: str, lead: str, phone: str) -> bool:
+    entry = _get_gohighlevel_entry(alias)
+    sent: Dict[str, dict] = entry.get("sent", {})  # type: ignore[assignment]
+    record = sent.get(_normalize_lead_id(lead))
+    if not isinstance(record, dict):
+        return False
+    stored_phone = str(record.get("phone") or "")
+    return bool(stored_phone) and stored_phone == phone
+
+
+def _gohighlevel_enabled_entry_for(username: str) -> tuple[Optional[str], Dict[str, object]]:
+    alias_candidates: List[str] = []
+    if ACTIVE_ALIAS:
+        alias_candidates.append(ACTIVE_ALIAS)
+    account = get_account(username) or {}
+    account_alias = str(account.get("alias") or "").strip()
+    if account_alias:
+        alias_candidates.append(account_alias)
+    alias_candidates.append(username)
+    alias_candidates.append("ALL")
+
+    seen: set[str] = set()
+    for alias in alias_candidates:
+        norm = _normalize_alias_key(alias)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        entry = _get_gohighlevel_entry(alias)
+        api_key = str(entry.get("api_key") or "")
+        if api_key and entry.get("enabled"):
+            return alias, entry
+    return None, {}
+
+
+def _require_requests() -> bool:
+    if requests is None:  # pragma: no cover - entorno sin dependencia
+        warn("La librería 'requests' no está disponible. Instalála para usar GoHighLevel.")
+        press_enter()
+        return False
+    return True
+
+
+def _gohighlevel_select_alias() -> Optional[str]:
+    alias = _prompt_alias_selection()
+    if not alias:
+        warn("Alias inválido.")
+        press_enter()
+        return None
+    return alias
+
+
+def _gohighlevel_configure_key() -> None:
+    banner()
+    print(style_text("GoHighLevel • Configurar API Key", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.BLUE))
+    for line in _gohighlevel_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _gohighlevel_select_alias()
+    if not alias:
+        return
+    current = _get_gohighlevel_entry(alias)
+    print(f"Actual: {_mask_key(str(current.get('api_key') or '')) or '(sin definir)'}")
+    new_key = ask("Ingresá la API Key de GoHighLevel (vacío para cancelar): ").strip()
+    if not new_key:
+        warn("No se modificó la API Key de GoHighLevel.")
+        press_enter()
+        return
+    _set_gohighlevel_entry(alias, {"api_key": new_key})
+    ok(f"API Key guardada para {alias}.")
+    press_enter()
+
+
+def _gohighlevel_activate() -> None:
+    if not _require_requests():
+        return
+    banner()
+    print(style_text("GoHighLevel • Activar envío automático", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.BLUE))
+    for line in _gohighlevel_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _gohighlevel_select_alias()
+    if not alias:
+        return
+    entry = _get_gohighlevel_entry(alias)
+    api_key = str(entry.get("api_key") or "")
+    if not api_key:
+        warn("Configurá la API Key antes de activar la conexión.")
+        press_enter()
+        return
+    _set_gohighlevel_entry(alias, {"enabled": True})
+    ok(f"Conexión GoHighLevel activada para {alias}.")
+    press_enter()
+
+
+def _gohighlevel_deactivate() -> None:
+    banner()
+    print(style_text("GoHighLevel • Desactivar conexión", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.BLUE))
+    for line in _gohighlevel_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _gohighlevel_select_alias()
+    if not alias:
+        return
+    _set_gohighlevel_entry(alias, {"enabled": False})
+    ok(f"Conexión GoHighLevel desactivada para {alias}.")
+    press_enter()
+
+
+def _gohighlevel_menu() -> None:
+    while True:
+        banner()
+        print(style_text("Conectar con GoHighLevel", color=Fore.CYAN, bold=True))
+        print(full_line(color=Fore.BLUE))
+        for line in _gohighlevel_status_lines():
+            print(line)
+        print(full_line(color=Fore.BLUE))
+        print("1) Ingresar API Key de GoHighLevel")
+        print("2) Activar el envío automático de leads calificados al CRM de GoHighLevel")
+        print("3) Desactivar conexión")
+        print("4) Volver al submenú anterior")
+        print(full_line(color=Fore.BLUE))
+        choice = ask("Opción: ").strip()
+        if choice == "1":
+            _gohighlevel_configure_key()
+        elif choice == "2":
+            _gohighlevel_activate()
+        elif choice == "3":
+            _gohighlevel_deactivate()
+        elif choice == "4":
+            break
+        else:
+            warn("Opción inválida.")
+            press_enter()
+
+
 def _configure_api_key() -> None:
     banner()
     current_key, _ = _load_preferences()
@@ -336,6 +595,13 @@ def _configure_prompt() -> None:
     new_prompt = ask_multiline("Ingresá el nuevo System Prompt")
     if not new_prompt:
         warn("No se modificó el prompt.")
+        press_enter()
+        return
+    if len(new_prompt) > MAX_SYSTEM_PROMPT_CHARS:
+        warn(
+            f"El System Prompt no puede superar {MAX_SYSTEM_PROMPT_CHARS} caracteres. "
+            f"Recibido: {len(new_prompt)}."
+        )
         press_enter()
         return
     update_app_config({PROMPT_KEY: new_prompt})
@@ -377,12 +643,14 @@ def _print_menu_header() -> None:
     print(f"API Key: {_mask_key(api_key) or '(sin definir)'}")
     print(f"System prompt: {_preview_prompt(prompt)}")
     print(status)
+    print(_gohighlevel_summary_line())
     print(full_line(color=Fore.BLUE))
     print("1) Configurar API Key")
     print("2) Configurar System Prompt")
     print("3) Activar bot (alias/grupo)")
-    print("4) Desactivar bot")
-    print("5) Volver")
+    print("4) Conectar con GoHighLevel")
+    print("5) Desactivar bot")
+    print("6) Volver")
     print(full_line(color=Fore.BLUE))
 
 
@@ -459,6 +727,151 @@ def _handle_account_issue(user: str, exc: Exception, active: List[str]) -> None:
             return
 
 
+def _normalize_phone(raw: str) -> str:
+    raw = raw.strip()
+    if not raw:
+        return ""
+    has_plus = raw.startswith("+")
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if not digits:
+        return ""
+    return f"+{digits}" if has_plus else digits
+
+
+def _extract_phone_numbers(text: str) -> List[str]:
+    if not text:
+        return []
+    matches = _PHONE_PATTERN.findall(text)
+    numbers: List[str] = []
+    for match in matches:
+        normalized = _normalize_phone(match)
+        if normalized and len(normalized.replace("+", "")) >= 8:
+            if normalized not in numbers:
+                numbers.append(normalized)
+    return numbers
+
+
+def _extract_email_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    matches = list(_EMAIL_PATTERN.findall(text))
+    if not matches:
+        return None
+    return matches[-1]
+
+
+def _build_conversation_note(account: str, recipient: str, conversation: str) -> str:
+    header = [f"Cuenta IG: @{account}"]
+    if recipient:
+        header.append(f"Usuario: @{recipient}")
+    header.append("Historial completo:")
+    return "\n".join(header + [conversation])
+
+
+def _create_gohighlevel_contact(api_key: str, payload: Dict[str, object]) -> Optional[str]:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    url = f"{_GOHIGHLEVEL_BASE}/contacts/"
+    response = requests.post(url, json=payload, headers=headers, timeout=15)  # type: ignore[call-arg]
+    data: Dict[str, object] = {}
+    if response.status_code == 409:
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+        contact = data.get("contact") if isinstance(data.get("contact"), dict) else None
+        contact_id = data.get("contactId") or (contact.get("id") if contact else None)
+        if contact_id:
+            return str(contact_id)
+    response.raise_for_status()
+    if response.content:
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+    contact_data = data.get("contact") if isinstance(data.get("contact"), dict) else {}
+    if isinstance(contact_data, dict):
+        for key in ("id", "Id", "contactId"):
+            if contact_data.get(key):
+                return str(contact_data[key])
+    for key in ("contactId", "id", "Id"):
+        value = data.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _attach_gohighlevel_note(api_key: str, contact_id: str, note: str) -> None:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    url = f"{_GOHIGHLEVEL_BASE}/contacts/{contact_id}/notes/"
+    payload = {"body": note}
+    response = requests.post(url, json=payload, headers=headers, timeout=15)  # type: ignore[call-arg]
+    response.raise_for_status()
+
+
+def _send_lead_to_gohighlevel(
+    account: str,
+    recipient: str,
+    conversation: str,
+    phone_numbers: List[str],
+) -> None:
+    if requests is None:
+        logger.warning("GoHighLevel no disponible: falta la librería requests.")
+        return
+    if not phone_numbers:
+        return
+    alias, entry = _gohighlevel_enabled_entry_for(account)
+    if not alias or not entry:
+        return
+    api_key = str(entry.get("api_key") or "")
+    if not api_key:
+        return
+    lead_identifier = recipient or phone_numbers[0]
+    normalized_lead = _normalize_lead_id(lead_identifier)
+    main_phone = phone_numbers[0]
+    if _gohighlevel_already_sent(alias, normalized_lead, main_phone):
+        return
+
+    contact_payload: Dict[str, object] = {
+        "name": recipient or "Lead Instagram",
+        "phone": main_phone,
+    }
+    email = _extract_email_from_text(conversation)
+    if email:
+        contact_payload["email"] = email
+    try:
+        contact_id = _create_gohighlevel_contact(api_key, contact_payload)
+        if not contact_id:
+            logger.warning(
+                "No se obtuvo contactId al crear contacto en GoHighLevel para %s.",
+                recipient or "(sin usuario)",
+            )
+            return
+        note_text = _build_conversation_note(account, recipient, conversation)
+        _attach_gohighlevel_note(api_key, contact_id, note_text)
+    except RequestException as exc:  # pragma: no cover - depende de red externa
+        logger.warning("Error enviando lead a GoHighLevel: %s", exc, exc_info=False)
+        return
+    except Exception as exc:  # pragma: no cover - manejo defensivo
+        logger.warning("Fallo inesperado con GoHighLevel: %s", exc, exc_info=False)
+        return
+
+    _gohighlevel_mark_sent(alias, normalized_lead, main_phone)
+    logger.info(
+        "Lead enviado a GoHighLevel | alias=%s | cuenta=%s | contacto=%s",
+        alias,
+        account,
+        recipient or "(sin usuario)",
+    )
+
+
 def _process_inbox(
     client,
     user: str,
@@ -498,6 +911,9 @@ def _process_inbox(
             if isinstance(msg_ts, datetime):
                 ts_value = int(msg_ts.timestamp())
             log_conversation_status(user, recipient_username, status, timestamp=ts_value)
+        phone_numbers = _extract_phone_numbers(last.text or "")
+        if phone_numbers and status != "No interesado":
+            _send_lead_to_gohighlevel(user, recipient_username, convo, phone_numbers)
         try:
             reply = _gen_response(api_key, system_prompt, convo)
             client.direct_send(reply, [last.user_id])
@@ -642,8 +1058,10 @@ def menu_autoresponder():
         elif choice == "3":
             _activate_bot()
         elif choice == "4":
-            _manual_stop()
+            _gohighlevel_menu()
         elif choice == "5":
+            _manual_stop()
+        elif choice == "6":
             break
         else:
             warn("Opción inválida.")
