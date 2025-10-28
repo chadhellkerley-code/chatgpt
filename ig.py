@@ -9,7 +9,9 @@ import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Dict, Optional
+from datetime import datetime, timedelta, time as dt_time
+from typing import Callable, Dict, Optional
+from zoneinfo import ZoneInfo
 
 from accounts import get_account, list_all, mark_connected, prompt_login
 from config import SETTINGS
@@ -43,6 +45,43 @@ class SendEvent:
 
 _LIVE_COUNTS = {"base_ok": 0, "base_fail": 0, "run_ok": 0, "run_fail": 0}
 _LIVE_LOCK = threading.Lock()
+
+AR_TZ = ZoneInfo("America/Argentina/Cordoba")
+
+
+def today_ar():
+    return datetime.now(AR_TZ).date()
+
+
+def next_midnight_ar(now=None):
+    now = now or datetime.now(AR_TZ)
+    tomorrow = now.date() + timedelta(days=1)
+    return datetime.combine(tomorrow, dt_time(0, 0), tzinfo=AR_TZ)
+
+
+def _refresh_daily_state(send_state: Dict[str, object]) -> None:
+    try:
+        now = datetime.now(AR_TZ)
+        stored_date = send_state.get("date")
+        next_reset = send_state.get("next_reset_at")
+        if (
+            stored_date is None
+            or next_reset is None
+            or now >= next_reset
+            or today_ar() != stored_date
+        ):
+            send_state["date"] = today_ar()
+            send_state["sent"] = 0
+            send_state["errors"] = 0
+            send_state["next_reset_at"] = next_midnight_ar(now)
+    except Exception:
+        try:
+            send_state["date"] = today_ar()
+            send_state.setdefault("sent", 0)
+            send_state.setdefault("errors", 0)
+            send_state["next_reset_at"] = next_midnight_ar()
+        except Exception:
+            pass
 
 
 def _reset_live_counters(reset_run: bool = True) -> None:
@@ -144,9 +183,10 @@ def _render_progress(
     success_totals: Dict[str, int],
     failed_totals: Dict[str, int],
     live_table: LiveTable,
+    send_state: Dict[str, object],
 ) -> None:
     banner()
-    ok_total, err_total = get_message_totals()
+    _refresh_daily_state(send_state)
     print(full_line())
     print(style_text(f"Alias: {alias}", color=Fore.CYAN, bold=True))
     print(style_text(f"Leads pendientes: {leads_left}", bold=True))
@@ -160,8 +200,14 @@ def _render_progress(
     print(style_text("Envíos en vuelo", color=Fore.CYAN, bold=True))
     print(live_table.render())
     print(full_line())
-    ok_line = style_text(f"Mensajes enviados: {ok_total}", color=Fore.GREEN, bold=True)
-    err_line = style_text(f"Mensajes con error: {err_total}", color=Fore.RED, bold=True)
+    sent_today = int(send_state.get("sent", 0) or 0)
+    err_today = int(send_state.get("errors", 0) or 0)
+    ok_line = style_text(
+        f"Mensajes enviados: {sent_today}", color=Fore.GREEN, bold=True
+    )
+    err_line = style_text(
+        f"Mensajes con error: {err_today}", color=Fore.RED, bold=True
+    )
     print(ok_line)
     print(err_line)
     print(full_line())
@@ -173,6 +219,7 @@ def _handle_event(
     failed: Dict[str, int],
     live_table: LiveTable,
     remaining: Dict[str, int],
+    bump: Callable[[str, int], None],
 ) -> Optional[str]:
     username = event.username
     if event.success:
@@ -182,6 +229,7 @@ def _handle_event(
         log_sent(username, event.lead, True, detail)
         with _LIVE_LOCK:
             _LIVE_COUNTS["run_ok"] += 1
+        bump("sent", 1)
         summary = style_text(
             f"✅ @{username} → @{event.lead}", color=Fore.GREEN, bold=True
         )
@@ -193,6 +241,7 @@ def _handle_event(
         log_sent(username, event.lead, False, detail)
         with _LIVE_LOCK:
             _LIVE_COUNTS["run_fail"] += 1
+        bump("errors", 1)
         summary = style_text(
             f"❌ @{username} → @{event.lead} ({detail})", color=Fore.RED, bold=True
         )
@@ -325,6 +374,26 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
     _reset_live_counters()
     settings = SETTINGS
 
+    send_state: Dict[str, object] = {
+        "date": today_ar(),
+        "sent": 0,
+        "errors": 0,
+        "next_reset_at": next_midnight_ar(),
+    }
+
+    def bump(kind: str, delta: int = 1) -> None:
+        if kind not in {"sent", "errors"}:
+            return
+        try:
+            _refresh_daily_state(send_state)
+            current = int(send_state.get(kind, 0) or 0)
+            send_state[kind] = current + delta
+        except Exception:
+            try:
+                send_state[kind] = int(send_state.get(kind, 0) or 0) + delta
+            except Exception:
+                pass
+
     inputs = _schedule_inputs(settings, concurrency_override)
     if inputs is None:
         return
@@ -443,12 +512,20 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
     try:
         last_render = 0.0
         while users and any(v > 0 for v in remaining.values()) and not STOP_EVENT.is_set():
+            _refresh_daily_state(send_state)
             need_render = False
             # procesar resultados pendientes
             try:
                 while True:
                     event = result_queue.get_nowait()
-                    action = _handle_event(event, success, failed, live_table, remaining)
+                    action = _handle_event(
+                        event,
+                        success,
+                        failed,
+                        live_table,
+                        remaining,
+                        bump,
+                    )
                     need_render = True
                     if action == "stop":
                         break
@@ -492,7 +569,14 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
 
             now = time.time()
             if need_render or now - last_render > 0.5:
-                _render_progress(alias, len(users), success, failed, live_table)
+                _render_progress(
+                    alias,
+                    len(users),
+                    success,
+                    failed,
+                    live_table,
+                    send_state,
+                )
                 last_render = now
             time.sleep(0.1)
 
@@ -500,8 +584,22 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
         while True:
             try:
                 event = result_queue.get(timeout=0.5)
-                _handle_event(event, success, failed, live_table, remaining)
-                _render_progress(alias, len(users), success, failed, live_table)
+                _handle_event(
+                    event,
+                    success,
+                    failed,
+                    live_table,
+                    remaining,
+                    bump,
+                )
+                _render_progress(
+                    alias,
+                    len(users),
+                    success,
+                    failed,
+                    live_table,
+                    send_state,
+                )
             except queue.Empty:
                 break
 
@@ -519,7 +617,14 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
             listener.join(timeout=0.1)
 
         _reset_live_counters()
-        _render_progress(alias, len(users), success, failed, live_table)
+        _render_progress(
+            alias,
+            len(users),
+            success,
+            failed,
+            live_table,
+            send_state,
+        )
 
     print("\n== Resumen ==")
     total_ok = sum(success.values())
