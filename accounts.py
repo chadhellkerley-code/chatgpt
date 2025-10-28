@@ -38,6 +38,46 @@ logger = logging.getLogger(__name__)
 
 _HEALTH_CACHE_TTL = timedelta(minutes=15)
 _HEALTH_CACHE: Dict[str, tuple[datetime, str]] = {}
+_HEALTH_CACHE_FILE = DATA / "account_health.json"
+
+
+def _load_health_cache_from_disk() -> None:
+    if not _HEALTH_CACHE_FILE.exists():
+        return
+    try:
+        raw = json.loads(_HEALTH_CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    now = datetime.utcnow()
+    for key, entry in raw.items():
+        if not isinstance(entry, dict):
+            continue
+        ts_raw = entry.get("timestamp")
+        badge = entry.get("badge")
+        if not ts_raw or not badge:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_raw)
+        except Exception:
+            continue
+        if now - ts <= _HEALTH_CACHE_TTL:
+            _HEALTH_CACHE[key] = (ts, badge)
+
+
+def _persist_health_cache() -> None:
+    try:
+        serializable = {
+            key: {"timestamp": ts.isoformat(), "badge": badge}
+            for key, (ts, badge) in _HEALTH_CACHE.items()
+        }
+        _HEALTH_CACHE_FILE.write_text(
+            json.dumps(serializable, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+_load_health_cache_from_disk()
 
 
 def _normalize_account(record: Dict) -> Dict:
@@ -398,7 +438,9 @@ def _health_cache_key(username: str) -> str:
 def _invalidate_health(username: str) -> None:
     key = _health_cache_key(username)
     if key:
-        _HEALTH_CACHE.pop(key, None)
+        if key in _HEALTH_CACHE:
+            _HEALTH_CACHE.pop(key, None)
+            _persist_health_cache()
 
 
 def _health_from_cache(username: str) -> str | None:
@@ -411,7 +453,9 @@ def _health_from_cache(username: str) -> str | None:
     timestamp, badge = cached
     if datetime.utcnow() - timestamp < _HEALTH_CACHE_TTL:
         return badge
-    _HEALTH_CACHE.pop(key, None)
+    if key in _HEALTH_CACHE:
+        _HEALTH_CACHE.pop(key, None)
+        _persist_health_cache()
     return None
 
 
@@ -419,6 +463,7 @@ def _store_health(username: str, badge: str) -> str:
     key = _health_cache_key(username)
     if key:
         _HEALTH_CACHE[key] = (datetime.utcnow(), badge)
+        _persist_health_cache()
     return badge
 
 
