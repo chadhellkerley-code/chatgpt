@@ -41,19 +41,21 @@ except Exception:  # pragma: no cover - fallback si requests no está
     requests = None  # type: ignore
     RequestException = Exception  # type: ignore
 
-try:  # pragma: no cover - depende de dependencia opcional
-    import requests
-    from requests import RequestException
-except Exception:  # pragma: no cover - fallback si requests no está
-    requests = None  # type: ignore
-    RequestException = Exception  # type: ignore
-
 logger = logging.getLogger(__name__)
 
 DEFAULT_PROMPT = "Respondé cordial, breve y como humano."
 PROMPT_KEY = "autoresponder_system_prompt"
 ACTIVE_ALIAS: str | None = None
 MAX_SYSTEM_PROMPT_CHARS = 50000
+
+_GOHIGHLEVEL_FILE = runtime_base(Path(__file__).resolve().parent) / "storage" / "gohighlevel.json"
+_GOHIGHLEVEL_BASE = "https://rest.gohighlevel.com/v1"
+_PHONE_PATTERN = re.compile(r"(?<!\d)(?:\+?\d[\d\s().-]{7,}\d)")
+_EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+_GOHIGHLEVEL_STATE: Dict[str, dict] | None = None
+
+_PROMPT_STORAGE_DIR = runtime_base(Path(__file__).resolve().parent) / "data" / "autoresponder"
+_PROMPT_DEFAULT_ALIAS = "default"
 
 _GOHIGHLEVEL_FILE = runtime_base(Path(__file__).resolve().parent) / "storage" / "gohighlevel.json"
 _GOHIGHLEVEL_BASE = "https://rest.gohighlevel.com/v1"
@@ -737,6 +739,22 @@ def _preview_prompt(prompt: str) -> str:
     return first_line
 
 
+def autoresponder_menu_options() -> List[str]:
+    return [
+        "1) Configurar API Key",
+        "2) Configurar System Prompt",
+        "3) Activar bot (alias/grupo)",
+        "4) Conectar con GoHighLevel",
+        "5) Desactivar bot",
+        "6) Volver",
+    ]
+
+
+def autoresponder_prompt_length() -> int:
+    _, prompt = _load_preferences()
+    return len(prompt or "")
+
+
 def _print_menu_header() -> None:
     banner()
     api_key, prompt = _load_preferences()
@@ -752,12 +770,8 @@ def _print_menu_header() -> None:
     print(status)
     print(_gohighlevel_summary_line())
     print(full_line(color=Fore.BLUE))
-    print("1) Configurar API Key")
-    print("2) Configurar System Prompt")
-    print("3) Activar bot (alias/grupo)")
-    print("4) Conectar con GoHighLevel")
-    print("5) Desactivar bot")
-    print("6) Volver")
+    for option in autoresponder_menu_options():
+        print(option)
     print(full_line(color=Fore.BLUE))
 
 
