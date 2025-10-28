@@ -59,6 +59,21 @@ def next_midnight_ar(now=None):
     return datetime.combine(tomorrow, dt_time(0, 0), tzinfo=AR_TZ)
 
 
+def create_daily_send_state() -> Dict[str, object]:
+    """Return a fresh counter state for the send screen.
+
+    Keeping this in a helper lets both owner and client launchers
+    initialize the exact same midnight reset behaviour.
+    """
+
+    return {
+        "date": today_ar(),
+        "sent": 0,
+        "errors": 0,
+        "next_reset_at": next_midnight_ar(),
+    }
+
+
 def _refresh_daily_state(send_state: Dict[str, object]) -> None:
     try:
         now = datetime.now(AR_TZ)
@@ -374,12 +389,7 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
     _reset_live_counters()
     settings = SETTINGS
 
-    send_state: Dict[str, object] = {
-        "date": today_ar(),
-        "sent": 0,
-        "errors": 0,
-        "next_reset_at": next_midnight_ar(),
-    }
+    send_state: Dict[str, object] = create_daily_send_state()
 
     def bump(kind: str, delta: int = 1) -> None:
         if kind not in {"sent", "errors"}:
