@@ -1983,6 +1983,8 @@ def _google_calendar_menu() -> None:
             _google_calendar_load_credentials_json()
         elif choice == "7":
             break
+        elif choice == "7":
+            _google_calendar_load_credentials_json()
         else:
             warn("Opción inválida.")
             press_enter()
