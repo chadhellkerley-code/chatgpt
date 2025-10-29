@@ -156,6 +156,7 @@ _GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 _GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 _GOOGLE_CALENDAR_BASE = "https://www.googleapis.com/calendar/v3"
 _GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar"
+_GOOGLE_REDIRECT_URI = "http://localhost"
 _GOOGLE_STATE: Dict[str, dict] | None = None
 _MEETING_TIME_PATTERN = re.compile(
     r"(?P<hour>\b[01]?\d|2[0-3])(?:(?:[:h\.])(?P<minute>[0-5]\d))?\s*(?P<ampm>am|pm)?\s*(?P<label>hs|hrs|horas)?",
@@ -1603,22 +1604,60 @@ def _google_calendar_perform_device_flow(
     return None
 
 
+def _google_calendar_validate_client_payload(
+    payload: Dict[str, object]
+) -> tuple[Optional[Dict[str, object]], Optional[str]]:
+    if not isinstance(payload, dict):
+        return None, "El archivo JSON no contiene una estructura válida."
+    installed = payload.get("installed")
+    if not isinstance(installed, dict):
+        return (
+            None,
+            "El archivo JSON debe corresponder a una 'Aplicación de escritorio' generada en Google Cloud Console.",
+        )
+    redirect_uris = installed.get("redirect_uris")
+    normalized_uris: set[str] = set()
+    if isinstance(redirect_uris, (list, tuple)):
+        normalized_uris = {
+            str(uri).strip().rstrip("/")
+            for uri in redirect_uris
+            if isinstance(uri, str) and uri.strip()
+        }
+    if _GOOGLE_REDIRECT_URI.rstrip("/") not in normalized_uris:
+        return (
+            None,
+            "El JSON debe incluir http://localhost como redirect URI autorizado en la consola de Google.",
+        )
+    client_id = installed.get("client_id")
+    if not client_id:
+        return None, "El archivo JSON no contiene un Client ID válido."
+    return installed, None
+
+
 def _google_calendar_extract_client_credentials(
     payload: Dict[str, object]
 ) -> tuple[Optional[str], Optional[str]]:
-    if not isinstance(payload, dict):
+    config, _ = _google_calendar_validate_client_payload(payload)
+    if not config:
         return None, None
-    candidates = [payload]
-    for key in ("installed", "web"):
-        value = payload.get(key)
-        if isinstance(value, dict):
-            candidates.append(value)
-    for candidate in candidates:
-        client_id = candidate.get("client_id")
-        client_secret = candidate.get("client_secret")
-        if client_id:
-            return str(client_id), (str(client_secret) if client_secret else None)
-    return None, None
+    client_id = config.get("client_id")
+    client_secret = config.get("client_secret")
+    return (
+        (str(client_id) if client_id else None),
+        (str(client_secret) if client_secret else None),
+    )
+
+
+def _google_calendar_report_oauth_error(exc: Exception) -> None:
+    base_message = (
+        "Error de autenticación. Verificá que el JSON cargado sea válido, "
+        "que estés autorizado como tester y que el proyecto esté correctamente configurado."
+    )
+    details = str(exc).strip()
+    if details:
+        warn(f"{base_message} Detalle: {details}")
+    else:
+        warn(base_message)
 
 
 def _ensure_google_auth_oauthlib() -> bool:
@@ -1705,7 +1744,14 @@ def _google_calendar_load_credentials_json() -> None:
         warn(f"No se pudo leer el archivo JSON: {exc}")
         press_enter()
         return
-    client_id, client_secret = _google_calendar_extract_client_credentials(json_payload)
+    config, error = _google_calendar_validate_client_payload(json_payload)
+    if error:
+        warn(error)
+        press_enter()
+        return
+    client_id = str(config.get("client_id") or "")
+    client_secret_value = config.get("client_secret")
+    client_secret = str(client_secret_value) if client_secret_value else None
     if not client_id:
         warn("El archivo JSON no contiene un Client ID válido.")
         press_enter()
@@ -1718,6 +1764,11 @@ def _google_calendar_load_credentials_json() -> None:
         flow = InstalledAppFlow.from_client_secrets_file(
             str(file_path), scopes=[_GOOGLE_SCOPE]
         )
+        try:
+            flow.redirect_uri = _GOOGLE_REDIRECT_URI
+        except Exception:
+            # Algunos objetos Flow no exponen redirect_uri hasta ejecutar run_*.
+            pass
     except Exception as exc:  # pragma: no cover - depende de librería externa
         warn(f"No se pudo inicializar el flujo OAuth: {exc}")
         press_enter()
@@ -1732,7 +1783,7 @@ def _google_calendar_load_credentials_json() -> None:
         try:
             credentials = flow.run_console()
         except Exception as exc_console:  # pragma: no cover - depende de librería externa
-            warn(f"No se pudo completar la autenticación OAuth: {exc_console}")
+            _google_calendar_report_oauth_error(exc_console)
             press_enter()
             return
     entry = _get_google_calendar_entry(alias)
