@@ -36,7 +36,10 @@ from ui import Fore, full_line, style_text
 from utils import ask, ask_int, banner, ok, press_enter, warn
 from zoneinfo import ZoneInfo
 
-from dateutil import parser as date_parser
+try:  # pragma: no cover - depende de dependencia opcional
+    from dateutil import parser as date_parser
+except Exception:  # pragma: no cover - fallback si falta dependencia
+    date_parser = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - depende de dependencia opcional
     import requests
@@ -60,6 +63,16 @@ DEFAULT_PROMPT = "Respondé cordial, breve y como humano."
 PROMPT_KEY = "autoresponder_system_prompt"
 ACTIVE_ALIAS: str | None = None
 MAX_SYSTEM_PROMPT_CHARS = 50000
+
+
+def _safe_parse_datetime(*args, **kwargs) -> Optional[datetime]:
+    """Parsea una fecha utilizando dateutil si está disponible."""
+    if date_parser is None:
+        return None
+    try:
+        return date_parser.parse(*args, **kwargs)
+    except Exception:
+        return None
 
 _GOHIGHLEVEL_FILE = runtime_base(Path(__file__).resolve().parent) / "storage" / "gohighlevel.json"
 _GOHIGHLEVEL_BASE = "https://rest.gohighlevel.com/v1"
@@ -889,7 +902,9 @@ def _google_calendar_update_tokens_from_credentials(
         try:
             expiry_dt = expiry
             if isinstance(expiry_dt, str):
-                expiry_dt = date_parser.parse(expiry_dt)
+                parsed = _safe_parse_datetime(expiry_dt)
+                if parsed is not None:
+                    expiry_dt = parsed
             if isinstance(expiry_dt, datetime):
                 if expiry_dt.tzinfo is None:
                     expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
@@ -1943,11 +1958,9 @@ def _parse_meeting_datetime_from_text(text: str, tz_label: str) -> Optional[date
                 date_value = _next_weekday_date(base, weekday)
                 break
     if date_value is None and _MEETING_DATE_PATTERN.search(text):
-        try:
-            parsed = date_parser.parse(text, fuzzy=True, dayfirst=True, default=base)
+        parsed = _safe_parse_datetime(text, fuzzy=True, dayfirst=True, default=base)
+        if isinstance(parsed, datetime):
             date_value = parsed.date()
-        except Exception:
-            date_value = None
     if date_value is None:
         return None
     meeting_dt = datetime.combine(date_value, dt_time(hour=hour, minute=minute), tz)
