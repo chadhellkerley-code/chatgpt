@@ -129,6 +129,40 @@ def remove_secret(username: str) -> None:
         logger.debug("Se eliminó el secreto TOTP de @%s", username)
 
 
+def rename_secret(old_username: str, new_username: str) -> None:
+    old_path = _path_for(old_username)
+    new_path = _path_for(new_username)
+    if not old_path.exists():
+        return
+
+    old_normalized = (old_username or "").strip().lstrip("@").lower()
+    new_normalized = (new_username or "").strip().lstrip("@").lower()
+    if not new_normalized or old_normalized == new_normalized:
+        return
+
+    try:
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        if new_path.exists():
+            new_path.unlink()
+        old_path.replace(new_path)
+        try:
+            os.chmod(new_path, 0o600)
+        except OSError:
+            pass
+        logger.debug(
+            "Se renombró el secreto TOTP de @%s a @%s",
+            old_username,
+            new_username,
+        )
+    except Exception as exc:  # pragma: no cover - operaciones de disco
+        logger.warning(
+            "No se pudo renombrar el TOTP de @%s a @%s: %s",
+            old_username,
+            new_username,
+            exc,
+        )
+
+
 def has_secret(username: str) -> bool:
     return _path_for(username).exists()
 
