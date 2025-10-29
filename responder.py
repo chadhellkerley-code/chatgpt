@@ -57,6 +57,11 @@ except Exception:  # pragma: no cover - si faltan dependencias opcionales
     build = None  # type: ignore
     GoogleAuthRequest = None  # type: ignore
 
+try:  # pragma: no cover - depende de dependencias opcionales
+    from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore
+except Exception:  # pragma: no cover - si falta dependencia opcional
+    InstalledAppFlow = None  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_PROMPT = "Respondé cordial, breve y como humano."
@@ -1434,6 +1439,92 @@ def _google_calendar_perform_device_flow(
     return None
 
 
+def _google_calendar_extract_client_credentials(
+    payload: Dict[str, object]
+) -> tuple[Optional[str], Optional[str]]:
+    if not isinstance(payload, dict):
+        return None, None
+    candidates = [payload]
+    for key in ("installed", "web"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+    for candidate in candidates:
+        client_id = candidate.get("client_id")
+        client_secret = candidate.get("client_secret")
+        if client_id:
+            return str(client_id), (str(client_secret) if client_secret else None)
+    return None, None
+
+
+def _google_calendar_load_credentials_json() -> None:
+    if InstalledAppFlow is None:
+        warn(
+            "Esta opción requiere la librería google-auth-oauthlib. Instalála para continuar."
+        )
+        press_enter()
+        return
+    banner()
+    print(
+        style_text(
+            "Google Calendar • Cargar credenciales JSON",
+            color=Fore.CYAN,
+            bold=True,
+        )
+    )
+    print(full_line(color=Fore.BLUE))
+    for line in _google_calendar_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _google_calendar_select_alias()
+    if not alias:
+        return
+    path_input = ask(
+        "Ruta del archivo JSON de Google (vacío para cancelar): "
+    ).strip()
+    if not path_input:
+        warn("No se cargó ningún archivo de credenciales.")
+        press_enter()
+        return
+    file_path = Path(path_input).expanduser()
+    if not file_path.exists():
+        warn("El archivo especificado no existe.")
+        press_enter()
+        return
+    try:
+        json_payload = json.loads(file_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        warn(f"No se pudo leer el archivo JSON: {exc}")
+        press_enter()
+        return
+    client_id, client_secret = _google_calendar_extract_client_credentials(json_payload)
+    if not client_id:
+        warn("El archivo JSON no contiene un Client ID válido.")
+        press_enter()
+        return
+    _set_google_calendar_entry(
+        alias,
+        {"client_id": client_id, "client_secret": client_secret},
+    )
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file(
+            str(file_path), scopes=[_GOOGLE_SCOPE]
+        )
+        credentials = flow.run_console()
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        warn(f"No se pudo completar la autenticación OAuth: {exc}")
+        press_enter()
+        return
+    entry = _get_google_calendar_entry(alias)
+    _google_calendar_update_tokens_from_credentials(alias, entry, credentials)
+    entry = _get_google_calendar_entry(alias)
+    if entry.get("connected"):
+        ok(f"Google Calendar conectado para {alias}.")
+    else:
+        warn("No se pudo completar la conexión con Google Calendar.")
+    press_enter()
+
+
 def _google_calendar_connect() -> None:
     if not _require_requests():
         return
@@ -1604,6 +1695,7 @@ def _google_calendar_menu() -> None:
         print("4) Desactivar creación automática de eventos")
         print("5) Revocar conexión")
         print("6) Volver al submenú anterior")
+        print("7) 📄 Cargar credenciales JSON (Google OAuth 2.0)")
         print(full_line(color=Fore.BLUE))
         choice = ask("Opción: ").strip()
         if choice == "1":
@@ -1618,6 +1710,8 @@ def _google_calendar_menu() -> None:
             _google_calendar_revoke()
         elif choice == "6":
             break
+        elif choice == "7":
+            _google_calendar_load_credentials_json()
         else:
             warn("Opción inválida.")
             press_enter()
