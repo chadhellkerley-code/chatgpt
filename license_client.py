@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
@@ -52,6 +53,7 @@ def _initial_app_root() -> Path:
 
 os.environ.setdefault("APP_DATA_ROOT", str(_initial_app_root()))
 
+import config
 from licensekit import validate_license_payload
 from ui import Fore, banner, full_line, style_text
 
@@ -203,6 +205,66 @@ def _prepare_client_environment(record: Dict[str, str]) -> None:
     os.environ["CLIENT_ALIAS"] = alias
     os.environ["LICENSE_ALREADY_VALIDATED"] = "1"
     os.environ["APP_DATA_ROOT"] = str(data_root)
+
+
+def _client_integrity_marker_path() -> Path:
+    base = Path(os.environ.get("APP_DATA_ROOT", str(_get_app_root())))
+    return base / "storage" / ".client_integrity_check"
+
+
+def _run_client_integrity_check() -> None:
+    if not config.SETTINGS.client_distribution:
+        return
+
+    marker = _client_integrity_marker_path()
+    if marker.exists():
+        return
+
+    try:
+        from app import current_menu_option_labels
+        from responder import autoresponder_menu_options, autoresponder_prompt_length
+    except Exception:
+        return
+
+    print(full_line(color=Fore.CYAN))
+    print(style_text("Verificación de integridad del cliente", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.CYAN))
+    print(style_text("Versión detectada: cliente", color=Fore.GREEN, bold=True))
+
+    options = current_menu_option_labels()
+    sin_siete = all(not opt.strip().startswith("7)") for opt in options)
+    estado_menu = "sí" if sin_siete else "no"
+    print(f"Menú sin opción 7: {estado_menu}")
+    if options:
+        print("Opciones visibles:")
+        for opt in options:
+            print(f" • {opt.strip()}")
+
+    prompt_length = autoresponder_prompt_length()
+    print(
+        f"Autoresponder 5.2 listo. System Prompt actual: {prompt_length} caracteres."
+    )
+
+    calendar_disponible = any(
+        "Conectar con Google Calendar" in opt for opt in autoresponder_menu_options()
+    )
+    estado_calendar = "sí" if calendar_disponible else "no"
+    print(f"Submenú 'Conectar con Google Calendar' disponible: {estado_calendar}")
+
+    gohighlevel_disponible = any(
+        "Conectar con GoHighLevel" in opt for opt in autoresponder_menu_options()
+    )
+    estado_gohighlevel = "sí" if gohighlevel_disponible else "no"
+    print(f"Submenú 'Conectar con GoHighLevel' disponible: {estado_gohighlevel}")
+
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(str(int(time.time())), encoding="utf-8")
+    except Exception:
+        pass
+
+    print(full_line(color=Fore.CYAN))
+    print()
 
 
 def _ensure_account_record(username: str, accounts: List[Dict]) -> Dict | None:
@@ -387,6 +449,7 @@ def launch_with_license() -> None:
         sys.exit(2)
 
     _prepare_client_environment(record)
+    config.refresh_settings()
     _load_sessions_on_boot()
 
     _print_section("Licencia validada", color=Fore.GREEN)
@@ -397,6 +460,8 @@ def launch_with_license() -> None:
         print(style_text(f"Vence: {expires}", color=Fore.GREEN))
     print(full_line(color=Fore.GREEN))
     print()
+
+    _run_client_integrity_check()
 
     from app import menu  # import tardío para evitar ciclos
 
