@@ -1694,8 +1694,8 @@ def _google_calendar_menu() -> None:
         print("3) Activar creación automática de eventos")
         print("4) Desactivar creación automática de eventos")
         print("5) Revocar conexión")
-        print("6) Volver al submenú anterior")
-        print("7) 📄 Cargar credenciales JSON (Google OAuth 2.0)")
+        print("6) Cargar credenciales JSON (Google OAuth 2.0)")
+        print("7) Volver al submenú anterior")
         print(full_line(color=Fore.BLUE))
         choice = ask("Opción: ").strip()
         if choice == "1":
@@ -1709,6 +1709,8 @@ def _google_calendar_menu() -> None:
         elif choice == "5":
             _google_calendar_revoke()
         elif choice == "6":
+            _google_calendar_load_credentials_json()
+        elif choice == "7":
             break
         elif choice == "7":
             _google_calendar_load_credentials_json()
