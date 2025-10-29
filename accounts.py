@@ -6,6 +6,7 @@ import csv
 import getpass
 import io
 import json
+import re
 import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import logging
+from urllib.parse import urlparse
 
 from config import SETTINGS
 from proxy_manager import (
@@ -557,6 +559,113 @@ def _badge_for_display(account: Dict) -> tuple[str, bool]:
     if cached_badge:
         return cached_badge, expired
     return "[🟡 En riesgo: unknown]", True
+
+
+def _account_status_from_badge(account: Dict, badge: str) -> str:
+    if not account.get("active"):
+        return "inactiva"
+
+    lowered = (badge or "").lower()
+    if "desactivada" in lowered:
+        return "baneada"
+    if any(keyword in lowered for keyword in ("action_block", "challenge", "checkpoint")):
+        return "bloqueada"
+    if "sesión expirada" in lowered or "sesion expirada" in lowered:
+        return "no se puede iniciar sesión"
+    if not account.get("connected"):
+        return "no se puede iniciar sesión"
+    return "activa"
+
+
+def _proxy_status_from_badge(account: Dict, badge: str) -> str:
+    lowered = (badge or "").lower()
+    if "proxy" in lowered and any(term in lowered for term in ("caído", "caido", "bloqueado")):
+        return "bloqueado"
+    return "activo"
+
+
+def _current_totp_code(username: str) -> str:
+    if not username:
+        return ""
+    try:
+        code = generate_totp_code(username)
+    except Exception:
+        return ""
+    return code or ""
+
+
+def _proxy_components(account: Dict) -> tuple[str, str, str, str]:
+    raw_url = (account.get("proxy_url") or "").strip()
+    ip = ""
+    port = ""
+    if raw_url:
+        parsed = urlparse(raw_url if "://" in raw_url else f"http://{raw_url}")
+        ip = (parsed.hostname or "").strip()
+        port = str(parsed.port) if parsed.port else ""
+    proxy_user = (account.get("proxy_user") or "").strip()
+    proxy_pass = (account.get("proxy_pass") or "").strip()
+    return ip, port, proxy_user, proxy_pass
+
+
+def _alias_slug(alias: str) -> str:
+    candidate = re.sub(r"[^0-9A-Za-z_-]", "_", alias.strip())
+    candidate = candidate.strip("_")
+    return candidate or "default"
+
+
+def _export_path(alias: str) -> Path:
+    base_dir = Path.home() / "Desktop" / "archivos CSV"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{_alias_slug(alias)}_accounts_{timestamp}.csv"
+    return base_dir / filename
+
+
+def _account_password(account: Dict) -> str:
+    value = account.get("password")
+    return value if isinstance(value, str) else ""
+
+
+def _export_accounts_csv(alias: str) -> None:
+    accounts = [acct for acct in _load() if acct.get("alias") == alias]
+    destination = _export_path(alias)
+    headers = [
+        "Username",
+        "Contraseña",
+        "Código 2FA",
+        "Proxy IP",
+        "Proxy Puerto",
+        "Proxy Usuario",
+        "Proxy Contraseña",
+        "Estado de la cuenta",
+        "Estado del proxy",
+    ]
+
+    with destination.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(headers)
+        for account in accounts:
+            username = (account.get("username") or "").strip()
+            badge, _ = _badge_for_display(account)
+            account_status = _account_status_from_badge(account, badge)
+            proxy_status = _proxy_status_from_badge(account, badge)
+            proxy_ip, proxy_port, proxy_user, proxy_pass = _proxy_components(account)
+            writer.writerow(
+                [
+                    username,
+                    _account_password(account),
+                    _current_totp_code(username),
+                    proxy_ip,
+                    proxy_port,
+                    proxy_user,
+                    proxy_pass,
+                    account_status,
+                    proxy_status,
+                ]
+            )
+
+    ok(f"Archivo CSV generado en: {destination}")
+    press_enter()
 
 
 def _schedule_health_refresh(accounts_to_refresh: List[Dict]) -> None:
@@ -1559,7 +1668,8 @@ def menu_accounts():
         print("8) Subir contenidos (Historias / Post / Reels)")
         print("9) Interacciones (Comentar / Ver & Like Reels)")
         print("10) Modificación de cuentas de Instagram")
-        print("11) Volver\n")
+        print("11) Exportar cuentas a CSV")
+        print("12) Volver\n")
 
         op = ask("Opción: ").strip()
         if op == "1":
@@ -1683,6 +1793,8 @@ def menu_accounts():
         elif op == "10":
             _modification_menu(alias)
         elif op == "11":
+            _export_accounts_csv(alias)
+        elif op == "12":
             break
         else:
             warn("Opción inválida.")
