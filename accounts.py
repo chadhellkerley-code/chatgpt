@@ -6,6 +6,7 @@ import csv
 import getpass
 import io
 import json
+import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
@@ -28,6 +29,7 @@ from session_store import has_session, load_into, remove as remove_session, save
 from totp_store import generate_code as generate_totp_code
 from totp_store import has_secret as has_totp_secret
 from totp_store import remove_secret as remove_totp_secret
+from totp_store import rename_secret as rename_totp_secret
 from totp_store import save_secret as save_totp_secret
 from utils import ask, banner, em, ok, press_enter, title, warn
 from paths import runtime_base
@@ -685,6 +687,697 @@ def _import_accounts_from_csv(alias: str) -> None:
     press_enter()
 
 
+def _select_usernames_for_modifications(alias: str) -> List[str]:
+    group = [acct for acct in _load() if acct.get("alias") == alias]
+    if not group:
+        warn("No hay cuentas disponibles en este alias.")
+        press_enter()
+        return []
+
+    print("Seleccioná cuentas por número o username (coma separada, * para todas):")
+    alias_map: Dict[str, str] = {}
+    for idx, acct in enumerate(group, start=1):
+        username = (acct.get("username") or "").strip()
+        if not username:
+            continue
+        alias_map[username.lower()] = username
+        sess = "[sesión]" if has_session(username) else "[sin sesión]"
+        proxy_flag = _proxy_indicator(acct)
+        totp_flag = _totp_indicator(acct)
+        print(f" {idx}) @{username} {sess} {proxy_flag}{totp_flag}")
+
+    raw = ask("Selección: ").strip()
+    if not raw:
+        warn("Sin selección.")
+        press_enter()
+        return []
+
+    if raw == "*":
+        return [acct.get("username") for acct in group if acct.get("username")]
+
+    chosen: List[str] = []
+    seen: set[str] = set()
+    for part in raw.split(","):
+        chunk = part.strip()
+        if not chunk:
+            continue
+        if chunk.isdigit():
+            idx = int(chunk)
+            if 1 <= idx <= len(group):
+                username = group[idx - 1].get("username")
+                if username:
+                    key = username.lower()
+                    if key not in seen:
+                        seen.add(key)
+                        chosen.append(username)
+        else:
+            normalized = chunk.lstrip("@").lower()
+            username = alias_map.get(normalized)
+            if username and normalized not in seen:
+                seen.add(normalized)
+                chosen.append(username)
+
+    if not chosen:
+        warn("No se encontraron cuentas con esos datos.")
+        press_enter()
+        return []
+
+    return chosen
+
+
+def _resolve_accounts_for_modifications(
+    alias: str, usernames: List[str]
+) -> List[Optional[Dict]]:
+    if not usernames:
+        return []
+
+    records = [acct for acct in _load() if acct.get("alias") == alias]
+    mapping: Dict[str, Dict] = {}
+    for acct in records:
+        username = (acct.get("username") or "").strip()
+        if username:
+            mapping[username.lower()] = acct
+
+    resolved: List[Optional[Dict]] = []
+    missing: List[str] = []
+    for username in usernames:
+        key = (username or "").strip().lstrip("@").lower()
+        acct = mapping.get(key)
+        if acct:
+            resolved.append(acct)
+        else:
+            resolved.append(None)
+            missing.append(username)
+
+    if missing:
+        formatted = ", ".join(f"@{name}" for name in missing if name)
+        if formatted:
+            warn(f"No se encontraron estas cuentas: {formatted}")
+
+    return resolved
+
+
+def _ask_delay_seconds(default: float = 5.0) -> float:
+    prompt = ask(f"Delay entre cuentas en segundos [{default:.0f}]: ").strip()
+    if not prompt:
+        return max(1.0, default)
+    try:
+        value = float(prompt.replace(",", "."))
+    except ValueError:
+        warn("Valor inválido, se utilizará el delay por defecto.")
+        return max(1.0, default)
+    return max(1.0, value)
+
+
+def _client_for_account_action(account: Dict, *, reason: str):
+    username = (account.get("username") or "").strip()
+    if not username:
+        return None
+
+    try:
+        from instagrapi import Client
+    except Exception as exc:  # pragma: no cover - dependencia opcional
+        warn(f"No se pudo importar instagrapi para @{username}: {exc}")
+        return None
+
+    try:
+        cl = Client()
+    except Exception as exc:
+        warn(f"No se pudo crear el cliente de Instagram para @{username}: {exc}")
+        return None
+
+    binding = None
+    try:
+        binding = apply_proxy_to_client(cl, username, account, reason=reason)
+    except Exception as exc:
+        logger.warning("No se pudo aplicar el proxy para @%s: %s", username, exc)
+        binding = None
+
+    try:
+        load_into(cl, username)
+    except FileNotFoundError:
+        warn(
+            f"No hay sesión guardada para @{username}. Iniciá sesión antes de modificar."
+        )
+        return None
+    except Exception as exc:
+        if binding and should_retry_proxy(exc):
+            record_proxy_failure(username, exc)
+        warn(f"No se pudo cargar la sesión de @{username}: {exc}")
+        return None
+
+    try:
+        cl.account_info()
+        mark_connected(username, True)
+    except Exception as exc:
+        if binding and should_retry_proxy(exc):
+            record_proxy_failure(username, exc)
+        mark_connected(username, False)
+        warn(f"Instagram rechazó la sesión de @{username}: {exc}")
+        return None
+
+    return cl
+
+
+def _rename_account_record(old_username: str, new_username: str) -> str:
+    old_clean = (old_username or "").strip().lstrip("@")
+    new_clean = (new_username or "").strip().lstrip("@")
+    if not new_clean:
+        return old_clean
+
+    items = _load()
+    old_norm = old_clean.lower()
+    changed = False
+    for idx, item in enumerate(items):
+        stored = (item.get("username") or "").strip().lstrip("@").lower()
+        if stored == old_norm:
+            updated = dict(item)
+            updated["username"] = new_clean
+            items[idx] = _normalize_account(updated)
+            changed = True
+            break
+
+    if changed:
+        _save(items)
+
+    if old_clean:
+        _invalidate_health(old_clean)
+    if new_clean:
+        _invalidate_health(new_clean)
+
+    try:
+        rename_totp_secret(old_clean, new_clean)
+    except Exception as exc:  # pragma: no cover - operaciones de disco
+        logger.warning(
+            "No se pudo trasladar el TOTP de @%s a @%s: %s", old_clean, new_clean, exc
+        )
+
+    return new_clean
+
+
+def _apply_username_change(account: Dict, desired_username: str, delay: float) -> Optional[str]:
+    username = (account.get("username") or "").strip()
+    client = _client_for_account_action(account, reason="mod-username")
+    if not client:
+        time.sleep(delay)
+        return None
+
+    desired_clean = desired_username.strip().lstrip("@")
+    if not desired_clean:
+        time.sleep(delay)
+        return None
+
+    actual_username = desired_clean
+    try:
+        result = client.account_edit(username=desired_clean)
+        actual_username = getattr(result, "username", None) or desired_clean
+        ok(f"@{username} → @{actual_username}")
+        try:
+            save_from(client, actual_username)
+        except Exception as exc:
+            logger.warning(
+                "No se pudo guardar la sesión actualizada de @%s: %s",
+                actual_username,
+                exc,
+            )
+        normalized = _rename_account_record(username, actual_username)
+        if username.strip().lower() != normalized.lower():
+            remove_session(username)
+        mark_connected(normalized, True)
+        return normalized
+    except Exception as exc:
+        if should_retry_proxy(exc):
+            record_proxy_failure(username, exc)
+        warn(f"No se pudo actualizar el username de @{username}: {exc}")
+        mark_connected(username, False)
+        return None
+    finally:
+        time.sleep(delay)
+
+
+def _change_usernames_flow(alias: str, selected: List[str]) -> List[str]:
+    resolved = _resolve_accounts_for_modifications(alias, selected)
+    if not any(resolved):
+        warn("No hay cuentas válidas seleccionadas.")
+        press_enter()
+        return selected
+
+    inputs: List[str] = []
+    for acct in resolved:
+        if acct:
+            value = ask(f"Nuevo username para @{acct['username']} (vacío para omitir): ")
+            inputs.append(value)
+        else:
+            inputs.append("")
+
+    if not any(inp.strip() for inp, acct in zip(inputs, resolved) if acct):
+        warn("No se ingresaron nuevos usernames.")
+        press_enter()
+        return selected
+
+    delay = _ask_delay_seconds()
+    total_targets = 0
+    successes = 0
+    for idx, acct in enumerate(resolved):
+        if not acct:
+            continue
+        desired = inputs[idx].strip()
+        if not desired:
+            continue
+        total_targets += 1
+        updated = _apply_username_change(acct, desired, delay)
+        if updated:
+            successes += 1
+            selected[idx] = updated
+
+    print(f"Usernames actualizados: {successes}/{total_targets}")
+    press_enter()
+    return selected
+
+
+def _apply_full_name_change(account: Dict, full_name: str, delay: float) -> bool:
+    username = (account.get("username") or "").strip()
+    client = _client_for_account_action(account, reason="mod-full-name")
+    if not client:
+        time.sleep(delay)
+        return False
+
+    try:
+        client.account_edit(full_name=full_name)
+        ok(f"Nombre actualizado para @{username}.")
+        mark_connected(username, True)
+        return True
+    except Exception as exc:
+        if should_retry_proxy(exc):
+            record_proxy_failure(username, exc)
+        warn(f"No se pudo actualizar el nombre completo de @{username}: {exc}")
+        mark_connected(username, False)
+        return False
+    finally:
+        time.sleep(delay)
+
+
+def _change_full_name_flow(alias: str, selected: List[str]) -> None:
+    resolved = _resolve_accounts_for_modifications(alias, selected)
+    if not any(resolved):
+        warn("No hay cuentas válidas seleccionadas.")
+        press_enter()
+        return
+
+    values: List[str] = []
+    for acct in resolved:
+        if acct:
+            values.append(ask(f"Nombre completo para @{acct['username']} (vacío para mantener): "))
+        else:
+            values.append("")
+
+    if not any(val.strip() for val, acct in zip(values, resolved) if acct):
+        warn("No se ingresaron nombres para actualizar.")
+        press_enter()
+        return
+
+    delay = _ask_delay_seconds()
+    total = 0
+    successes = 0
+    for acct, value in zip(resolved, values):
+        if not acct:
+            continue
+        value = value.strip()
+        if not value:
+            continue
+        total += 1
+        if _apply_full_name_change(acct, value, delay):
+            successes += 1
+
+    print(f"Nombres completos actualizados: {successes}/{total}")
+    press_enter()
+
+
+def _apply_bio_change(account: Dict, biography: str, delay: float) -> bool:
+    username = (account.get("username") or "").strip()
+    client = _client_for_account_action(account, reason="mod-bio")
+    if not client:
+        time.sleep(delay)
+        return False
+
+    try:
+        client.account_set_biography(biography)
+        action = "eliminada" if not biography else "actualizada"
+        ok(f"Bio {action} para @{username}.")
+        mark_connected(username, True)
+        return True
+    except Exception as exc:
+        if should_retry_proxy(exc):
+            record_proxy_failure(username, exc)
+        warn(f"No se pudo actualizar la bio de @{username}: {exc}")
+        mark_connected(username, False)
+        return False
+    finally:
+        time.sleep(delay)
+
+
+def _change_bio_flow(alias: str, selected: List[str]) -> None:
+    resolved = _resolve_accounts_for_modifications(alias, selected)
+    if not any(resolved):
+        warn("No hay cuentas válidas seleccionadas.")
+        press_enter()
+        return
+
+    bios: List[str] = []
+    for acct in resolved:
+        if acct:
+            bios.append(ask(f"Bio para @{acct['username']} (vacío = eliminar): "))
+        else:
+            bios.append("")
+
+    if not any(acct for acct in resolved):
+        warn("No se encontraron cuentas para actualizar.")
+        press_enter()
+        return
+
+    delay = _ask_delay_seconds()
+    total = 0
+    successes = 0
+    for acct, bio in zip(resolved, bios):
+        if not acct:
+            continue
+        biography = bio or ""
+        total += 1
+        if _apply_bio_change(acct, biography, delay):
+            successes += 1
+
+    print(f"Bios actualizadas/eliminadas: {successes}/{total}")
+    press_enter()
+
+
+def _apply_profile_picture(account: Dict, image_path: Path, delay: float) -> bool:
+    username = (account.get("username") or "").strip()
+    client = _client_for_account_action(account, reason="mod-profile-picture")
+    if not client:
+        time.sleep(delay)
+        return False
+
+    try:
+        client.account_change_picture(image_path)
+        ok(f"Foto de perfil actualizada para @{username}.")
+        mark_connected(username, True)
+        return True
+    except Exception as exc:
+        if should_retry_proxy(exc):
+            record_proxy_failure(username, exc)
+        warn(f"No se pudo cambiar la foto de @{username}: {exc}")
+        mark_connected(username, False)
+        return False
+    finally:
+        time.sleep(delay)
+
+
+def _apply_profile_picture_removal(account: Dict, delay: float) -> bool:
+    username = (account.get("username") or "").strip()
+    client = _client_for_account_action(account, reason="mod-profile-picture")
+    if not client:
+        time.sleep(delay)
+        return False
+
+    try:
+        client.private_request(
+            "accounts/remove_profile_picture/", client.with_default_data({})
+        )
+        ok(f"Foto de perfil eliminada para @{username}.")
+        mark_connected(username, True)
+        return True
+    except Exception as exc:
+        if should_retry_proxy(exc):
+            record_proxy_failure(username, exc)
+        warn(f"No se pudo eliminar la foto de @{username}: {exc}")
+        mark_connected(username, False)
+        return False
+    finally:
+        time.sleep(delay)
+
+
+def _profile_photo_flow(alias: str, selected: List[str]) -> None:
+    resolved = _resolve_accounts_for_modifications(alias, selected)
+    if not any(resolved):
+        warn("No hay cuentas válidas seleccionadas.")
+        press_enter()
+        return
+
+    while True:
+        print("\n1) Subir una imagen para todas las cuentas")
+        print("2) Subir imágenes individuales")
+        print("3) Eliminar la foto actual")
+        print("4) Volver")
+        choice = ask("Opción: ").strip() or "4"
+
+        if choice == "1":
+            path_input = ask("Ruta de la imagen: ").strip()
+            if not path_input:
+                warn("No se indicó la ruta del archivo.")
+                press_enter()
+                continue
+            path = Path(path_input).expanduser()
+            if not path.exists() or not path.is_file():
+                warn("La imagen indicada no existe o no es un archivo válido.")
+                press_enter()
+                continue
+            delay = _ask_delay_seconds()
+            total = 0
+            successes = 0
+            for acct in resolved:
+                if not acct:
+                    continue
+                total += 1
+                if _apply_profile_picture(acct, path, delay):
+                    successes += 1
+            print(f"Fotos actualizadas: {successes}/{total}")
+            press_enter()
+        elif choice == "2":
+            delay = _ask_delay_seconds()
+            total = 0
+            successes = 0
+            for acct in resolved:
+                if not acct:
+                    continue
+                raw = ask(
+                    f"Ruta de imagen para @{acct['username']} (vacío para omitir): "
+                ).strip()
+                if not raw:
+                    continue
+                path = Path(raw).expanduser()
+                if not path.exists() or not path.is_file():
+                    warn(
+                        f"Archivo inválido para @{acct['username']}. Se omitirá esta cuenta."
+                    )
+                    continue
+                total += 1
+                if _apply_profile_picture(acct, path, delay):
+                    successes += 1
+            print(f"Fotos actualizadas: {successes}/{total}")
+            press_enter()
+        elif choice == "3":
+            delay = _ask_delay_seconds()
+            total = 0
+            successes = 0
+            for acct in resolved:
+                if not acct:
+                    continue
+                total += 1
+                if _apply_profile_picture_removal(acct, delay):
+                    successes += 1
+            print(f"Fotos eliminadas: {successes}/{total}")
+            press_enter()
+        elif choice == "4":
+            break
+        else:
+            warn("Opción inválida.")
+            press_enter()
+
+
+def _apply_highlight_cleanup(account: Dict, delay: float) -> bool:
+    username = (account.get("username") or "").strip()
+    client = _client_for_account_action(account, reason="mod-highlights")
+    if not client:
+        time.sleep(delay)
+        return False
+
+    try:
+        user_id = client.user_id or client.user_id_from_username(username)
+        highlights = client.user_highlights(user_id)
+        deleted = 0
+        for item in highlights:
+            try:
+                if client.highlight_delete(item.id):
+                    deleted += 1
+            except Exception as exc:
+                if should_retry_proxy(exc):
+                    record_proxy_failure(username, exc)
+                logger.warning(
+                    "Error eliminando historia destacada de @%s: %s", username, exc
+                )
+        ok(f"Historias destacadas eliminadas para @{username}: {deleted}")
+        mark_connected(username, True)
+        return True
+    except Exception as exc:
+        if should_retry_proxy(exc):
+            record_proxy_failure(username, exc)
+        warn(f"No se pudieron eliminar las destacadas de @{username}: {exc}")
+        mark_connected(username, False)
+        return False
+    finally:
+        time.sleep(delay)
+
+
+def _delete_highlights_flow(alias: str, selected: List[str]) -> None:
+    resolved = _resolve_accounts_for_modifications(alias, selected)
+    if not any(resolved):
+        warn("No hay cuentas válidas seleccionadas.")
+        press_enter()
+        return
+
+    delay = _ask_delay_seconds()
+    total = 0
+    successes = 0
+    for acct in resolved:
+        if not acct:
+            continue
+        total += 1
+        if _apply_highlight_cleanup(acct, delay):
+            successes += 1
+
+    print(f"Cuentas con historias destacadas eliminadas: {successes}/{total}")
+    press_enter()
+
+
+def _apply_posts_cleanup(account: Dict, delay: float) -> bool:
+    username = (account.get("username") or "").strip()
+    client = _client_for_account_action(account, reason="mod-posts")
+    if not client:
+        time.sleep(delay)
+        return False
+
+    try:
+        user_id = client.user_id or client.user_id_from_username(username)
+        medias = client.user_medias(user_id, amount=0)
+        deleted = 0
+        failures = 0
+        for media in medias:
+            try:
+                if client.media_delete(media.id):
+                    deleted += 1
+                else:
+                    failures += 1
+            except Exception as exc:
+                if should_retry_proxy(exc):
+                    record_proxy_failure(username, exc)
+                failures += 1
+                logger.warning(
+                    "Error eliminando publicación de @%s: %s", username, exc
+                )
+        ok(f"Publicaciones eliminadas para @{username}: {deleted}")
+        if failures:
+            warn(
+                f"@{username}: {failures} publicaciones no pudieron eliminarse automáticamente."
+            )
+        mark_connected(username, True)
+        return True
+    except Exception as exc:
+        if should_retry_proxy(exc):
+            record_proxy_failure(username, exc)
+        warn(f"No se pudieron eliminar las publicaciones de @{username}: {exc}")
+        mark_connected(username, False)
+        return False
+    finally:
+        time.sleep(delay)
+
+
+def _delete_posts_flow(alias: str, selected: List[str]) -> None:
+    resolved = _resolve_accounts_for_modifications(alias, selected)
+    if not any(resolved):
+        warn("No hay cuentas válidas seleccionadas.")
+        press_enter()
+        return
+
+    delay = _ask_delay_seconds()
+    total = 0
+    successes = 0
+    for acct in resolved:
+        if not acct:
+            continue
+        total += 1
+        if _apply_posts_cleanup(acct, delay):
+            successes += 1
+
+    print(f"Cuentas con publicaciones eliminadas: {successes}/{total}")
+    press_enter()
+
+
+def _modification_menu(alias: str) -> None:
+    selected: List[str] = []
+    while True:
+        banner()
+        title(f"Modificación de cuentas de Instagram - Alias: {alias}")
+        if selected:
+            print("Cuentas seleccionadas: " + ", ".join(f"@{name}" for name in selected))
+        else:
+            print("Cuentas seleccionadas: (ninguna)")
+
+        print("\n1) Seleccionar cuentas a modificar")
+        print("2) Cambiar usernames")
+        print("3) Cambiar nombres completos (Full name)")
+        print("4) Cambiar o eliminar biografía (bio)")
+        print("5) Cambiar o eliminar foto de perfil")
+        print("6) Eliminar historias destacadas")
+        print("7) Eliminar publicaciones existentes")
+        print("8) Volver\n")
+
+        choice = ask("Opción: ").strip() or "8"
+
+        if choice == "1":
+            selected = _select_usernames_for_modifications(alias)
+        elif choice == "2":
+            if not selected:
+                warn("Seleccioná cuentas primero.")
+                press_enter()
+                continue
+            selected = _change_usernames_flow(alias, selected)
+        elif choice == "3":
+            if not selected:
+                warn("Seleccioná cuentas primero.")
+                press_enter()
+                continue
+            _change_full_name_flow(alias, selected)
+        elif choice == "4":
+            if not selected:
+                warn("Seleccioná cuentas primero.")
+                press_enter()
+                continue
+            _change_bio_flow(alias, selected)
+        elif choice == "5":
+            if not selected:
+                warn("Seleccioná cuentas primero.")
+                press_enter()
+                continue
+            _profile_photo_flow(alias, selected)
+        elif choice == "6":
+            if not selected:
+                warn("Seleccioná cuentas primero.")
+                press_enter()
+                continue
+            _delete_highlights_flow(alias, selected)
+        elif choice == "7":
+            if not selected:
+                warn("Seleccioná cuentas primero.")
+                press_enter()
+                continue
+            _delete_posts_flow(alias, selected)
+        elif choice == "8":
+            break
+        else:
+            warn("Opción inválida.")
+            press_enter()
+
+
 def _format_health_error(exc: Exception, ig_exceptions) -> str:
     msg = str(exc).lower()
 
@@ -865,7 +1558,8 @@ def menu_accounts():
         print("7) Modo de exploración automática por hashtag (nuevo)")
         print("8) Subir contenidos (Historias / Post / Reels)")
         print("9) Interacciones (Comentar / Ver & Like Reels)")
-        print("10) Volver\n")
+        print("10) Modificación de cuentas de Instagram")
+        print("11) Volver\n")
 
         op = ask("Opción: ").strip()
         if op == "1":
@@ -987,6 +1681,8 @@ def menu_accounts():
         elif op == "9":
             _launch_interactions(alias)
         elif op == "10":
+            _modification_menu(alias)
+        elif op == "11":
             break
         else:
             warn("Opción inválida.")
