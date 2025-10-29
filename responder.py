@@ -3,10 +3,11 @@ import logging
 import re
 import time
 import unicodedata
+import uuid
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, time as dt_time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -33,6 +34,9 @@ from session_store import has_session, load_into
 from storage import get_auto_state, log_conversation_status, save_auto_state
 from ui import Fore, full_line, style_text
 from utils import ask, ask_int, banner, ok, press_enter, warn
+from zoneinfo import ZoneInfo
+
+from dateutil import parser as date_parser
 
 try:  # pragma: no cover - depende de dependencia opcional
     import requests
@@ -99,6 +103,49 @@ _PHONE_PATTERN = re.compile(r"(?<!\d)(?:\+?\d[\d\s().-]{7,}\d)")
 _EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
 _GOHIGHLEVEL_STATE: Dict[str, dict] | None = None
 
+_PROMPT_STORAGE_DIR = runtime_base(Path(__file__).resolve().parent) / "data" / "autoresponder"
+_PROMPT_DEFAULT_ALIAS = "default"
+
+_GOHIGHLEVEL_FILE = runtime_base(Path(__file__).resolve().parent) / "storage" / "gohighlevel.json"
+_GOHIGHLEVEL_BASE = "https://rest.gohighlevel.com/v1"
+_PHONE_PATTERN = re.compile(r"(?<!\d)(?:\+?\d[\d\s().-]{7,}\d)")
+_EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+_GOHIGHLEVEL_STATE: Dict[str, dict] | None = None
+
+_GOOGLE_CALENDAR_FILE = (
+    runtime_base(Path(__file__).resolve().parent) / "storage" / "google_calendar.json"
+)
+_GOOGLE_DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code"
+_GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+_GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+_GOOGLE_CALENDAR_BASE = "https://www.googleapis.com/calendar/v3"
+_GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+_GOOGLE_STATE: Dict[str, dict] | None = None
+_MEETING_TIME_PATTERN = re.compile(
+    r"(?P<hour>\b[01]?\d|2[0-3])(?:(?:[:h\.])(?P<minute>[0-5]\d))?\s*(?P<ampm>am|pm)?\s*(?P<label>hs|hrs|horas)?",
+    re.IGNORECASE,
+)
+_MEETING_DATE_PATTERN = re.compile(
+    r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)\b",
+    re.IGNORECASE,
+)
+_RELATIVE_DATE_KEYWORDS = (
+    ("hoy", 0),
+    ("manana", 1),
+    ("pasado manana", 2),
+)
+_WEEKDAY_KEYWORDS = {
+    "lunes": 0,
+    "martes": 1,
+    "miercoles": 2,
+    "miércoles": 2,
+    "jueves": 3,
+    "viernes": 4,
+    "sabado": 5,
+    "sábado": 5,
+    "domingo": 6,
+}
+
 _POSITIVE_KEYWORDS = (
     "si",
     "quiero saber mas",
@@ -142,6 +189,32 @@ def _format_handle(value: str | None) -> str:
     if value.startswith("@"):
         return value
     return f"@{value}"
+
+
+def _default_timezone_label() -> str:
+    try:
+        tz = datetime.now().astimezone().tzinfo
+        if tz is None:
+            return "UTC"
+        key = getattr(tz, "key", None)
+        if key:
+            return str(key)
+        zone = getattr(tz, "zone", None)
+        if zone:
+            return str(zone)
+    except Exception:
+        pass
+    return "UTC"
+
+
+def _safe_timezone(label: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(label)
+    except Exception:
+        try:
+            return ZoneInfo(_default_timezone_label())
+        except Exception:
+            return ZoneInfo("UTC")
 
 
 def _print_response_summary(index: int, sender: str, recipient: str, success: bool) -> None:
@@ -458,6 +531,32 @@ def _write_gohighlevel_state(state: Dict[str, dict]) -> None:
     _read_gohighlevel_state(refresh=True)
 
 
+def _read_google_calendar_state(refresh: bool = False) -> Dict[str, dict]:
+    global _GOOGLE_STATE
+    if refresh or _GOOGLE_STATE is None:
+        data: Dict[str, dict] = {"aliases": {}}
+        if _GOOGLE_CALENDAR_FILE.exists():
+            try:
+                loaded = json.loads(_GOOGLE_CALENDAR_FILE.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data.update(loaded)
+            except Exception:
+                data = {"aliases": {}}
+        if "aliases" not in data or not isinstance(data["aliases"], dict):
+            data["aliases"] = {}
+        _GOOGLE_STATE = data
+    return _GOOGLE_STATE
+
+
+def _write_google_calendar_state(state: Dict[str, dict]) -> None:
+    state.setdefault("aliases", {})
+    _GOOGLE_CALENDAR_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _GOOGLE_CALENDAR_FILE.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    _read_google_calendar_state(refresh=True)
+
+
 def _normalize_alias_key(alias: str) -> str:
     return alias.strip().lower()
 
@@ -538,6 +637,216 @@ def _set_gohighlevel_entry(alias: str, updates: Dict[str, object]) -> None:
     entry.update(normalized_updates)
     aliases[key] = entry
     _write_gohighlevel_state(state)
+
+
+def _get_google_calendar_entry(alias: str) -> Dict[str, object]:
+    state = _read_google_calendar_state()
+    key = _normalize_alias_key(alias)
+    aliases: Dict[str, dict] = state.get("aliases", {})
+    entry = aliases.get(key)
+    if isinstance(entry, dict):
+        entry.setdefault("alias", alias.strip())
+        entry.setdefault("scheduled", {})
+        entry.setdefault("event_name", "{{username}} - Sistema de adquisición con IA")
+        entry.setdefault("duration_minutes", 30)
+        entry.setdefault("timezone", _default_timezone_label())
+        entry.setdefault("auto_meet", True)
+        return entry
+    return {}
+
+
+def _set_google_calendar_entry(alias: str, updates: Dict[str, object]) -> None:
+    alias = alias.strip()
+    if not alias:
+        warn("Alias inválido.")
+        return
+    state = _read_google_calendar_state()
+    aliases: Dict[str, dict] = state.setdefault("aliases", {})
+    key = _normalize_alias_key(alias)
+    entry = aliases.get(key, {})
+    entry.setdefault("alias", alias)
+    entry.setdefault("scheduled", {})
+    entry.setdefault("event_name", "{{username}} - Sistema de adquisición con IA")
+    entry.setdefault("duration_minutes", 30)
+    entry.setdefault("timezone", _default_timezone_label())
+    entry.setdefault("auto_meet", True)
+    normalized_updates: Dict[str, object] = {}
+    for key_name, value in updates.items():
+        if value is None:
+            continue
+        if key_name == "duration_minutes":
+            try:
+                normalized_updates[key_name] = max(5, int(value))
+            except Exception:
+                continue
+        elif key_name == "timezone":
+            try:
+                tz_value = str(value).strip() or _default_timezone_label()
+                _ = _safe_timezone(tz_value)
+                normalized_updates[key_name] = tz_value
+            except Exception:
+                warn("Zona horaria inválida; se mantiene el valor previo.")
+                continue
+        else:
+            normalized_updates[key_name] = value
+    entry.update(normalized_updates)
+    aliases[key] = entry
+    _write_google_calendar_state(state)
+
+
+def _mask_google_calendar_status(entry: Dict[str, object]) -> str:
+    connected = bool(entry.get("connected"))
+    enabled = bool(entry.get("enabled"))
+    status = "🟢 Activo" if connected and enabled else "🟡 Conectado" if connected else "⚪ Inactivo"
+    summary = entry.get("event_name") or "(sin nombre)"
+    tz_label = entry.get("timezone") or "UTC"
+    return f"{status} • Evento: {summary} • TZ: {tz_label}"
+
+
+def _google_calendar_status_lines() -> List[str]:
+    state = _read_google_calendar_state()
+    aliases: Dict[str, dict] = state.get("aliases", {})
+    if not aliases:
+        return ["(sin configuraciones)"]
+    rows: List[str] = []
+    for key in sorted(aliases.keys()):
+        entry = aliases[key]
+        label = str(entry.get("alias") or key)
+        rows.append(f" - {label}: {_mask_google_calendar_status(entry)}")
+    return rows
+
+
+def _google_calendar_summary_line() -> str:
+    state = _read_google_calendar_state()
+    aliases: Dict[str, dict] = state.get("aliases", {})
+    enabled_aliases = [
+        entry
+        for entry in aliases.values()
+        if isinstance(entry, dict) and entry.get("connected") and entry.get("enabled")
+    ]
+    if not enabled_aliases:
+        return "Google Calendar: (sin conexión activa)"
+    labels = sorted(str(entry.get("alias") or "?") for entry in enabled_aliases)
+    return f"Google Calendar: {'; '.join(labels)}"
+
+
+def _google_calendar_mark_scheduled(
+    alias: str, lead: str, phone: str, event_id: str, link: str | None
+) -> None:
+    lead_key = f"{_normalize_lead_id(lead)}|{_normalize_phone(phone)}"
+    entry = _get_google_calendar_entry(alias)
+    scheduled = entry.setdefault("scheduled", {})
+    scheduled[lead_key] = {
+        "event_id": event_id,
+        "link": link or "",
+        "ts": int(time.time()),
+    }
+    _set_google_calendar_entry(alias, {"scheduled": scheduled})
+
+
+def _google_calendar_already_scheduled(alias: str, lead: str, phone: str) -> bool:
+    entry = _get_google_calendar_entry(alias)
+    scheduled = entry.get("scheduled") or {}
+    lead_key = f"{_normalize_lead_id(lead)}|{_normalize_phone(phone)}"
+    return lead_key in scheduled
+
+
+def _google_calendar_token_is_valid(entry: Dict[str, object]) -> bool:
+    expires_at = entry.get("token_expires_at")
+    try:
+        expires_float = float(expires_at)
+    except Exception:
+        return False
+    return expires_float - time.time() > 60
+
+
+def _google_calendar_store_tokens(
+    alias: str, entry: Dict[str, object], token_data: Dict[str, object]
+) -> Dict[str, object]:
+    access_token = token_data.get("access_token") or entry.get("access_token")
+    refresh_token = token_data.get("refresh_token") or entry.get("refresh_token")
+    token_type = token_data.get("token_type") or entry.get("token_type")
+    expires_in = token_data.get("expires_in")
+    if isinstance(expires_in, str) and expires_in.isdigit():
+        expires_in = int(expires_in)
+    if not isinstance(expires_in, (int, float)):
+        expires_in = 3600
+    expires_at = time.time() + float(expires_in)
+    updated = {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": token_type,
+        "token_expires_at": expires_at,
+        "connected": bool(access_token and refresh_token),
+    }
+    _set_google_calendar_entry(alias, updated)
+    entry.update(updated)
+    return entry
+
+
+def _google_calendar_refresh_access_token(
+    alias: str, entry: Dict[str, object]
+) -> Optional[str]:
+    if requests is None:
+        return None
+    refresh_token = entry.get("refresh_token")
+    client_id = entry.get("client_id")
+    client_secret = entry.get("client_secret")
+    if not refresh_token or not client_id:
+        return None
+    data = {
+        "client_id": client_id,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }
+    if client_secret:
+        data["client_secret"] = client_secret
+    try:
+        response = requests.post(_GOOGLE_TOKEN_URL, data=data, timeout=15)
+    except RequestException as exc:  # pragma: no cover - depende de red externa
+        logger.warning("No se pudo refrescar el token de Google Calendar: %s", exc, exc_info=False)
+        return None
+    if response.status_code != 200:
+        logger.warning(
+            "Respuesta inesperada al refrescar token de Google Calendar: %s", response.text
+        )
+        return None
+    token_data = response.json()
+    entry = _google_calendar_store_tokens(alias, entry, token_data)
+    return entry.get("access_token")
+
+
+def _google_calendar_ensure_token(alias: str, entry: Dict[str, object]) -> Optional[str]:
+    access_token = entry.get("access_token")
+    if access_token and _google_calendar_token_is_valid(entry):
+        return str(access_token)
+    return _google_calendar_refresh_access_token(alias, entry)
+
+
+def _google_calendar_enabled_entry_for(username: str) -> tuple[Optional[str], Dict[str, object]]:
+    alias_candidates: List[str] = []
+    if ACTIVE_ALIAS:
+        alias_candidates.append(ACTIVE_ALIAS)
+    account = get_account(username) or {}
+    account_alias = str(account.get("alias") or "").strip()
+    if account_alias:
+        alias_candidates.append(account_alias)
+    alias_candidates.append(username)
+    alias_candidates.append("ALL")
+
+    seen: set[str] = set()
+    for alias in alias_candidates:
+        norm = _normalize_alias_key(alias)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        entry = _get_google_calendar_entry(alias)
+        if entry.get("connected") and entry.get("enabled"):
+            access_token = entry.get("access_token")
+            refresh_token = entry.get("refresh_token")
+            if access_token and refresh_token:
+                return alias, entry
+    return None, {}
 
 
 def _mask_gohighlevel_status(entry: Dict[str, object]) -> str:
@@ -774,6 +1083,281 @@ def _gohighlevel_menu() -> None:
             press_enter()
 
 
+def _google_calendar_select_alias() -> Optional[str]:
+    alias = _prompt_alias_selection()
+    if not alias:
+        warn("Alias inválido.")
+        press_enter()
+        return None
+    return alias
+
+
+def _google_calendar_perform_device_flow(
+    client_id: str, client_secret: str | None
+) -> Optional[Dict[str, object]]:
+    if requests is None:
+        return None
+    try:
+        response = requests.post(
+            _GOOGLE_DEVICE_CODE_URL,
+            data={"client_id": client_id, "scope": _GOOGLE_SCOPE},
+            timeout=15,
+        )
+    except RequestException as exc:  # pragma: no cover - depende de red externa
+        warn(f"No se pudo iniciar la autorización de Google: {exc}")
+        press_enter()
+        return None
+    if response.status_code != 200:
+        warn(f"Respuesta inesperada de Google: {response.text}")
+        press_enter()
+        return None
+    payload = response.json()
+    device_code = payload.get("device_code")
+    if not device_code:
+        warn("Google no devolvió device_code válido.")
+        press_enter()
+        return None
+    verification_url = payload.get("verification_url") or payload.get("verification_uri")
+    user_code = payload.get("user_code")
+    print(style_text("Para continuar:", color=Fore.CYAN, bold=True))
+    if verification_url and user_code:
+        print(f"1. Visitá {verification_url}")
+        print(f"2. Ingresá el código: {user_code}")
+    elif user_code:
+        print(f"Ingresá el código: {user_code}")
+    else:
+        print("Abrí la URL indicada por Google y autorizá el acceso.")
+    print("Esperando confirmación...")
+    interval = int(payload.get("interval", 5))
+    expires_at = time.time() + int(payload.get("expires_in", 1800))
+    data = {
+        "client_id": client_id,
+        "device_code": device_code,
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+    }
+    if client_secret:
+        data["client_secret"] = client_secret
+    while time.time() < expires_at:
+        time.sleep(interval)
+        try:
+            token_response = requests.post(_GOOGLE_TOKEN_URL, data=data, timeout=15)
+        except RequestException as exc:  # pragma: no cover - depende de red externa
+            warn(f"Error al consultar token de Google: {exc}")
+            press_enter()
+            return None
+        if token_response.status_code == 200:
+            return token_response.json()
+        try:
+            error_payload = token_response.json()
+        except Exception:
+            error_payload = {}
+        error_code = (error_payload or {}).get("error")
+        if error_code in {"authorization_pending"}:
+            continue
+        if error_code == "slow_down":
+            interval = min(interval + 2, 15)
+            continue
+        if error_code in {"expired_token", "access_denied"}:
+            warn("La autorización no fue completada.")
+            press_enter()
+            return None
+        warn(f"Error al obtener token de Google: {token_response.text}")
+        press_enter()
+        return None
+    warn("El código de autorización expiró. Intentá nuevamente.")
+    press_enter()
+    return None
+
+
+def _google_calendar_connect() -> None:
+    if not _require_requests():
+        return
+    banner()
+    print(style_text("Google Calendar • Conectar cuenta", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.BLUE))
+    for line in _google_calendar_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _google_calendar_select_alias()
+    if not alias:
+        return
+    entry = _get_google_calendar_entry(alias)
+    current_client_id = str(entry.get("client_id") or "")
+    current_client_secret = str(entry.get("client_secret") or "")
+    print(f"Client ID actual: {current_client_id or '(sin definir)'}")
+    client_id = ask("Ingresá el Client ID de OAuth (vacío mantiene actual): ").strip()
+    if not client_id:
+        client_id = current_client_id
+    if not client_id:
+        warn("Se requiere un Client ID válido para continuar.")
+        press_enter()
+        return
+    client_secret = ask(
+        "Ingresá el Client Secret (vacío mantiene actual o se omite si no aplica): "
+    ).strip()
+    if not client_secret:
+        client_secret = current_client_secret
+    _set_google_calendar_entry(alias, {"client_id": client_id, "client_secret": client_secret})
+    token_data = _google_calendar_perform_device_flow(client_id, client_secret or None)
+    if not token_data:
+        return
+    entry = _get_google_calendar_entry(alias)
+    entry = _google_calendar_store_tokens(alias, entry, token_data)
+    if entry.get("connected"):
+        ok(f"Google Calendar conectado para {alias}.")
+    else:
+        warn("No se pudo completar la conexión con Google Calendar.")
+    press_enter()
+
+
+def _google_calendar_configure_event() -> None:
+    banner()
+    print(style_text("Google Calendar • Configuración de eventos", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.BLUE))
+    for line in _google_calendar_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _google_calendar_select_alias()
+    if not alias:
+        return
+    entry = _get_google_calendar_entry(alias)
+    current_name = str(entry.get("event_name") or "{{username}} - Sistema de adquisición con IA")
+    current_duration = int(entry.get("duration_minutes") or 30)
+    current_timezone = str(entry.get("timezone") or _default_timezone_label())
+    current_auto_meet = bool(entry.get("auto_meet", True))
+    print(f"Nombre actual del evento: {current_name}")
+    new_name = ask("Nuevo nombre (usa {{username}} para el lead, Enter mantiene): ").strip()
+    updates: Dict[str, object] = {}
+    if new_name:
+        updates["event_name"] = new_name
+    duration_input = ask(
+        f"Duración en minutos (actual {current_duration}, Enter mantiene): "
+    ).strip()
+    if duration_input:
+        try:
+            updates["duration_minutes"] = max(5, int(duration_input))
+        except Exception:
+            warn("Duración inválida; se mantiene el valor actual.")
+    tz_input = ask(
+        f"Zona horaria (actual {current_timezone}, Enter mantiene): "
+    ).strip()
+    if tz_input:
+        updates["timezone"] = tz_input
+    auto_meet_input = ask(
+        f"Generar enlace de Google Meet automáticamente? (S/N, actual {'S' if current_auto_meet else 'N'}): "
+    ).strip().lower()
+    if auto_meet_input in {"s", "si", "sí"}:
+        updates["auto_meet"] = True
+    elif auto_meet_input in {"n", "no"}:
+        updates["auto_meet"] = False
+    if updates:
+        _set_google_calendar_entry(alias, updates)
+        ok("Configuración de eventos actualizada.")
+    else:
+        warn("No se realizaron cambios.")
+    press_enter()
+
+
+def _google_calendar_activate() -> None:
+    banner()
+    print(style_text("Google Calendar • Activar creación automática", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.BLUE))
+    for line in _google_calendar_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _google_calendar_select_alias()
+    if not alias:
+        return
+    entry = _get_google_calendar_entry(alias)
+    if not entry.get("connected"):
+        warn("Conectá Google Calendar antes de activar la lógica automática.")
+        press_enter()
+        return
+    _set_google_calendar_entry(alias, {"enabled": True})
+    ok(f"Lógica automática activada para {alias}.")
+    press_enter()
+
+
+def _google_calendar_deactivate() -> None:
+    banner()
+    print(style_text("Google Calendar • Desactivar creación automática", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.BLUE))
+    for line in _google_calendar_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _google_calendar_select_alias()
+    if not alias:
+        return
+    _set_google_calendar_entry(alias, {"enabled": False})
+    ok(f"Lógica automática desactivada para {alias}.")
+    press_enter()
+
+
+def _google_calendar_revoke() -> None:
+    banner()
+    print(style_text("Google Calendar • Revocar conexión", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.BLUE))
+    for line in _google_calendar_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _google_calendar_select_alias()
+    if not alias:
+        return
+    entry = _get_google_calendar_entry(alias)
+    token = entry.get("access_token") or entry.get("refresh_token")
+    if token and _require_requests():
+        try:
+            requests.post(_GOOGLE_REVOKE_URL, params={"token": token}, timeout=15)
+        except RequestException:
+            logger.warning("No se pudo notificar la revocación a Google.", exc_info=False)
+    _set_google_calendar_entry(
+        alias,
+        {
+            "access_token": "",
+            "refresh_token": "",
+            "token_type": "",
+            "token_expires_at": 0,
+            "connected": False,
+            "enabled": False,
+        },
+    )
+    ok(f"Conexión revocada para {alias}.")
+    press_enter()
+
+
+def _google_calendar_menu() -> None:
+    while True:
+        banner()
+        print(style_text("Conectar con Google Calendar", color=Fore.CYAN, bold=True))
+        print(full_line(color=Fore.BLUE))
+        for line in _google_calendar_status_lines():
+            print(line)
+        print(full_line(color=Fore.BLUE))
+        print("1) Conectar cuenta mediante OAuth")
+        print("2) Configurar parámetros del evento")
+        print("3) Activar creación automática de eventos")
+        print("4) Desactivar creación automática de eventos")
+        print("5) Revocar conexión")
+        print("6) Volver al submenú anterior")
+        print(full_line(color=Fore.BLUE))
+        choice = ask("Opción: ").strip()
+        if choice == "1":
+            _google_calendar_connect()
+        elif choice == "2":
+            _google_calendar_configure_event()
+        elif choice == "3":
+            _google_calendar_activate()
+        elif choice == "4":
+            _google_calendar_deactivate()
+        elif choice == "5":
+            _google_calendar_revoke()
+        elif choice == "6":
+            break
+        else:
+            warn("Opción inválida.")
+            press_enter()
+
+
 def _configure_api_key() -> None:
     banner()
     current_key, _ = _load_preferences()
@@ -894,9 +1478,10 @@ def autoresponder_menu_options() -> List[str]:
         "1) Configurar API Key",
         "2) Configurar System Prompt",
         "3) Activar bot (alias/grupo)",
-        "4) Conectar con GoHighLevel",
-        "5) Desactivar bot",
-        "6) Volver",
+        "4) Conectar con Google Calendar",
+        "5) Conectar con GoHighLevel",
+        "6) Desactivar bot",
+        "7) Volver",
     ]
 
 
@@ -918,6 +1503,7 @@ def _print_menu_header() -> None:
     print(f"API Key: {_mask_key(api_key) or '(sin definir)'}")
     print(f"System prompt: {_preview_prompt(prompt)}")
     print(status)
+    print(_google_calendar_summary_line())
     print(_gohighlevel_summary_line())
     print(full_line(color=Fore.BLUE))
     for option in autoresponder_menu_options():
@@ -1064,6 +1650,79 @@ def _build_conversation_note(account: str, recipient: str, conversation: str) ->
     return "\n".join(header + [conversation])
 
 
+def _next_weekday_date(base: datetime, target_weekday: int) -> datetime.date:
+    days_ahead = (target_weekday - base.weekday() + 7) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    return (base + timedelta(days=days_ahead)).date()
+
+
+def _parse_meeting_datetime_from_text(text: str, tz_label: str) -> Optional[datetime]:
+    if not text:
+        return None
+    if not _MEETING_TIME_PATTERN.search(text):
+        return None
+    match = _MEETING_TIME_PATTERN.search(text)
+    if not match:
+        return None
+    try:
+        hour = int(match.group("hour"))
+    except Exception:
+        return None
+    minute_str = match.group("minute")
+    minute = int(minute_str) if minute_str and minute_str.isdigit() else 0
+    ampm = match.group("ampm")
+    if ampm:
+        ampm = ampm.lower()
+        if ampm == "pm" and hour < 12:
+            hour += 12
+        if ampm == "am" and hour == 12:
+            hour = 0
+    hour %= 24
+    tz = _safe_timezone(tz_label)
+    base = datetime.now(tz)
+    normalized = _normalize_text_for_match(text)
+    date_value: Optional[datetime.date] = None
+    for keyword, offset in _RELATIVE_DATE_KEYWORDS:
+        if keyword in normalized:
+            date_value = (base + timedelta(days=offset)).date()
+            break
+    if date_value is None:
+        for keyword, weekday in _WEEKDAY_KEYWORDS.items():
+            if _contains_token(normalized, keyword):
+                date_value = _next_weekday_date(base, weekday)
+                break
+    if date_value is None and _MEETING_DATE_PATTERN.search(text):
+        try:
+            parsed = date_parser.parse(text, fuzzy=True, dayfirst=True, default=base)
+            date_value = parsed.date()
+        except Exception:
+            date_value = None
+    if date_value is None:
+        return None
+    meeting_dt = datetime.combine(date_value, dt_time(hour=hour, minute=minute), tz)
+    if meeting_dt < base:
+        if _MEETING_DATE_PATTERN.search(text):
+            return None
+        meeting_dt += timedelta(days=7)
+    return meeting_dt
+
+
+def _detect_meeting_datetime(conversation: str, tz_label: str) -> Optional[datetime]:
+    lines = [line for line in conversation.splitlines() if line.startswith("ELLOS:")]
+    for line in reversed(lines):
+        _, _, content = line.partition(":")
+        meeting_dt = _parse_meeting_datetime_from_text(content.strip(), tz_label)
+        if meeting_dt:
+            return meeting_dt
+    return None
+
+
+def _render_calendar_summary(template: str, username: str) -> str:
+    template = template or "{{username}} - Sistema de adquisición con IA"
+    return template.replace("{{username}}", username or "Lead")
+
+
 def _create_gohighlevel_contact(api_key: str, payload: Dict[str, object]) -> Optional[str]:
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -1198,6 +1857,148 @@ def _send_lead_to_gohighlevel(
     )
 
 
+def _maybe_schedule_google_calendar_event(
+    account: str,
+    recipient: str,
+    conversation: str,
+    phone_numbers: List[str],
+    status: Optional[str],
+) -> Optional[str]:
+    if ACTIVE_ALIAS is None:
+        return None
+    if not phone_numbers:
+        return None
+    if status and status.strip().lower() == "no interesado":
+        return None
+    alias, entry = _google_calendar_enabled_entry_for(account)
+    if not alias or not entry:
+        return None
+    if requests is None:
+        return None
+    normalized_convo = _normalize_text_for_match(conversation)
+    if not any(keyword in normalized_convo for keyword in _CALL_KEYWORDS):
+        return None
+    tz_label = str(entry.get("timezone") or _default_timezone_label())
+    meeting_dt = _detect_meeting_datetime(conversation, tz_label)
+    if not meeting_dt:
+        return None
+    main_phone = _normalize_phone(phone_numbers[0])
+    if not main_phone:
+        return None
+    normalized_lead = recipient or main_phone
+    if _google_calendar_already_scheduled(alias, normalized_lead, main_phone):
+        return None
+    access_token = _google_calendar_ensure_token(alias, entry)
+    if not access_token:
+        return None
+    summary_template = str(entry.get("event_name") or "{{username}} - Sistema de adquisición con IA")
+    summary = _render_calendar_summary(summary_template, recipient or "Lead")
+    try:
+        duration = int(entry.get("duration_minutes") or 30)
+    except Exception:
+        duration = 30
+    duration = max(5, duration)
+    tz = _safe_timezone(tz_label)
+    start_dt = meeting_dt.astimezone(tz)
+    end_dt = start_dt + timedelta(minutes=duration)
+    email = _extract_email_from_text(conversation)
+    description_lines = [
+        "Evento generado automáticamente desde el bot de Instagram.",
+        f"Cuenta IG: @{account}",
+    ]
+    if recipient:
+        description_lines.append(f"Usuario IG: @{recipient}")
+    description_lines.append(f"Teléfono: {main_phone}")
+    if email:
+        description_lines.append(f"Email: {email}")
+    if status:
+        description_lines.append(f"Estado detectado: {status}")
+    description_lines.append("")
+    description_lines.append("Historial de la conversación:")
+    description_lines.append(conversation)
+    description = "\n".join(description_lines)
+    payload: Dict[str, object] = {
+        "summary": summary,
+        "description": description,
+        "start": {"dateTime": start_dt.isoformat(), "timeZone": tz_label},
+        "end": {"dateTime": end_dt.isoformat(), "timeZone": tz_label},
+    }
+    attendees: List[Dict[str, str]] = []
+    if email:
+        attendees.append({"email": email})
+    if attendees:
+        payload["attendees"] = attendees
+    params = {}
+    if entry.get("auto_meet", True):
+        payload["conferenceData"] = {
+            "createRequest": {
+                "requestId": uuid.uuid4().hex,
+                "conferenceSolutionKey": {"type": "hangoutsMeet"},
+            }
+        }
+        params["conferenceDataVersion"] = 1
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+    url = f"{_GOOGLE_CALENDAR_BASE}/calendars/primary/events"
+    try:
+        response = requests.post(  # type: ignore[call-arg]
+            url, headers=headers, json=payload, params=params, timeout=20
+        )
+    except RequestException as exc:  # pragma: no cover - depende de red externa
+        logger.warning("No se pudo crear el evento en Google Calendar: %s", exc, exc_info=False)
+        return None
+    if response.status_code == 401:
+        new_token = _google_calendar_refresh_access_token(alias, entry)
+        if not new_token:
+            return None
+        headers["Authorization"] = f"Bearer {new_token}"
+        try:
+            response = requests.post(  # type: ignore[call-arg]
+                url, headers=headers, json=payload, params=params, timeout=20
+            )
+        except RequestException as exc:  # pragma: no cover - depende de red externa
+            logger.warning(
+                "No se pudo crear el evento en Google Calendar tras refrescar token: %s",
+                exc,
+                exc_info=False,
+            )
+            return None
+    if response.status_code not in {200, 201}:
+        logger.warning(
+            "Respuesta inesperada al crear evento de Google Calendar (%s): %s",
+            response.status_code,
+            response.text,
+        )
+        return None
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+    event_id = data.get("id")
+    if not event_id:
+        return None
+    link = data.get("htmlLink") or data.get("hangoutLink") or ""
+    _google_calendar_mark_scheduled(alias, normalized_lead, main_phone, event_id, link)
+    logger.info(
+        "Evento programado en Google Calendar | alias=%s | cuenta=%s | lead=%s | inicio=%s",
+        alias,
+        account,
+        recipient or "(sin usuario)",
+        start_dt.isoformat(),
+    )
+    formatted_dt = start_dt.strftime("%d/%m/%Y %H:%M")
+    message_lines = [
+        f"Listo, agendé nuestra llamada para {formatted_dt} ({tz_label}).",
+    ]
+    if link:
+        message_lines.append(f"Podés ver los detalles acá: {link}")
+    else:
+        message_lines.append("Te compartí los detalles en nuestro calendario.")
+    return "\n".join(message_lines)
+
+
 def _process_inbox(
     client,
     user: str,
@@ -1238,8 +2039,16 @@ def _process_inbox(
                 ts_value = int(msg_ts.timestamp())
             log_conversation_status(user, recipient_username, status, timestamp=ts_value)
         phone_numbers = _extract_phone_numbers(last.text or "")
+        calendar_message: Optional[str] = None
         if phone_numbers and status != "No interesado":
             _send_lead_to_gohighlevel(
+                user,
+                recipient_username,
+                convo,
+                phone_numbers,
+                status,
+            )
+            calendar_message = _maybe_schedule_google_calendar_event(
                 user,
                 recipient_username,
                 convo,
@@ -1249,6 +2058,8 @@ def _process_inbox(
         try:
             reply = _gen_response(api_key, system_prompt, convo)
             client.direct_send(reply, [last.user_id])
+            if calendar_message:
+                client.direct_send(calendar_message, [last.user_id])
         except Exception as exc:
             setattr(exc, "_autoresponder_sender", user)
             setattr(exc, "_autoresponder_recipient", recipient_username)
@@ -1390,10 +2201,12 @@ def menu_autoresponder():
         elif choice == "3":
             _activate_bot()
         elif choice == "4":
-            _gohighlevel_menu()
+            _google_calendar_menu()
         elif choice == "5":
-            _manual_stop()
+            _gohighlevel_menu()
         elif choice == "6":
+            _manual_stop()
+        elif choice == "7":
             break
         else:
             warn("Opción inválida.")

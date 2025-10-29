@@ -245,6 +245,12 @@ def _run_client_integrity_check() -> None:
         f"Autoresponder 5.2 listo. System Prompt actual: {prompt_length} caracteres."
     )
 
+    calendar_disponible = any(
+        "Conectar con Google Calendar" in opt for opt in autoresponder_menu_options()
+    )
+    estado_calendar = "sí" if calendar_disponible else "no"
+    print(f"Submenú 'Conectar con Google Calendar' disponible: {estado_calendar}")
+
     gohighlevel_disponible = any(
         "Conectar con GoHighLevel" in opt for opt in autoresponder_menu_options()
     )
