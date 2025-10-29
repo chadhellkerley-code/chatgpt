@@ -155,7 +155,7 @@ _GOOGLE_DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code"
 _GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 _GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 _GOOGLE_CALENDAR_BASE = "https://www.googleapis.com/calendar/v3"
-_GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+_GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar"
 _GOOGLE_STATE: Dict[str, dict] | None = None
 _MEETING_TIME_PATTERN = re.compile(
     r"(?P<hour>\b[01]?\d|2[0-3])(?:(?:[:h\.])(?P<minute>[0-5]\d))?\s*(?P<ampm>am|pm)?\s*(?P<label>hs|hrs|horas)?",
@@ -198,7 +198,7 @@ _GOOGLE_DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code"
 _GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 _GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 _GOOGLE_CALENDAR_BASE = "https://www.googleapis.com/calendar/v3"
-_GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+_GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar"
 _GOOGLE_STATE: Dict[str, dict] | None = None
 _MEETING_TIME_PATTERN = re.compile(
     r"(?P<hour>\b[01]?\d|2[0-3])(?:(?:[:h\.])(?P<minute>[0-5]\d))?\s*(?P<ampm>am|pm)?\s*(?P<label>hs|hrs|horas)?",
