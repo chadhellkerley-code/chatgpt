@@ -751,6 +751,8 @@ def _move_accounts_to_alias(alias: str) -> None:
 
 
 def _schedule_health_refresh(accounts_to_refresh: List[Dict]) -> None:
+    if SETTINGS.client_distribution:
+        return
     for account in accounts_to_refresh:
         username = account.get("username", "")
         key = _health_cache_key(username)
