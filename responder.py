@@ -86,6 +86,13 @@ _GOHIGHLEVEL_BASE = "https://rest.gohighlevel.com/v1"
 _PHONE_PATTERN = re.compile(r"(?<!\d)(?:\+?\d[\d\s().-]{7,}\d)")
 _EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
 _GOHIGHLEVEL_STATE: Dict[str, dict] | None = None
+_DEFAULT_GOHIGHLEVEL_PROMPT = (
+    "Sos un asistente que evalúa conversaciones de Instagram y determina si un lead está "
+    "calificado para enviarse automáticamente al CRM GoHighLevel. Respondé únicamente "
+    "con 'SI' cuando corresponda enviarlo y 'NO' cuando no cumpla con los criterios. "
+    "Considerá el contexto, el interés real del lead y si el equipo comercial debería "
+    "contactarlo."
+)
 
 _PROMPT_STORAGE_DIR = runtime_base(Path(__file__).resolve().parent) / "data" / "autoresponder"
 _PROMPT_DEFAULT_ALIAS = "default"
@@ -681,6 +688,7 @@ def _get_gohighlevel_entry(alias: str) -> Dict[str, dict]:
     if isinstance(entry, dict):
         entry.setdefault("alias", alias.strip())
         entry.setdefault("sent", {})
+        entry.setdefault("qualify_prompt", _DEFAULT_GOHIGHLEVEL_PROMPT)
         if "location_ids" in entry:
             entry["location_ids"] = _sanitize_location_ids(entry.get("location_ids"))
         return entry
@@ -1205,6 +1213,70 @@ def _gohighlevel_enabled_entry_for(username: str) -> tuple[Optional[str], Dict[s
     return None, {}
 
 
+def _gohighlevel_lead_qualifies(
+    entry: Dict[str, object],
+    conversation: str,
+    status: Optional[str],
+    phone_numbers: List[str],
+    api_key: Optional[str],
+) -> bool:
+    prompt_text = str(entry.get("qualify_prompt") or "").strip()
+    if not prompt_text:
+        return True
+    if not api_key:
+        return True
+    try:  # pragma: no cover - depende de dependencia externa
+        from openai import OpenAI
+    except Exception as exc:  # pragma: no cover - entorno sin openai
+        logger.warning(
+            "No se pudo importar OpenAI para evaluar GoHighLevel: %s", exc, exc_info=False
+        )
+        return True
+    try:  # pragma: no cover - depende de credenciales externas
+        client = OpenAI(api_key=api_key)
+    except Exception as exc:
+        logger.warning(
+            "No se pudo inicializar OpenAI para evaluar GoHighLevel: %s",
+            exc,
+            exc_info=False,
+        )
+        return True
+
+    system_prompt = (
+        prompt_text
+        + "\n\nResponde únicamente con 'SI' o 'NO' indicando si se debe enviar el lead a GoHighLevel."
+    )
+    context_lines = [
+        f"Estado detectado: {status or 'desconocido'}",
+        "Teléfonos detectados: "
+        + (", ".join(phone_numbers) if phone_numbers else "(sin teléfono)"),
+        "Conversación completa:",
+        conversation,
+    ]
+    user_content = "\n".join(context_lines)
+    try:  # pragma: no cover - depende de red externa
+        response = client.responses.create(
+            model="gpt-4o-mini",
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0,
+            max_output_tokens=20,
+        )
+        decision = (response.output_text or "").strip().lower()
+    except Exception as exc:  # pragma: no cover - depende de red externa
+        logger.warning(
+            "No se pudo evaluar el criterio de GoHighLevel con OpenAI: %s",
+            exc,
+            exc_info=False,
+        )
+        return True
+
+    normalized = _normalize_text_for_match(decision)
+    return normalized.startswith("s")
+
+
 def _require_requests() -> bool:
     if requests is None:  # pragma: no cover - entorno sin dependencia
         warn("La librería 'requests' no está disponible. Instalála para usar GoHighLevel.")
@@ -1265,11 +1337,42 @@ def _gohighlevel_configure_locations() -> None:
     print()
     prompt = (
         "Ingresá uno o más Location IDs (separados por coma o espacio).\n"
-        "Escribí 'limpiar' para eliminar los existentes o dejá vacío para cancelar: "
+        "Escribí 'eliminar N' para borrar uno específico (usa el número de la lista),\n"
+        "'limpiar' para eliminar todos o dejá vacío para cancelar: "
     )
     raw = ask(prompt).strip()
     if not raw:
         warn("No se modificaron los Location IDs.")
+        press_enter()
+        return
+    if raw.lower().startswith("eliminar"):
+        if not current_ids:
+            warn("No hay Location IDs para eliminar.")
+            press_enter()
+            return
+        indexes = [token for token in re.split(r"[^0-9]+", raw) if token.isdigit()]
+        if not indexes:
+            warn("Indicá el número del Location ID a eliminar.")
+            press_enter()
+            return
+        to_remove: set[int] = set()
+        for token in indexes:
+            try:
+                idx = int(token)
+            except ValueError:
+                continue
+            if 1 <= idx <= len(current_ids):
+                to_remove.add(idx - 1)
+        if not to_remove:
+            warn("Los números indicados no coinciden con Location IDs existentes.")
+            press_enter()
+            return
+        remaining = [value for idx, value in enumerate(current_ids) if idx not in to_remove]
+        _set_gohighlevel_entry(alias, {"location_ids": remaining})
+        ok(
+            "Se eliminaron los Location IDs seleccionados. Total restante: "
+            f"{len(remaining)}"
+        )
         press_enter()
         return
     if raw.lower() in {"limpiar", "clear", "ninguno", "eliminar", "borrar"}:
@@ -1284,6 +1387,62 @@ def _gohighlevel_configure_locations() -> None:
         return
     _set_gohighlevel_entry(alias, {"location_ids": location_ids})
     ok(f"Location IDs guardados para {alias}. Total: {len(location_ids)}")
+    press_enter()
+
+
+def _gohighlevel_configure_prompt() -> None:
+    banner()
+    print(style_text("GoHighLevel • Criterios de envío", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.BLUE))
+    for line in _gohighlevel_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _gohighlevel_select_alias()
+    if not alias:
+        return
+    entry = _get_gohighlevel_entry(alias)
+    current_prompt = str(entry.get("qualify_prompt") or _DEFAULT_GOHIGHLEVEL_PROMPT)
+    print(style_text("Prompt actual:", color=Fore.BLUE))
+    print(current_prompt or "(sin definir)")
+    print(full_line(color=Fore.BLUE))
+    print("Elegí una opción:")
+    print("  E) Editar prompt")
+    print("  D) Restaurar prompt predeterminado")
+    print("  Enter) Cancelar")
+    action = ask("Acción: ").strip().lower()
+    if not action:
+        warn("No se modificó el prompt de calificación.")
+        press_enter()
+        return
+    if action in {"d", "default", "predeterminado"}:
+        _set_gohighlevel_entry(alias, {"qualify_prompt": _DEFAULT_GOHIGHLEVEL_PROMPT})
+        ok("Se restauró el prompt predeterminado para GoHighLevel.")
+        press_enter()
+        return
+    if action not in {"e", "editar"}:
+        warn("Opción inválida. No se modificó el prompt de calificación.")
+        press_enter()
+        return
+    print(
+        style_text(
+            "Pegá el nuevo prompt y finalizá con una línea que diga <<<END>>>."
+            " Dejá vacío para cancelar.",
+            color=Fore.CYAN,
+        )
+    )
+    lines: List[str] = []
+    while True:
+        line = ask("› ")
+        if line.strip() == "<<<END>>>":
+            break
+        lines.append(line.replace("\r", ""))
+    new_prompt = "\n".join(lines).strip()
+    if not new_prompt:
+        warn("No se modificó el prompt de calificación.")
+        press_enter()
+        return
+    _set_gohighlevel_entry(alias, {"qualify_prompt": new_prompt})
+    ok(f"Prompt actualizado. Longitud: {len(new_prompt)} caracteres.")
     press_enter()
 
 
@@ -1337,7 +1496,8 @@ def _gohighlevel_menu() -> None:
         print("2) Configurar Location IDs de GoHighLevel")
         print("3) Activar el envío automático de leads calificados al CRM de GoHighLevel")
         print("4) Desactivar conexión")
-        print("5) Volver al submenú anterior")
+        print("5) Configurar criterios de calificación")
+        print("6) Volver al submenú anterior")
         print(full_line(color=Fore.BLUE))
         choice = ask("Opción: ").strip()
         if choice == "1":
@@ -1349,6 +1509,8 @@ def _gohighlevel_menu() -> None:
         elif choice == "4":
             _gohighlevel_deactivate()
         elif choice == "5":
+            _gohighlevel_configure_prompt()
+        elif choice == "6":
             break
         else:
             warn("Opción inválida.")
@@ -2061,10 +2223,14 @@ def _infer_lead_tag(
     return _DEFAULT_LEAD_TAG
 
 
-def _build_conversation_note(account: str, recipient: str, conversation: str) -> str:
+def _build_conversation_note(
+    account: str, recipient: str, conversation: str, status: Optional[str] = None
+) -> str:
     header = [f"Cuenta IG: @{account}"]
     if recipient:
         header.append(f"Usuario: @{recipient}")
+    if status:
+        header.append(f"Estado detectado: {status}")
     header.append("Historial completo:")
     return "\n".join(header + [conversation])
 
@@ -2140,7 +2306,44 @@ def _render_calendar_summary(template: str, username: str) -> str:
     return template.replace("{{username}}", username or "Lead")
 
 
-def _create_gohighlevel_contact(api_key: str, payload: Dict[str, object]) -> Optional[str]:
+def _parse_gohighlevel_contact_id(data: Dict[str, object]) -> Optional[str]:
+    if not isinstance(data, dict):
+        return None
+    contact = data.get("contact") if isinstance(data.get("contact"), dict) else None
+    if isinstance(contact, dict):
+        for key in ("id", "Id", "contactId"):
+            if contact.get(key):
+                return str(contact[key])
+    for key in ("contactId", "id", "Id"):
+        value = data.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _update_gohighlevel_contact(
+    api_key: str, contact_id: str, payload: Dict[str, object]
+) -> Optional[str]:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    url = f"{_GOHIGHLEVEL_BASE}/contacts/{contact_id}"
+    response = requests.put(url, json=payload, headers=headers, timeout=15)  # type: ignore[call-arg]
+    response.raise_for_status()
+    data: Dict[str, object] = {}
+    if response.content:
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+    return _parse_gohighlevel_contact_id(data) or contact_id
+
+
+def _create_gohighlevel_contact(
+    api_key: str, payload: Dict[str, object]
+) -> tuple[Optional[str], bool]:
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -2154,26 +2357,20 @@ def _create_gohighlevel_contact(api_key: str, payload: Dict[str, object]) -> Opt
             data = response.json()
         except ValueError:
             data = {}
-        contact = data.get("contact") if isinstance(data.get("contact"), dict) else None
-        contact_id = data.get("contactId") or (contact.get("id") if contact else None)
+        contact_id = _parse_gohighlevel_contact_id(data)
         if contact_id:
-            return str(contact_id)
+            updated_id = _update_gohighlevel_contact(api_key, str(contact_id), payload)
+            return updated_id, False
     response.raise_for_status()
     if response.content:
         try:
             data = response.json()
         except ValueError:
             data = {}
-    contact_data = data.get("contact") if isinstance(data.get("contact"), dict) else {}
-    if isinstance(contact_data, dict):
-        for key in ("id", "Id", "contactId"):
-            if contact_data.get(key):
-                return str(contact_data[key])
-    for key in ("contactId", "id", "Id"):
-        value = data.get(key)
-        if value:
-            return str(value)
-    return None
+    contact_id = _parse_gohighlevel_contact_id(data)
+    if contact_id:
+        return contact_id, True
+    return None, True
 
 
 def _attach_gohighlevel_note(api_key: str, contact_id: str, note: str) -> None:
@@ -2194,6 +2391,7 @@ def _send_lead_to_gohighlevel(
     conversation: str,
     phone_numbers: List[str],
     status: Optional[str],
+    openai_api_key: Optional[str] = None,
 ) -> None:
     if requests is None:
         logger.warning("GoHighLevel no disponible: falta la librería requests.")
@@ -2220,6 +2418,15 @@ def _send_lead_to_gohighlevel(
     if _gohighlevel_already_sent(alias, normalized_lead, main_phone):
         return
 
+    if not _gohighlevel_lead_qualifies(
+        entry,
+        conversation,
+        status,
+        phone_numbers,
+        openai_api_key,
+    ):
+        return
+
     contact_payload: Dict[str, object] = {
         "name": recipient or "Lead Instagram",
         "phone": main_phone,
@@ -2227,25 +2434,35 @@ def _send_lead_to_gohighlevel(
     email = _extract_email_from_text(conversation)
     if email:
         contact_payload["email"] = email
-    note_text = _build_conversation_note(account, recipient, conversation)
+    note_text = _build_conversation_note(account, recipient, conversation, status)
     lead_tag = _infer_lead_tag(conversation, phone_numbers, status)
-    successes = 0
+    successes: List[str] = []
     for location_id in location_ids:
         payload = dict(contact_payload)
         payload["locationId"] = location_id
         if lead_tag:
             payload["tags"] = [lead_tag]
         try:
-            contact_id = _create_gohighlevel_contact(api_key, payload)
+            contact_id, created = _create_gohighlevel_contact(api_key, payload)
             if not contact_id:
+                message = (
+                    "No se obtuvo contactId al crear contacto en GoHighLevel para %s (location %s)."
+                )
                 logger.warning(
-                    "No se obtuvo contactId al crear contacto en GoHighLevel para %s (location %s).",
+                    message,
                     recipient or "(sin usuario)",
                     location_id,
                 )
+                print(
+                    f"❌ Falló el envío a GHL (Location {location_id}): no se recibió identificador del contacto"
+                )
                 continue
             _attach_gohighlevel_note(api_key, contact_id, note_text)
-            successes += 1
+            successes.append(location_id)
+            action = "creado" if created else "actualizado"
+            print(
+                f"✅ Lead enviado a GHL (Location {location_id}) — contacto {action} (ID {contact_id})"
+            )
         except RequestException as exc:  # pragma: no cover - depende de red externa
             logger.warning(
                 "Error enviando lead a GoHighLevel (location %s): %s",
@@ -2253,6 +2470,7 @@ def _send_lead_to_gohighlevel(
                 exc,
                 exc_info=False,
             )
+            print(f"❌ Falló el envío a GHL (Location {location_id}): {exc}")
         except Exception as exc:  # pragma: no cover - manejo defensivo
             logger.warning(
                 "Fallo inesperado con GoHighLevel (location %s): %s",
@@ -2260,6 +2478,7 @@ def _send_lead_to_gohighlevel(
                 exc,
                 exc_info=False,
             )
+            print(f"❌ Falló el envío a GHL (Location {location_id}): {exc}")
     if not successes:
         return
 
@@ -2269,7 +2488,7 @@ def _send_lead_to_gohighlevel(
         alias,
         account,
         recipient or "(sin usuario)",
-        ",".join(location_ids),
+        ",".join(successes),
         lead_tag,
     )
 
@@ -2431,6 +2650,8 @@ def _process_inbox(
                 ts_value = int(msg_ts.timestamp())
             log_conversation_status(user, recipient_username, status, timestamp=ts_value)
         phone_numbers = _extract_phone_numbers(last.text or "")
+        if not phone_numbers:
+            phone_numbers = _extract_phone_numbers(convo)
         calendar_message: Optional[str] = None
         if phone_numbers and status != "No interesado":
             _send_lead_to_gohighlevel(
@@ -2439,6 +2660,7 @@ def _process_inbox(
                 convo,
                 phone_numbers,
                 status,
+                api_key,
             )
             calendar_message = _maybe_schedule_google_calendar_event(
                 user,
