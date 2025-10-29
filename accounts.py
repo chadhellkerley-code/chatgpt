@@ -2,7 +2,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import csv
 import getpass
+import io
 import json
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -46,6 +48,17 @@ _HEALTH_REFRESH_PENDING: set[str] = set()
 _HEALTH_REFRESH_EXECUTOR = ThreadPoolExecutor(
     max_workers=3, thread_name_prefix="health-refresh"
 )
+
+
+_CSV_HEADERS = [
+    "username",
+    "password",
+    "2fa code",
+    "proxy id",
+    "proxy port",
+    "proxy username",
+    "proxy password",
+]
 
 
 def _load_health_cache_from_disk() -> None:
@@ -148,6 +161,65 @@ def _load() -> List[Dict]:
 def _save(items: List[Dict]) -> None:
     cleaned = [_prepare_for_save(_normalize_account(it)) for it in items]
     FILE.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _parse_accounts_csv(path: Path) -> List[Dict[str, str]]:
+    raw_text = path.read_text(encoding="utf-8-sig")
+    if not raw_text.strip():
+        return []
+
+    buffer = io.StringIO(raw_text)
+    reader = csv.DictReader(buffer)
+    normalized_rows: List[Dict[str, str]] = []
+    mapping: Dict[str, str] = {}
+
+    if reader.fieldnames:
+        lowered = {name.strip().lower(): name for name in reader.fieldnames if name}
+        if all(header in lowered for header in _CSV_HEADERS):
+            mapping = {header: lowered[header] for header in _CSV_HEADERS}
+
+    if mapping:
+        for row in reader:
+            normalized = {
+                header: (row.get(actual) or "").strip()
+                for header, actual in mapping.items()
+            }
+            if not any(normalized.values()):
+                continue
+            normalized_rows.append(normalized)
+        return normalized_rows
+
+    buffer = io.StringIO(raw_text)
+    plain_reader = csv.reader(buffer)
+    for row_index, row in enumerate(plain_reader):
+        if not row:
+            continue
+        candidate = [cell.strip().lower() for cell in row[: len(_CSV_HEADERS)]]
+        if row_index == 0 and candidate == _CSV_HEADERS:
+            continue
+        normalized = {
+            header: row[idx].strip() if idx < len(row) else ""
+            for idx, header in enumerate(_CSV_HEADERS)
+        }
+        if not any(normalized.values()):
+            continue
+        normalized_rows.append(normalized)
+    return normalized_rows
+
+
+def _compose_proxy_url(identifier: str, port: str) -> str:
+    base = identifier.strip()
+    if not base:
+        return ""
+    if "://" not in base:
+        base = f"http://{base}"
+    if port:
+        trimmed = base.rstrip("/")
+        if trimmed.count(":") <= 1:
+            base = f"{trimmed}:{port}"
+        else:
+            base = trimmed
+    return base
 
 
 def list_all() -> List[Dict]:
@@ -511,6 +583,108 @@ def _schedule_health_refresh(accounts_to_refresh: List[Dict]) -> None:
                 _HEALTH_REFRESH_PENDING.discard(key)
 
 
+def _import_accounts_from_csv(alias: str) -> None:
+    path_input = ask("Ruta del archivo CSV: ").strip()
+    if not path_input:
+        warn("No se indicó la ruta del archivo.")
+        press_enter()
+        return
+
+    path = Path(path_input).expanduser()
+    if not path.exists() or not path.is_file():
+        warn("El archivo CSV indicado no existe o no es un archivo válido.")
+        press_enter()
+        return
+
+    try:
+        rows = _parse_accounts_csv(path)
+    except Exception as exc:
+        warn(f"No se pudo leer el CSV: {exc}")
+        press_enter()
+        return
+
+    if not rows:
+        warn("El archivo CSV no contiene registros válidos.")
+        press_enter()
+        return
+
+    proxy_defaults = default_proxy_settings()
+    sticky_value = proxy_defaults.get("sticky") or SETTINGS.proxy_sticky_minutes or 10
+    try:
+        sticky_minutes = int(sticky_value)
+    except Exception:
+        sticky_minutes = SETTINGS.proxy_sticky_minutes or 10
+    sticky_minutes = max(1, sticky_minutes)
+
+    total = len(rows)
+    successes = 0
+    errors: List[tuple[int, str]] = []
+
+    for idx, row in enumerate(rows, start=1):
+        username = (row.get("username") or "").strip().lstrip("@")
+        password = (row.get("password") or "").strip()
+        totp_value = (row.get("2fa code") or "").strip()
+        proxy_id = (row.get("proxy id") or "").strip()
+        proxy_port = (row.get("proxy port") or "").strip()
+        proxy_user = (row.get("proxy username") or "").strip()
+        proxy_pass = (row.get("proxy password") or "").strip()
+
+        fields = [
+            ("Username", username),
+            ("Password", password),
+            ("2FA Code", totp_value),
+            ("Proxy ID", proxy_id),
+            ("Proxy Port", proxy_port),
+            ("Proxy Username", proxy_user),
+            ("Proxy Password", proxy_pass),
+        ]
+        missing = [label for label, value in fields if not value]
+        if missing:
+            errors.append((idx, f"Campos incompletos: {', '.join(missing)}"))
+            continue
+
+        proxy_url = _compose_proxy_url(proxy_id, proxy_port)
+        if not proxy_url:
+            errors.append((idx, "Configuración de proxy inválida."))
+            continue
+
+        proxy_data = {
+            "proxy_url": proxy_url,
+            "proxy_user": proxy_user,
+            "proxy_pass": proxy_pass,
+            "proxy_sticky_minutes": sticky_minutes,
+        }
+
+        added = add_account(username, alias, proxy_data)
+        if not added:
+            errors.append((idx, "No se pudo agregar la cuenta (posible duplicado)."))
+            continue
+
+        if totp_value:
+            try:
+                save_totp_secret(username, totp_value)
+            except ValueError as exc:
+                remove_account(username)
+                errors.append((idx, f"2FA inválido: {exc}"))
+                continue
+
+        successes += 1
+
+        account = get_account(username)
+        if account and not _login_and_save_session(account, password):
+            errors.append((idx, "La cuenta se agregó pero el inicio de sesión falló."))
+
+    print("\nResumen de importación:")
+    print(f"Total de cuentas procesadas: {total}")
+    print(f"Cuentas agregadas correctamente: {successes}")
+    print(f"Cuentas con error: {len(errors)}")
+    if errors:
+        warn("Detalle de errores:")
+        for row_number, message in errors:
+            print(f" - Fila {row_number}: {message}")
+    press_enter()
+
+
 def _format_health_error(exc: Exception, ig_exceptions) -> str:
     msg = str(exc).lower()
 
@@ -683,14 +857,15 @@ def menu_accounts():
                 _schedule_health_refresh(pending_refresh)
 
         print("\n1) Agregar cuenta")
-        print("2) Eliminar cuenta")
-        print("3) Activar/Desactivar / Proxy")
-        print("4) Iniciar sesión y guardar sesiónid (auto en TODAS del alias)")
-        print("5) Iniciar sesión y guardar sesión ID (seleccionar cuenta)")
-        print("6) Modo de exploración automática por hashtag (nuevo)")
-        print("7) Subir contenidos (Historias / Post / Reels)")
-        print("8) Interacciones (Comentar / Ver & Like Reels)")
-        print("9) Volver\n")
+        print("2) Agregar cuentas mediante archivo CSV")
+        print("3) Eliminar cuenta")
+        print("4) Activar/Desactivar / Proxy")
+        print("5) Iniciar sesión y guardar sesiónid (auto en TODAS del alias)")
+        print("6) Iniciar sesión y guardar sesión ID (seleccionar cuenta)")
+        print("7) Modo de exploración automática por hashtag (nuevo)")
+        print("8) Subir contenidos (Historias / Post / Reels)")
+        print("9) Interacciones (Comentar / Ver & Like Reels)")
+        print("10) Volver\n")
 
         op = ask("Opción: ").strip()
         if op == "1":
@@ -712,10 +887,12 @@ def menu_accounts():
                     remove_totp_secret(u)
             press_enter()
         elif op == "2":
+            _import_accounts_from_csv(alias)
+        elif op == "3":
             u = ask("Username a eliminar: ").strip().lstrip("@")
             remove_account(u)
             press_enter()
-        elif op == "3":
+        elif op == "4":
             u = ask("Username: ").strip().lstrip("@")
             account = get_account(u)
             if not account:
@@ -758,12 +935,12 @@ def menu_accounts():
                 account = get_account(u) or account
             else:
                 continue
-        elif op == "4":
+        elif op == "5":
             print("Se pedirá contraseña por cada cuenta...")
             for it in [x for x in _load() if x.get("alias") == alias]:
                 prompt_login(it["username"])
             press_enter()
-        elif op == "5":
+        elif op == "6":
             group = [x for x in _load() if x.get("alias") == alias]
             if not group:
                 warn("No hay cuentas para iniciar sesión.")
@@ -803,13 +980,13 @@ def menu_accounts():
             for acct in targets:
                 prompt_login(acct["username"])
             press_enter()
-        elif op == "6":
-            _launch_hashtag_mode(alias)
         elif op == "7":
-            _launch_content_publisher(alias)
+            _launch_hashtag_mode(alias)
         elif op == "8":
-            _launch_interactions(alias)
+            _launch_content_publisher(alias)
         elif op == "9":
+            _launch_interactions(alias)
+        elif op == "10":
             break
         else:
             warn("Opción inválida.")
