@@ -1,6 +1,8 @@
 import json
 import logging
 import re
+import subprocess
+import sys
 import time
 import unicodedata
 import uuid
@@ -1457,12 +1459,56 @@ def _google_calendar_extract_client_credentials(
     return None, None
 
 
-def _google_calendar_load_credentials_json() -> None:
-    if InstalledAppFlow is None:
-        warn(
-            "Esta opción requiere la librería google-auth-oauthlib. Instalála para continuar."
+def _ensure_google_auth_oauthlib() -> bool:
+    global InstalledAppFlow
+    if InstalledAppFlow is not None:
+        return True
+    flow_cls = None
+    try:
+        from google_auth_oauthlib.flow import InstalledAppFlow as flow_cls  # type: ignore
+    except Exception:
+        warn("Esta opción requiere la librería google-auth-oauthlib.")
+        confirm = (
+            ask("¿Deseás que la instalemos automáticamente ahora? (s/n): ")
+            .strip()
+            .lower()
         )
+        if confirm not in {"s", "si", "sí", "y", "yes"}:
+            warn("Instalación cancelada. Instalá google-auth-oauthlib para continuar.")
+            press_enter()
+            return False
+        python_bin = sys.executable or "python3"
+        print(
+            style_text(
+                "Instalando google-auth-oauthlib, por favor esperá...",
+                color=Fore.YELLOW,
+            )
+        )
+        try:
+            subprocess.check_call(
+                [python_bin, "-m", "pip", "install", "google-auth-oauthlib"]
+            )
+        except Exception as exc:
+            warn(f"No se pudo instalar google-auth-oauthlib automáticamente: {exc}")
+            press_enter()
+            return False
+        try:
+            from google_auth_oauthlib.flow import InstalledAppFlow as flow_cls  # type: ignore
+        except Exception as exc:
+            warn(f"La librería google-auth-oauthlib no pudo cargarse: {exc}")
+            press_enter()
+            return False
+        ok("La librería google-auth-oauthlib se instaló correctamente.")
+    if flow_cls is None:
+        warn("No se pudo cargar la librería google-auth-oauthlib.")
         press_enter()
+        return False
+    InstalledAppFlow = flow_cls
+    return True
+
+
+def _google_calendar_load_credentials_json() -> None:
+    if not _ensure_google_auth_oauthlib():
         return
     banner()
     print(
