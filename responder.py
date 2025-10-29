@@ -156,6 +156,7 @@ _GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 _GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 _GOOGLE_CALENDAR_BASE = "https://www.googleapis.com/calendar/v3"
 _GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar"
+_DEFAULT_GOOGLE_CALENDAR_PROMPT = ""
 _GOOGLE_REDIRECT_URI = "http://localhost"
 _GOOGLE_STATE: Dict[str, dict] | None = None
 _MEETING_TIME_PATTERN = re.compile(
@@ -732,6 +733,7 @@ def _get_google_calendar_entry(alias: str) -> Dict[str, object]:
         entry.setdefault("duration_minutes", 30)
         entry.setdefault("timezone", _default_timezone_label())
         entry.setdefault("auto_meet", True)
+        entry.setdefault("schedule_prompt", _DEFAULT_GOOGLE_CALENDAR_PROMPT)
         return entry
     return {}
 
@@ -751,6 +753,7 @@ def _set_google_calendar_entry(alias: str, updates: Dict[str, object]) -> None:
     entry.setdefault("duration_minutes", 30)
     entry.setdefault("timezone", _default_timezone_label())
     entry.setdefault("auto_meet", True)
+    entry.setdefault("schedule_prompt", _DEFAULT_GOOGLE_CALENDAR_PROMPT)
     normalized_updates: Dict[str, object] = {}
     for key_name, value in updates.items():
         if value is None:
@@ -768,6 +771,8 @@ def _set_google_calendar_entry(alias: str, updates: Dict[str, object]) -> None:
             except Exception:
                 warn("Zona horaria inválida; se mantiene el valor previo.")
                 continue
+        elif key_name == "schedule_prompt":
+            normalized_updates[key_name] = str(value)
         else:
             normalized_updates[key_name] = value
     entry.update(normalized_updates)
@@ -1128,6 +1133,74 @@ def _google_calendar_enabled_entry_for(username: str) -> tuple[Optional[str], Di
             if access_token and refresh_token:
                 return alias, entry
     return None, {}
+
+
+def _google_calendar_lead_qualifies(
+    entry: Dict[str, object],
+    conversation: str,
+    status: Optional[str],
+    phone_numbers: List[str],
+    meeting_dt: datetime,
+    api_key: Optional[str],
+) -> bool:
+    prompt_text = str(entry.get("schedule_prompt") or "").strip()
+    if not prompt_text:
+        return True
+    if not api_key:
+        return True
+    try:  # pragma: no cover - depende de dependencia externa
+        from openai import OpenAI
+    except Exception as exc:  # pragma: no cover - entorno sin openai
+        logger.warning(
+            "No se pudo importar OpenAI para evaluar Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return True
+    try:  # pragma: no cover - depende de credenciales externas
+        client = OpenAI(api_key=api_key)
+    except Exception as exc:
+        logger.warning(
+            "No se pudo inicializar OpenAI para evaluar Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return True
+
+    system_prompt = (
+        prompt_text
+        + "\n\nResponde únicamente con 'SI' o 'NO' indicando si se debe crear un evento en Google Calendar."
+    )
+    context_lines = [
+        f"Estado detectado: {status or 'desconocido'}",
+        "Teléfonos detectados: "
+        + (", ".join(phone_numbers) if phone_numbers else "(sin teléfono)"),
+        f"Fecha/hora detectada: {meeting_dt.isoformat()}",
+        "Conversación completa:",
+        conversation,
+    ]
+    user_content = "\n".join(context_lines)
+    try:  # pragma: no cover - depende de red externa
+        response = client.responses.create(
+            model="gpt-4o-mini",
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0,
+            max_output_tokens=20,
+        )
+        decision = (response.output_text or "").strip().lower()
+    except Exception as exc:  # pragma: no cover - depende de red externa
+        logger.warning(
+            "No se pudo evaluar el criterio de Google Calendar con OpenAI: %s",
+            exc,
+            exc_info=False,
+        )
+        return True
+
+    normalized = _normalize_text_for_match(decision)
+    return normalized.startswith("s")
 
 
 def _mask_gohighlevel_status(entry: Dict[str, object]) -> str:
@@ -1885,6 +1958,70 @@ def _google_calendar_configure_event() -> None:
     press_enter()
 
 
+def _google_calendar_configure_prompt() -> None:
+    banner()
+    print(
+        style_text(
+            "Google Calendar • Criterio para creación de eventos",
+            color=Fore.CYAN,
+            bold=True,
+        )
+    )
+    print(full_line(color=Fore.BLUE))
+    for line in _google_calendar_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _google_calendar_select_alias()
+    if not alias:
+        return
+    entry = _get_google_calendar_entry(alias)
+    current_prompt = str(entry.get("schedule_prompt") or _DEFAULT_GOOGLE_CALENDAR_PROMPT)
+    print(style_text("Prompt actual:", color=Fore.BLUE))
+    print(current_prompt.strip() or "(sin definir)")
+    print(full_line(color=Fore.BLUE))
+    print("Elegí una opción:")
+    print("  E) Editar prompt")
+    print("  D) Restaurar valor predeterminado")
+    print("  Enter) Cancelar")
+    action = ask("Acción: ").strip().lower()
+    if not action:
+        warn("No se modificó el criterio de calendario.")
+        press_enter()
+        return
+    if action in {"d", "default", "predeterminado"}:
+        _set_google_calendar_entry(
+            alias,
+            {"schedule_prompt": _DEFAULT_GOOGLE_CALENDAR_PROMPT},
+        )
+        ok("Se restauró el criterio predeterminado de Google Calendar.")
+        press_enter()
+        return
+    if action not in {"e", "editar"}:
+        warn("Opción inválida. No se modificó el criterio de calendario.")
+        press_enter()
+        return
+    print(
+        style_text(
+            "Pegá el nuevo criterio y finalizá con una línea que diga <<<END>>>.",
+            " Dejá vacío para cancelar.",
+            color=Fore.CYAN,
+        )
+    )
+    lines: List[str] = []
+    while True:
+        line = ask("› ")
+        if line.strip() == "<<<END>>>":
+            break
+        lines.append(line.replace("\r", ""))
+    new_prompt = "\n".join(lines).strip()
+    _set_google_calendar_entry(alias, {"schedule_prompt": new_prompt})
+    if new_prompt:
+        ok(f"Criterio actualizado. Longitud: {len(new_prompt)} caracteres.")
+    else:
+        ok("Se eliminó el criterio personalizado. Se usará la lógica automática predeterminada.")
+    press_enter()
+
+
 def _google_calendar_activate() -> None:
     banner()
     print(style_text("Google Calendar • Activar creación automática", color=Fore.CYAN, bold=True))
@@ -1962,11 +2099,12 @@ def _google_calendar_menu() -> None:
         print(full_line(color=Fore.BLUE))
         print("1) Conectar cuenta mediante OAuth")
         print("2) Configurar parámetros del evento")
-        print("3) Activar creación automática de eventos")
-        print("4) Desactivar creación automática de eventos")
-        print("5) Revocar conexión")
-        print("6) Cargar credenciales JSON (Google OAuth 2.0)")
-        print("7) Volver al submenú anterior")
+        print("3) Configurar criterio para creación de evento")
+        print("4) Activar creación automática de eventos")
+        print("5) Desactivar creación automática de eventos")
+        print("6) Revocar conexión")
+        print("7) Cargar credenciales JSON (Google OAuth 2.0)")
+        print("8) Volver al submenú anterior")
         print(full_line(color=Fore.BLUE))
         choice = ask("Opción: ").strip()
         if choice == "1":
@@ -1974,14 +2112,16 @@ def _google_calendar_menu() -> None:
         elif choice == "2":
             _google_calendar_configure_event()
         elif choice == "3":
-            _google_calendar_activate()
+            _google_calendar_configure_prompt()
         elif choice == "4":
-            _google_calendar_deactivate()
+            _google_calendar_activate()
         elif choice == "5":
-            _google_calendar_revoke()
+            _google_calendar_deactivate()
         elif choice == "6":
-            _google_calendar_load_credentials_json()
+            _google_calendar_revoke()
         elif choice == "7":
+            _google_calendar_load_credentials_json()
+        elif choice == "8":
             break
         elif choice == "7":
             _google_calendar_load_credentials_json()
@@ -2550,6 +2690,7 @@ def _maybe_schedule_google_calendar_event(
     conversation: str,
     phone_numbers: List[str],
     status: Optional[str],
+    openai_api_key: Optional[str] = None,
 ) -> Optional[str]:
     if ACTIVE_ALIAS is None:
         return None
@@ -2568,6 +2709,15 @@ def _maybe_schedule_google_calendar_event(
     tz_label = str(entry.get("timezone") or _default_timezone_label())
     meeting_dt = _detect_meeting_datetime(conversation, tz_label)
     if not meeting_dt:
+        return None
+    if not _google_calendar_lead_qualifies(
+        entry,
+        conversation,
+        status,
+        phone_numbers,
+        meeting_dt,
+        openai_api_key,
+    ):
         return None
     main_phone = _normalize_phone(phone_numbers[0])
     if not main_phone:
@@ -2719,6 +2869,7 @@ def _process_inbox(
                 convo,
                 phone_numbers,
                 status,
+                api_key,
             )
         try:
             reply = _gen_response(api_key, system_prompt, convo)
