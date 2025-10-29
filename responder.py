@@ -2002,8 +2002,10 @@ def _google_calendar_configure_prompt() -> None:
         return
     print(
         style_text(
-            "Pegá el nuevo criterio y finalizá con una línea que diga <<<END>>>.",
-            " Dejá vacío para cancelar.",
+            (
+                "Pegá el nuevo criterio y finalizá con una línea que diga <<<END>>>."
+                " Dejá vacío para cancelar."
+            ),
             color=Fore.CYAN,
         )
     )
