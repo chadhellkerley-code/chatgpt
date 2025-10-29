@@ -1556,11 +1556,23 @@ def _google_calendar_load_credentials_json() -> None:
         flow = InstalledAppFlow.from_client_secrets_file(
             str(file_path), scopes=[_GOOGLE_SCOPE]
         )
-        credentials = flow.run_console()
     except Exception as exc:  # pragma: no cover - depende de librería externa
-        warn(f"No se pudo completar la autenticación OAuth: {exc}")
+        warn(f"No se pudo inicializar el flujo OAuth: {exc}")
         press_enter()
         return
+    try:
+        credentials = flow.run_local_server(port=0)
+    except Exception as exc_local:  # pragma: no cover - depende de librería externa
+        logger.debug(
+            "Fallo run_local_server para Google OAuth, se intenta modo consola",
+            exc_info=exc_local,
+        )
+        try:
+            credentials = flow.run_console()
+        except Exception as exc_console:  # pragma: no cover - depende de librería externa
+            warn(f"No se pudo completar la autenticación OAuth: {exc_console}")
+            press_enter()
+            return
     entry = _get_google_calendar_entry(alias)
     _google_calendar_update_tokens_from_credentials(alias, entry, credentials)
     entry = _get_google_calendar_entry(alias)
