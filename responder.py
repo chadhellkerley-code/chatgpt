@@ -777,9 +777,17 @@ def _google_calendar_summary_line() -> str:
         if isinstance(entry, dict) and entry.get("connected") and entry.get("enabled")
     ]
     if not enabled_aliases:
-        return "Aún no conectado con Google Calendar. Usá la opción 4 para conectar tu cuenta."
+        configured_aliases = [
+            entry
+            for entry in aliases.values()
+            if isinstance(entry, dict) and entry.get("connected")
+        ]
+        if configured_aliases:
+            labels = sorted(str(entry.get("alias") or "?") for entry in configured_aliases)
+            return f"Google Calendar: conectado para {', '.join(labels)} (inactivo)"
+        return "Google Calendar: (sin configurar)"
     labels = sorted(str(entry.get("alias") or "?") for entry in enabled_aliases)
-    return f"Google Calendar: {'; '.join(labels)}"
+    return f"Google Calendar: activo para {', '.join(labels)}"
 
 
 def _google_calendar_mark_scheduled(
@@ -1720,8 +1728,8 @@ def autoresponder_menu_options() -> List[str]:
         "1) Configurar API Key",
         "2) Configurar System Prompt",
         "3) Activar bot (alias/grupo)",
-        "4) Conectar con Google Calendar",
-        "5) Conectar con GoHighLevel",
+        "4) Conectar con GoHighLevel",
+        "5) Conectar con Google Calendar",
         "6) Desactivar bot",
         "7) Volver",
     ]
@@ -1745,8 +1753,8 @@ def _print_menu_header() -> None:
     print(f"API Key: {_mask_key(api_key) or '(sin definir)'}")
     print(f"System prompt: {_preview_prompt(prompt)}")
     print(status)
-    print(_google_calendar_summary_line())
     print(_gohighlevel_summary_line())
+    print(_google_calendar_summary_line())
     print(full_line(color=Fore.BLUE))
     for option in autoresponder_menu_options():
         print(option)
@@ -2418,9 +2426,9 @@ def menu_autoresponder():
         elif choice == "3":
             _activate_bot()
         elif choice == "4":
-            _google_calendar_menu()
-        elif choice == "5":
             _gohighlevel_menu()
+        elif choice == "5":
+            _google_calendar_menu()
         elif choice == "6":
             _manual_stop()
         elif choice == "7":
