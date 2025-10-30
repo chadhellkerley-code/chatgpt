@@ -2784,19 +2784,22 @@ def _maybe_schedule_google_calendar_event(
     event_id = event.get("id") if isinstance(event, dict) else None
     if not event_id:
         return None
-    link = ""
+    event_link = ""
+    backup_link = ""
     if isinstance(event, dict):
-        link = event.get("htmlLink") or event.get("hangoutLink") or ""
-        if not link:
+        event_link = str(event.get("htmlLink") or "")
+        backup_link = str(event.get("hangoutLink") or "")
+        if not backup_link:
             conference_data = event.get("conferenceData") if isinstance(event.get("conferenceData"), dict) else {}
             if isinstance(conference_data, dict):
                 entry_points = conference_data.get("entryPoints")
                 if isinstance(entry_points, list):
                     for item in entry_points:
                         if isinstance(item, dict) and item.get("uri"):
-                            link = str(item["uri"])
+                            backup_link = str(item["uri"])
                             break
-    _google_calendar_mark_scheduled(alias, normalized_lead, main_phone, event_id, link)
+    stored_link = event_link or backup_link
+    _google_calendar_mark_scheduled(alias, normalized_lead, main_phone, event_id, stored_link)
     logger.info(
         "Evento programado en Google Calendar | alias=%s | cuenta=%s | lead=%s | inicio=%s",
         alias,
@@ -2806,10 +2809,15 @@ def _maybe_schedule_google_calendar_event(
     )
     formatted_dt = start_dt.strftime("%d/%m/%Y %H:%M")
     message_lines = [
-        f"Listo, agendé nuestra llamada para {formatted_dt} ({tz_label}).",
+        f"Listo, ya agendé nuestra llamada para {formatted_dt} ({tz_label}).",
     ]
-    if link:
-        message_lines.append(f"Podés ver los detalles acá: {link}")
+    if event_link:
+        message_lines.append(
+            "Te paso el link del evento para que lo tengas a mano y puedas "
+            f"sumarlo a tu calendario: {event_link}"
+        )
+    elif stored_link:
+        message_lines.append(f"Te compartí los detalles en nuestro calendario: {stored_link}")
     else:
         message_lines.append("Te compartí los detalles en nuestro calendario.")
     return "\n".join(message_lines)
