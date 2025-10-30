@@ -41,6 +41,44 @@ BASE.mkdir(parents=True, exist_ok=True)
 DATA = BASE / "data"
 DATA.mkdir(exist_ok=True)
 FILE = DATA / "accounts.json"
+_PASSWORD_FILE = DATA / "passwords.json"
+
+
+def _password_key(username: str | None) -> str:
+    if not username:
+        return ""
+    return username.strip().lstrip("@").lower()
+
+
+def _load_password_cache() -> Dict[str, str]:
+    if not _PASSWORD_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(_PASSWORD_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    cache: Dict[str, str] = {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                continue
+            normalized = key.strip().lower()
+            if not normalized or not value:
+                continue
+            cache[normalized] = value
+    return cache
+
+
+def _save_password_cache(cache: Dict[str, str]) -> None:
+    try:
+        _PASSWORD_FILE.write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+_PASSWORD_CACHE: Dict[str, str] = _load_password_cache()
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +163,11 @@ def _normalize_account(record: Dict) -> Dict:
     result["proxy_sticky_minutes"] = max(1, sticky_value)
     username = result.get("username")
     if username:
+        key = _password_key(username)
+        if not result.get("password") and key:
+            cached = _PASSWORD_CACHE.get(key)
+            if cached:
+                result["password"] = cached
         result["has_totp"] = has_totp_secret(username)
     else:
         result.setdefault("has_totp", False)
@@ -303,6 +346,10 @@ def remove_account(username: str) -> None:
     remove_totp_secret(username)
     clear_proxy(username)
     _invalidate_health(username)
+    key = _password_key(username)
+    if key and key in _PASSWORD_CACHE:
+        _PASSWORD_CACHE.pop(key, None)
+        _save_password_cache(_PASSWORD_CACHE)
     ok("Eliminada (si existía).")
 
 
@@ -684,13 +731,27 @@ def _export_path(alias: str) -> Path:
 
 def _account_password(account: Dict) -> str:
     value = account.get("password")
-    return value if isinstance(value, str) else ""
+    if isinstance(value, str) and value:
+        return value
+    key = _password_key(account.get("username"))
+    if key:
+        cached = _PASSWORD_CACHE.get(key)
+        if cached:
+            return cached
+    return ""
 
 
 def _store_account_password(username: str, password: str) -> None:
     if not password:
         return
     update_account(username, {"password": password})
+    key = _password_key(username)
+    if not key:
+        return
+    if _PASSWORD_CACHE.get(key) == password:
+        return
+    _PASSWORD_CACHE[key] = password
+    _save_password_cache(_PASSWORD_CACHE)
 
 
 def _export_accounts_csv(alias: str) -> None:
