@@ -2809,17 +2809,18 @@ def _maybe_schedule_google_calendar_event(
     )
     formatted_dt = start_dt.strftime("%d/%m/%Y %H:%M")
     message_lines = [
-        f"Listo, ya agendé nuestra llamada para {formatted_dt} ({tz_label}).",
+        f"Listo, acabo de agendar nuestra llamada para {formatted_dt} ({tz_label}).",
     ]
     if event_link:
         message_lines.append(
-            "Te paso el link del evento para que lo tengas a mano y puedas "
-            f"sumarlo a tu calendario: {event_link}"
+            f"Te paso el link del evento para que confirmes la asistencia: {event_link}"
         )
     elif stored_link:
-        message_lines.append(f"Te compartí los detalles en nuestro calendario: {stored_link}")
+        message_lines.append(
+            f"Te compartí los detalles de la reunión en nuestro calendario: {stored_link}"
+        )
     else:
-        message_lines.append("Te compartí los detalles en nuestro calendario.")
+        message_lines.append("Te compartí los detalles de la reunión en nuestro calendario.")
     return "\n".join(message_lines)
 
 
