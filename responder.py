@@ -522,7 +522,7 @@ def _filter_valid_sessions(targets: list[str]) -> list[str]:
             print(f" - @{user}: {reason}")
         if ask("¿Iniciar sesión ahora? (s/N): ").strip().lower() == "s":
             for user, _ in needing_login:
-                if prompt_login(user) and _ensure_session(user):
+                if prompt_login(user, interactive=False) and _ensure_session(user):
                     if user not in verified:
                         verified.append(user)
         else:
@@ -2341,7 +2341,7 @@ def _handle_account_issue(user: str, exc: Exception, active: List[str]) -> None:
         return
 
     while choice == "r":
-        if prompt_login(user) and _ensure_session(user):
+        if prompt_login(user, interactive=False) and _ensure_session(user):
             mark_connected(user, True)
             ok(f"Sesión renovada para @{user}")
             return

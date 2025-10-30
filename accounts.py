@@ -499,37 +499,60 @@ def _login_and_save_session(account: Dict, password: str) -> bool:
         return False
 
 
-def prompt_login(username: str) -> bool:
+def prompt_login(username: str, *, interactive: bool = True) -> bool:
     account = get_account(username)
     if not account:
         warn("No existe la cuenta indicada.")
         return False
     stored_password = _account_password(account).strip()
-    password = ""
+    original_stored = stored_password
+    attempted_auto = False
 
     if stored_password:
-        changed = (
-            ask("¿Cambiaste la contraseña de esta cuenta? (s/N): ")
-            .strip()
-            .lower()
-        )
-        if changed == "s":
+        attempted_auto = True
+        if _login_and_save_session(account, stored_password):
+            return True
+
+    while True:
+        if attempted_auto and stored_password:
+            changed = (
+                ask("¿Cambiaste la contraseña de esta cuenta? (s/N): ")
+                .strip()
+                .lower()
+            )
+            if changed != "s":
+                warn(
+                    "Instagram rechazó la sesión guardada. Posiblemente haya un challenge o chequeo de seguridad pendiente."
+                )
+                return False
             password = getpass.getpass(
                 f"Nueva password @{account['username']}: "
             )
         else:
-            password = stored_password
-    else:
-        password = getpass.getpass(f"Password @{account['username']}: ")
+            password = getpass.getpass(
+                f"Password @{account['username']}: "
+            )
 
-    if not password:
-        warn("Se canceló el inicio de sesión.")
+        if not password:
+            warn("Se canceló el inicio de sesión.")
+            return False
+
+        success = _login_and_save_session(account, password)
+        if success:
+            if password != original_stored:
+                _store_account_password(username, password)
+            return True
+
+        attempted_auto = False
+        stored_password = ""
+        if interactive and (
+            ask("¿Intentar ingresar nuevamente? (s/N): ")
+            .strip()
+            .lower()
+            == "s"
+        ):
+            continue
         return False
-
-    success = _login_and_save_session(account, password)
-    if success and password != stored_password:
-        _store_account_password(username, password)
-    return success
 
 
 def _proxy_indicator(account: Dict) -> str:
@@ -1860,7 +1883,7 @@ def menu_accounts():
                 "se solicitará solo si es necesario."
             )
             for it in [x for x in _load() if x.get("alias") == alias]:
-                prompt_login(it["username"])
+                prompt_login(it["username"], interactive=False)
             press_enter()
         elif op == "6":
             group = [x for x in _load() if x.get("alias") == alias]
@@ -1900,7 +1923,7 @@ def menu_accounts():
                 press_enter()
                 continue
             for acct in targets:
-                prompt_login(acct["username"])
+                prompt_login(acct["username"], interactive=False)
             press_enter()
         elif op == "7":
             _launch_hashtag_mode(alias)
