@@ -113,6 +113,7 @@ def _normalize_account(record: Dict) -> Dict:
     result.setdefault("alias", "default")
     result.setdefault("active", True)
     result.setdefault("connected", False)
+    result.setdefault("password", "")
     result.setdefault("proxy_url", "")
     result.setdefault("proxy_user", "")
     result.setdefault("proxy_pass", "")
@@ -503,11 +504,32 @@ def prompt_login(username: str) -> bool:
     if not account:
         warn("No existe la cuenta indicada.")
         return False
-    pwd = getpass.getpass(f"Password @{account['username']}: ")
-    if not pwd:
+    stored_password = _account_password(account).strip()
+    password = ""
+
+    if stored_password:
+        changed = (
+            ask("¿Cambiaste la contraseña de esta cuenta? (s/N): ")
+            .strip()
+            .lower()
+        )
+        if changed == "s":
+            password = getpass.getpass(
+                f"Nueva password @{account['username']}: "
+            )
+        else:
+            password = stored_password
+    else:
+        password = getpass.getpass(f"Password @{account['username']}: ")
+
+    if not password:
         warn("Se canceló el inicio de sesión.")
         return False
-    return _login_and_save_session(account, pwd)
+
+    success = _login_and_save_session(account, password)
+    if success and password != stored_password:
+        _store_account_password(username, password)
+    return success
 
 
 def _proxy_indicator(account: Dict) -> str:
@@ -624,6 +646,12 @@ def _export_path(alias: str) -> Path:
 def _account_password(account: Dict) -> str:
     value = account.get("password")
     return value if isinstance(value, str) else ""
+
+
+def _store_account_password(username: str, password: str) -> None:
+    if not password:
+        return
+    update_account(username, {"password": password})
 
 
 def _export_accounts_csv(alias: str) -> None:
@@ -864,6 +892,8 @@ def _import_accounts_from_csv(alias: str) -> None:
                 continue
 
         successes += 1
+
+        _store_account_password(username, password)
 
         account = get_account(username)
         if account and not _login_and_save_session(account, password):
@@ -1825,7 +1855,10 @@ def menu_accounts():
             else:
                 continue
         elif op == "5":
-            print("Se pedirá contraseña por cada cuenta...")
+            print(
+                "Se reutilizará la contraseña guardada cuando esté disponible; "
+                "se solicitará solo si es necesario."
+            )
             for it in [x for x in _load() if x.get("alias") == alias]:
                 prompt_login(it["username"])
             press_enter()
