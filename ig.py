@@ -304,7 +304,7 @@ def _build_accounts_for_alias(alias: str) -> list[Dict]:
             print(f" - @{account['username']}: {reason}")
         if ask("¿Iniciar sesión ahora? (s/N): ").strip().lower() == "s":
             for account, _ in needing_login:
-                if prompt_login(account["username"]) and _ensure_session(account["username"]):
+                if prompt_login(account["username"], interactive=False) and _ensure_session(account["username"]):
                     if account not in verified:
                         verified.append(account)
         else:
