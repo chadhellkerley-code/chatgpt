@@ -499,6 +499,22 @@ def _login_and_save_session(account: Dict, password: str) -> bool:
         return False
 
 
+def auto_login_with_saved_password(
+    username: str, *, account: Optional[Dict] = None
+) -> bool:
+    """Intenta iniciar sesión reutilizando la contraseña almacenada."""
+
+    account = account or get_account(username)
+    if not account:
+        return False
+
+    stored_password = _account_password(account).strip()
+    if not stored_password:
+        return False
+
+    return _login_and_save_session(account, stored_password)
+
+
 def prompt_login(username: str, *, interactive: bool = True) -> bool:
     account = get_account(username)
     if not account:
@@ -510,7 +526,7 @@ def prompt_login(username: str, *, interactive: bool = True) -> bool:
 
     if stored_password:
         attempted_auto = True
-        if _login_and_save_session(account, stored_password):
+        if auto_login_with_saved_password(username, account=account):
             return True
 
     while True:

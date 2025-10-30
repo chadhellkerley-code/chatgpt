@@ -13,7 +13,13 @@ from datetime import datetime, timedelta, time as dt_time
 from typing import Callable, Dict, Optional
 from zoneinfo import ZoneInfo
 
-from accounts import get_account, list_all, mark_connected, prompt_login
+from accounts import (
+    auto_login_with_saved_password,
+    get_account,
+    list_all,
+    mark_connected,
+    prompt_login,
+)
 from config import SETTINGS
 from leads import load_list
 from proxy_manager import apply_proxy_to_client, record_proxy_failure, should_retry_proxy
@@ -299,16 +305,29 @@ def _build_accounts_for_alias(alias: str) -> list[Dict]:
         verified.append(account)
 
     if needing_login:
-        print("\nLas siguientes cuentas necesitan volver a iniciar sesión:")
+        remaining: list[tuple[Dict, str]] = []
         for account, reason in needing_login:
-            print(f" - @{account['username']}: {reason}")
-        if ask("¿Iniciar sesión ahora? (s/N): ").strip().lower() == "s":
-            for account, _ in needing_login:
-                if prompt_login(account["username"], interactive=False) and _ensure_session(account["username"]):
-                    if account not in verified:
-                        verified.append(account)
-        else:
-            warn("Se omitieron las cuentas sin sesión válida.")
+            username = account["username"]
+            if auto_login_with_saved_password(username, account=account) and _ensure_session(username):
+                refreshed = get_account(username) or account
+                if refreshed not in verified:
+                    verified.append(refreshed)
+            else:
+                remaining.append((account, reason))
+
+        if remaining:
+            print("\nLas siguientes cuentas necesitan volver a iniciar sesión:")
+            for account, reason in remaining:
+                print(f" - @{account['username']}: {reason}")
+            if ask("¿Iniciar sesión ahora? (s/N): ").strip().lower() == "s":
+                for account, _ in remaining:
+                    username = account["username"]
+                    if prompt_login(username, interactive=False) and _ensure_session(username):
+                        refreshed = get_account(username) or account
+                        if refreshed not in verified:
+                            verified.append(refreshed)
+            else:
+                warn("Se omitieron las cuentas sin sesión válida.")
 
     if not verified:
         warn("No hay cuentas con sesión válida para enviar mensajes.")

@@ -13,7 +13,13 @@ from datetime import datetime, timedelta, time as dt_time, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from accounts import get_account, list_all, mark_connected, prompt_login
+from accounts import (
+    auto_login_with_saved_password,
+    get_account,
+    list_all,
+    mark_connected,
+    prompt_login,
+)
 from config import (
     SETTINGS,
     read_app_config,
@@ -517,16 +523,25 @@ def _filter_valid_sessions(targets: list[str]) -> list[str]:
         verified.append(user)
 
     if needing_login:
-        print("\nLas siguientes cuentas necesitan volver a iniciar sesión:")
+        remaining: list[tuple[str, str]] = []
         for user, reason in needing_login:
-            print(f" - @{user}: {reason}")
-        if ask("¿Iniciar sesión ahora? (s/N): ").strip().lower() == "s":
-            for user, _ in needing_login:
-                if prompt_login(user, interactive=False) and _ensure_session(user):
-                    if user not in verified:
-                        verified.append(user)
-        else:
-            warn("Se omitieron las cuentas sin sesión válida.")
+            if auto_login_with_saved_password(user) and _ensure_session(user):
+                if user not in verified:
+                    verified.append(user)
+            else:
+                remaining.append((user, reason))
+
+        if remaining:
+            print("\nLas siguientes cuentas necesitan volver a iniciar sesión:")
+            for user, reason in remaining:
+                print(f" - @{user}: {reason}")
+            if ask("¿Iniciar sesión ahora? (s/N): ").strip().lower() == "s":
+                for user, _ in remaining:
+                    if prompt_login(user, interactive=False) and _ensure_session(user):
+                        if user not in verified:
+                            verified.append(user)
+            else:
+                warn("Se omitieron las cuentas sin sesión válida.")
     return verified
 
 
