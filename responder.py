@@ -2696,8 +2696,6 @@ def _maybe_schedule_google_calendar_event(
 ) -> Optional[str]:
     if ACTIVE_ALIAS is None:
         return None
-    if not phone_numbers:
-        return None
     if status and status.strip().lower() == "no interesado":
         return None
     alias, entry = _google_calendar_enabled_entry_for(account)
@@ -2724,10 +2722,8 @@ def _maybe_schedule_google_calendar_event(
         openai_api_key,
     ):
         return None
-    main_phone = _normalize_phone(phone_numbers[0])
-    if not main_phone:
-        return None
-    normalized_lead = recipient or main_phone
+    main_phone = _normalize_phone(phone_numbers[0]) if phone_numbers else ""
+    normalized_lead = recipient or main_phone or f"{account}-lead"
     if _google_calendar_already_scheduled(alias, normalized_lead, main_phone):
         return None
     access_token = _google_calendar_ensure_token(alias, entry)
@@ -2750,7 +2746,10 @@ def _maybe_schedule_google_calendar_event(
     ]
     if recipient:
         description_lines.append(f"Usuario IG: @{recipient}")
-    description_lines.append(f"Teléfono: {main_phone}")
+    if main_phone:
+        description_lines.append(f"Teléfono: {main_phone}")
+    else:
+        description_lines.append("Teléfono: (sin proporcionar)")
     if email:
         description_lines.append(f"Email: {email}")
     if status:
@@ -2859,15 +2858,16 @@ def _process_inbox(
         if not phone_numbers:
             phone_numbers = _extract_phone_numbers(convo)
         calendar_message: Optional[str] = None
-        if phone_numbers and status != "No interesado":
-            _send_lead_to_gohighlevel(
-                user,
-                recipient_username,
-                convo,
-                phone_numbers,
-                status,
-                api_key,
-            )
+        if status != "No interesado":
+            if phone_numbers:
+                _send_lead_to_gohighlevel(
+                    user,
+                    recipient_username,
+                    convo,
+                    phone_numbers,
+                    status,
+                    api_key,
+                )
             calendar_message = _maybe_schedule_google_calendar_event(
                 user,
                 recipient_username,
