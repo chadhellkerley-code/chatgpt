@@ -2705,12 +2705,15 @@ def _maybe_schedule_google_calendar_event(
         return None
     if requests is None and (Credentials is None or build is None):
         return None
-    normalized_convo = _normalize_text_for_match(conversation)
-    if not any(keyword in normalized_convo for keyword in _CALL_KEYWORDS):
-        return None
     tz_label = str(entry.get("timezone") or _default_timezone_label())
     meeting_dt = _detect_meeting_datetime(conversation, tz_label)
     if not meeting_dt:
+        return None
+    normalized_convo = _normalize_text_for_match(conversation)
+    prompt_text = str(entry.get("schedule_prompt") or "").strip()
+    if not prompt_text and not any(
+        keyword in normalized_convo for keyword in _CALL_KEYWORDS
+    ):
         return None
     if not _google_calendar_lead_qualifies(
         entry,
