@@ -1,6 +1,8 @@
 import json
 import logging
 import re
+import subprocess
+import sys
 import time
 import unicodedata
 import uuid
@@ -57,6 +59,11 @@ except Exception:  # pragma: no cover - si faltan dependencias opcionales
     build = None  # type: ignore
     GoogleAuthRequest = None  # type: ignore
 
+try:  # pragma: no cover - depende de dependencias opcionales
+    from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore
+except Exception:  # pragma: no cover - si falta dependencia opcional
+    InstalledAppFlow = None  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_PROMPT = "Respondé cordial, breve y como humano."
@@ -79,6 +86,13 @@ _GOHIGHLEVEL_BASE = "https://rest.gohighlevel.com/v1"
 _PHONE_PATTERN = re.compile(r"(?<!\d)(?:\+?\d[\d\s().-]{7,}\d)")
 _EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
 _GOHIGHLEVEL_STATE: Dict[str, dict] | None = None
+_DEFAULT_GOHIGHLEVEL_PROMPT = (
+    "Sos un asistente que evalúa conversaciones de Instagram y determina si un lead está "
+    "calificado para enviarse automáticamente al CRM GoHighLevel. Respondé únicamente "
+    "con 'SI' cuando corresponda enviarlo y 'NO' cuando no cumpla con los criterios. "
+    "Considerá el contexto, el interés real del lead y si el equipo comercial debería "
+    "contactarlo."
+)
 
 _PROMPT_STORAGE_DIR = runtime_base(Path(__file__).resolve().parent) / "data" / "autoresponder"
 _PROMPT_DEFAULT_ALIAS = "default"
@@ -141,7 +155,9 @@ _GOOGLE_DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code"
 _GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 _GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 _GOOGLE_CALENDAR_BASE = "https://www.googleapis.com/calendar/v3"
-_GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+_GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar"
+_DEFAULT_GOOGLE_CALENDAR_PROMPT = ""
+_GOOGLE_REDIRECT_URI = "http://localhost"
 _GOOGLE_STATE: Dict[str, dict] | None = None
 _MEETING_TIME_PATTERN = re.compile(
     r"(?P<hour>\b[01]?\d|2[0-3])(?:(?:[:h\.])(?P<minute>[0-5]\d))?\s*(?P<ampm>am|pm)?\s*(?P<label>hs|hrs|horas)?",
@@ -184,7 +200,7 @@ _GOOGLE_DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code"
 _GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 _GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 _GOOGLE_CALENDAR_BASE = "https://www.googleapis.com/calendar/v3"
-_GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+_GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar"
 _GOOGLE_STATE: Dict[str, dict] | None = None
 _MEETING_TIME_PATTERN = re.compile(
     r"(?P<hour>\b[01]?\d|2[0-3])(?:(?:[:h\.])(?P<minute>[0-5]\d))?\s*(?P<ampm>am|pm)?\s*(?P<label>hs|hrs|horas)?",
@@ -674,6 +690,7 @@ def _get_gohighlevel_entry(alias: str) -> Dict[str, dict]:
     if isinstance(entry, dict):
         entry.setdefault("alias", alias.strip())
         entry.setdefault("sent", {})
+        entry.setdefault("qualify_prompt", _DEFAULT_GOHIGHLEVEL_PROMPT)
         if "location_ids" in entry:
             entry["location_ids"] = _sanitize_location_ids(entry.get("location_ids"))
         return entry
@@ -716,6 +733,7 @@ def _get_google_calendar_entry(alias: str) -> Dict[str, object]:
         entry.setdefault("duration_minutes", 30)
         entry.setdefault("timezone", _default_timezone_label())
         entry.setdefault("auto_meet", True)
+        entry.setdefault("schedule_prompt", _DEFAULT_GOOGLE_CALENDAR_PROMPT)
         return entry
     return {}
 
@@ -735,6 +753,7 @@ def _set_google_calendar_entry(alias: str, updates: Dict[str, object]) -> None:
     entry.setdefault("duration_minutes", 30)
     entry.setdefault("timezone", _default_timezone_label())
     entry.setdefault("auto_meet", True)
+    entry.setdefault("schedule_prompt", _DEFAULT_GOOGLE_CALENDAR_PROMPT)
     normalized_updates: Dict[str, object] = {}
     for key_name, value in updates.items():
         if value is None:
@@ -752,6 +771,8 @@ def _set_google_calendar_entry(alias: str, updates: Dict[str, object]) -> None:
             except Exception:
                 warn("Zona horaria inválida; se mantiene el valor previo.")
                 continue
+        elif key_name == "schedule_prompt":
+            normalized_updates[key_name] = str(value)
         else:
             normalized_updates[key_name] = value
     entry.update(normalized_updates)
@@ -1114,6 +1135,74 @@ def _google_calendar_enabled_entry_for(username: str) -> tuple[Optional[str], Di
     return None, {}
 
 
+def _google_calendar_lead_qualifies(
+    entry: Dict[str, object],
+    conversation: str,
+    status: Optional[str],
+    phone_numbers: List[str],
+    meeting_dt: datetime,
+    api_key: Optional[str],
+) -> bool:
+    prompt_text = str(entry.get("schedule_prompt") or "").strip()
+    if not prompt_text:
+        return True
+    if not api_key:
+        return True
+    try:  # pragma: no cover - depende de dependencia externa
+        from openai import OpenAI
+    except Exception as exc:  # pragma: no cover - entorno sin openai
+        logger.warning(
+            "No se pudo importar OpenAI para evaluar Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return True
+    try:  # pragma: no cover - depende de credenciales externas
+        client = OpenAI(api_key=api_key)
+    except Exception as exc:
+        logger.warning(
+            "No se pudo inicializar OpenAI para evaluar Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return True
+
+    system_prompt = (
+        prompt_text
+        + "\n\nResponde únicamente con 'SI' o 'NO' indicando si se debe crear un evento en Google Calendar."
+    )
+    context_lines = [
+        f"Estado detectado: {status or 'desconocido'}",
+        "Teléfonos detectados: "
+        + (", ".join(phone_numbers) if phone_numbers else "(sin teléfono)"),
+        f"Fecha/hora detectada: {meeting_dt.isoformat()}",
+        "Conversación completa:",
+        conversation,
+    ]
+    user_content = "\n".join(context_lines)
+    try:  # pragma: no cover - depende de red externa
+        response = client.responses.create(
+            model="gpt-4o-mini",
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0,
+            max_output_tokens=20,
+        )
+        decision = (response.output_text or "").strip().lower()
+    except Exception as exc:  # pragma: no cover - depende de red externa
+        logger.warning(
+            "No se pudo evaluar el criterio de Google Calendar con OpenAI: %s",
+            exc,
+            exc_info=False,
+        )
+        return True
+
+    normalized = _normalize_text_for_match(decision)
+    return normalized.startswith("s")
+
+
 def _mask_gohighlevel_status(entry: Dict[str, object]) -> str:
     api_key = str(entry.get("api_key") or "")
     enabled = bool(entry.get("enabled"))
@@ -1198,6 +1287,70 @@ def _gohighlevel_enabled_entry_for(username: str) -> tuple[Optional[str], Dict[s
     return None, {}
 
 
+def _gohighlevel_lead_qualifies(
+    entry: Dict[str, object],
+    conversation: str,
+    status: Optional[str],
+    phone_numbers: List[str],
+    api_key: Optional[str],
+) -> bool:
+    prompt_text = str(entry.get("qualify_prompt") or "").strip()
+    if not prompt_text:
+        return True
+    if not api_key:
+        return True
+    try:  # pragma: no cover - depende de dependencia externa
+        from openai import OpenAI
+    except Exception as exc:  # pragma: no cover - entorno sin openai
+        logger.warning(
+            "No se pudo importar OpenAI para evaluar GoHighLevel: %s", exc, exc_info=False
+        )
+        return True
+    try:  # pragma: no cover - depende de credenciales externas
+        client = OpenAI(api_key=api_key)
+    except Exception as exc:
+        logger.warning(
+            "No se pudo inicializar OpenAI para evaluar GoHighLevel: %s",
+            exc,
+            exc_info=False,
+        )
+        return True
+
+    system_prompt = (
+        prompt_text
+        + "\n\nResponde únicamente con 'SI' o 'NO' indicando si se debe enviar el lead a GoHighLevel."
+    )
+    context_lines = [
+        f"Estado detectado: {status or 'desconocido'}",
+        "Teléfonos detectados: "
+        + (", ".join(phone_numbers) if phone_numbers else "(sin teléfono)"),
+        "Conversación completa:",
+        conversation,
+    ]
+    user_content = "\n".join(context_lines)
+    try:  # pragma: no cover - depende de red externa
+        response = client.responses.create(
+            model="gpt-4o-mini",
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0,
+            max_output_tokens=20,
+        )
+        decision = (response.output_text or "").strip().lower()
+    except Exception as exc:  # pragma: no cover - depende de red externa
+        logger.warning(
+            "No se pudo evaluar el criterio de GoHighLevel con OpenAI: %s",
+            exc,
+            exc_info=False,
+        )
+        return True
+
+    normalized = _normalize_text_for_match(decision)
+    return normalized.startswith("s")
+
+
 def _require_requests() -> bool:
     if requests is None:  # pragma: no cover - entorno sin dependencia
         warn("La librería 'requests' no está disponible. Instalála para usar GoHighLevel.")
@@ -1258,11 +1411,42 @@ def _gohighlevel_configure_locations() -> None:
     print()
     prompt = (
         "Ingresá uno o más Location IDs (separados por coma o espacio).\n"
-        "Escribí 'limpiar' para eliminar los existentes o dejá vacío para cancelar: "
+        "Escribí 'eliminar N' para borrar uno específico (usa el número de la lista),\n"
+        "'limpiar' para eliminar todos o dejá vacío para cancelar: "
     )
     raw = ask(prompt).strip()
     if not raw:
         warn("No se modificaron los Location IDs.")
+        press_enter()
+        return
+    if raw.lower().startswith("eliminar"):
+        if not current_ids:
+            warn("No hay Location IDs para eliminar.")
+            press_enter()
+            return
+        indexes = [token for token in re.split(r"[^0-9]+", raw) if token.isdigit()]
+        if not indexes:
+            warn("Indicá el número del Location ID a eliminar.")
+            press_enter()
+            return
+        to_remove: set[int] = set()
+        for token in indexes:
+            try:
+                idx = int(token)
+            except ValueError:
+                continue
+            if 1 <= idx <= len(current_ids):
+                to_remove.add(idx - 1)
+        if not to_remove:
+            warn("Los números indicados no coinciden con Location IDs existentes.")
+            press_enter()
+            return
+        remaining = [value for idx, value in enumerate(current_ids) if idx not in to_remove]
+        _set_gohighlevel_entry(alias, {"location_ids": remaining})
+        ok(
+            "Se eliminaron los Location IDs seleccionados. Total restante: "
+            f"{len(remaining)}"
+        )
         press_enter()
         return
     if raw.lower() in {"limpiar", "clear", "ninguno", "eliminar", "borrar"}:
@@ -1277,6 +1461,62 @@ def _gohighlevel_configure_locations() -> None:
         return
     _set_gohighlevel_entry(alias, {"location_ids": location_ids})
     ok(f"Location IDs guardados para {alias}. Total: {len(location_ids)}")
+    press_enter()
+
+
+def _gohighlevel_configure_prompt() -> None:
+    banner()
+    print(style_text("GoHighLevel • Criterios de envío", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.BLUE))
+    for line in _gohighlevel_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _gohighlevel_select_alias()
+    if not alias:
+        return
+    entry = _get_gohighlevel_entry(alias)
+    current_prompt = str(entry.get("qualify_prompt") or _DEFAULT_GOHIGHLEVEL_PROMPT)
+    print(style_text("Prompt actual:", color=Fore.BLUE))
+    print(current_prompt or "(sin definir)")
+    print(full_line(color=Fore.BLUE))
+    print("Elegí una opción:")
+    print("  E) Editar prompt")
+    print("  D) Restaurar prompt predeterminado")
+    print("  Enter) Cancelar")
+    action = ask("Acción: ").strip().lower()
+    if not action:
+        warn("No se modificó el prompt de calificación.")
+        press_enter()
+        return
+    if action in {"d", "default", "predeterminado"}:
+        _set_gohighlevel_entry(alias, {"qualify_prompt": _DEFAULT_GOHIGHLEVEL_PROMPT})
+        ok("Se restauró el prompt predeterminado para GoHighLevel.")
+        press_enter()
+        return
+    if action not in {"e", "editar"}:
+        warn("Opción inválida. No se modificó el prompt de calificación.")
+        press_enter()
+        return
+    print(
+        style_text(
+            "Pegá el nuevo prompt y finalizá con una línea que diga <<<END>>>."
+            " Dejá vacío para cancelar.",
+            color=Fore.CYAN,
+        )
+    )
+    lines: List[str] = []
+    while True:
+        line = ask("› ")
+        if line.strip() == "<<<END>>>":
+            break
+        lines.append(line.replace("\r", ""))
+    new_prompt = "\n".join(lines).strip()
+    if not new_prompt:
+        warn("No se modificó el prompt de calificación.")
+        press_enter()
+        return
+    _set_gohighlevel_entry(alias, {"qualify_prompt": new_prompt})
+    ok(f"Prompt actualizado. Longitud: {len(new_prompt)} caracteres.")
     press_enter()
 
 
@@ -1330,7 +1570,8 @@ def _gohighlevel_menu() -> None:
         print("2) Configurar Location IDs de GoHighLevel")
         print("3) Activar el envío automático de leads calificados al CRM de GoHighLevel")
         print("4) Desactivar conexión")
-        print("5) Volver al submenú anterior")
+        print("5) Configurar criterios de calificación")
+        print("6) Volver al submenú anterior")
         print(full_line(color=Fore.BLUE))
         choice = ask("Opción: ").strip()
         if choice == "1":
@@ -1342,6 +1583,8 @@ def _gohighlevel_menu() -> None:
         elif choice == "4":
             _gohighlevel_deactivate()
         elif choice == "5":
+            _gohighlevel_configure_prompt()
+        elif choice == "6":
             break
         else:
             warn("Opción inválida.")
@@ -1434,6 +1677,198 @@ def _google_calendar_perform_device_flow(
     return None
 
 
+def _google_calendar_validate_client_payload(
+    payload: Dict[str, object]
+) -> tuple[Optional[Dict[str, object]], Optional[str]]:
+    if not isinstance(payload, dict):
+        return None, "El archivo JSON no contiene una estructura válida."
+    installed = payload.get("installed")
+    if not isinstance(installed, dict):
+        return (
+            None,
+            "El archivo JSON debe corresponder a una 'Aplicación de escritorio' generada en Google Cloud Console.",
+        )
+    redirect_uris = installed.get("redirect_uris")
+    normalized_uris: set[str] = set()
+    if isinstance(redirect_uris, (list, tuple)):
+        normalized_uris = {
+            str(uri).strip().rstrip("/")
+            for uri in redirect_uris
+            if isinstance(uri, str) and uri.strip()
+        }
+    if _GOOGLE_REDIRECT_URI.rstrip("/") not in normalized_uris:
+        return (
+            None,
+            "El JSON debe incluir http://localhost como redirect URI autorizado en la consola de Google.",
+        )
+    client_id = installed.get("client_id")
+    if not client_id:
+        return None, "El archivo JSON no contiene un Client ID válido."
+    return installed, None
+
+
+def _google_calendar_extract_client_credentials(
+    payload: Dict[str, object]
+) -> tuple[Optional[str], Optional[str]]:
+    config, _ = _google_calendar_validate_client_payload(payload)
+    if not config:
+        return None, None
+    client_id = config.get("client_id")
+    client_secret = config.get("client_secret")
+    return (
+        (str(client_id) if client_id else None),
+        (str(client_secret) if client_secret else None),
+    )
+
+
+def _google_calendar_report_oauth_error(exc: Exception) -> None:
+    base_message = (
+        "Error de autenticación. Verificá que el JSON cargado sea válido, "
+        "que estés autorizado como tester y que el proyecto esté correctamente configurado."
+    )
+    details = str(exc).strip()
+    if details:
+        warn(f"{base_message} Detalle: {details}")
+    else:
+        warn(base_message)
+
+
+def _ensure_google_auth_oauthlib() -> bool:
+    global InstalledAppFlow
+    if InstalledAppFlow is not None:
+        return True
+    flow_cls = None
+    try:
+        from google_auth_oauthlib.flow import InstalledAppFlow as flow_cls  # type: ignore
+    except Exception:
+        warn("Esta opción requiere la librería google-auth-oauthlib.")
+        confirm = (
+            ask("¿Deseás que la instalemos automáticamente ahora? (s/n): ")
+            .strip()
+            .lower()
+        )
+        if confirm not in {"s", "si", "sí", "y", "yes"}:
+            warn("Instalación cancelada. Instalá google-auth-oauthlib para continuar.")
+            press_enter()
+            return False
+        python_bin = sys.executable or "python3"
+        print(
+            style_text(
+                "Instalando google-auth-oauthlib, por favor esperá...",
+                color=Fore.YELLOW,
+            )
+        )
+        try:
+            subprocess.check_call(
+                [python_bin, "-m", "pip", "install", "google-auth-oauthlib"]
+            )
+        except Exception as exc:
+            warn(f"No se pudo instalar google-auth-oauthlib automáticamente: {exc}")
+            press_enter()
+            return False
+        try:
+            from google_auth_oauthlib.flow import InstalledAppFlow as flow_cls  # type: ignore
+        except Exception as exc:
+            warn(f"La librería google-auth-oauthlib no pudo cargarse: {exc}")
+            press_enter()
+            return False
+        ok("La librería google-auth-oauthlib se instaló correctamente.")
+    if flow_cls is None:
+        warn("No se pudo cargar la librería google-auth-oauthlib.")
+        press_enter()
+        return False
+    InstalledAppFlow = flow_cls
+    return True
+
+
+def _google_calendar_load_credentials_json() -> None:
+    if not _ensure_google_auth_oauthlib():
+        return
+    banner()
+    print(
+        style_text(
+            "Google Calendar • Cargar credenciales JSON",
+            color=Fore.CYAN,
+            bold=True,
+        )
+    )
+    print(full_line(color=Fore.BLUE))
+    for line in _google_calendar_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _google_calendar_select_alias()
+    if not alias:
+        return
+    path_input = ask(
+        "Ruta del archivo JSON de Google (vacío para cancelar): "
+    ).strip()
+    if not path_input:
+        warn("No se cargó ningún archivo de credenciales.")
+        press_enter()
+        return
+    file_path = Path(path_input).expanduser()
+    if not file_path.exists():
+        warn("El archivo especificado no existe.")
+        press_enter()
+        return
+    try:
+        json_payload = json.loads(file_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        warn(f"No se pudo leer el archivo JSON: {exc}")
+        press_enter()
+        return
+    config, error = _google_calendar_validate_client_payload(json_payload)
+    if error:
+        warn(error)
+        press_enter()
+        return
+    client_id = str(config.get("client_id") or "")
+    client_secret_value = config.get("client_secret")
+    client_secret = str(client_secret_value) if client_secret_value else None
+    if not client_id:
+        warn("El archivo JSON no contiene un Client ID válido.")
+        press_enter()
+        return
+    _set_google_calendar_entry(
+        alias,
+        {"client_id": client_id, "client_secret": client_secret},
+    )
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file(
+            str(file_path), scopes=[_GOOGLE_SCOPE]
+        )
+        try:
+            flow.redirect_uri = _GOOGLE_REDIRECT_URI
+        except Exception:
+            # Algunos objetos Flow no exponen redirect_uri hasta ejecutar run_*.
+            pass
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        warn(f"No se pudo inicializar el flujo OAuth: {exc}")
+        press_enter()
+        return
+    try:
+        credentials = flow.run_local_server(port=0)
+    except Exception as exc_local:  # pragma: no cover - depende de librería externa
+        logger.debug(
+            "Fallo run_local_server para Google OAuth, se intenta modo consola",
+            exc_info=exc_local,
+        )
+        try:
+            credentials = flow.run_console()
+        except Exception as exc_console:  # pragma: no cover - depende de librería externa
+            _google_calendar_report_oauth_error(exc_console)
+            press_enter()
+            return
+    entry = _get_google_calendar_entry(alias)
+    _google_calendar_update_tokens_from_credentials(alias, entry, credentials)
+    entry = _get_google_calendar_entry(alias)
+    if entry.get("connected"):
+        ok(f"Google Calendar conectado para {alias}.")
+    else:
+        warn("No se pudo completar la conexión con Google Calendar.")
+    press_enter()
+
+
 def _google_calendar_connect() -> None:
     if not _require_requests():
         return
@@ -1523,6 +1958,72 @@ def _google_calendar_configure_event() -> None:
     press_enter()
 
 
+def _google_calendar_configure_prompt() -> None:
+    banner()
+    print(
+        style_text(
+            "Google Calendar • Criterio para creación de eventos",
+            color=Fore.CYAN,
+            bold=True,
+        )
+    )
+    print(full_line(color=Fore.BLUE))
+    for line in _google_calendar_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _google_calendar_select_alias()
+    if not alias:
+        return
+    entry = _get_google_calendar_entry(alias)
+    current_prompt = str(entry.get("schedule_prompt") or _DEFAULT_GOOGLE_CALENDAR_PROMPT)
+    print(style_text("Prompt actual:", color=Fore.BLUE))
+    print(current_prompt.strip() or "(sin definir)")
+    print(full_line(color=Fore.BLUE))
+    print("Elegí una opción:")
+    print("  E) Editar prompt")
+    print("  D) Restaurar valor predeterminado")
+    print("  Enter) Cancelar")
+    action = ask("Acción: ").strip().lower()
+    if not action:
+        warn("No se modificó el criterio de calendario.")
+        press_enter()
+        return
+    if action in {"d", "default", "predeterminado"}:
+        _set_google_calendar_entry(
+            alias,
+            {"schedule_prompt": _DEFAULT_GOOGLE_CALENDAR_PROMPT},
+        )
+        ok("Se restauró el criterio predeterminado de Google Calendar.")
+        press_enter()
+        return
+    if action not in {"e", "editar"}:
+        warn("Opción inválida. No se modificó el criterio de calendario.")
+        press_enter()
+        return
+    print(
+        style_text(
+            (
+                "Pegá el nuevo criterio y finalizá con una línea que diga <<<END>>>."
+                " Dejá vacío para cancelar."
+            ),
+            color=Fore.CYAN,
+        )
+    )
+    lines: List[str] = []
+    while True:
+        line = ask("› ")
+        if line.strip() == "<<<END>>>":
+            break
+        lines.append(line.replace("\r", ""))
+    new_prompt = "\n".join(lines).strip()
+    _set_google_calendar_entry(alias, {"schedule_prompt": new_prompt})
+    if new_prompt:
+        ok(f"Criterio actualizado. Longitud: {len(new_prompt)} caracteres.")
+    else:
+        ok("Se eliminó el criterio personalizado. Se usará la lógica automática predeterminada.")
+    press_enter()
+
+
 def _google_calendar_activate() -> None:
     banner()
     print(style_text("Google Calendar • Activar creación automática", color=Fore.CYAN, bold=True))
@@ -1600,10 +2101,12 @@ def _google_calendar_menu() -> None:
         print(full_line(color=Fore.BLUE))
         print("1) Conectar cuenta mediante OAuth")
         print("2) Configurar parámetros del evento")
-        print("3) Activar creación automática de eventos")
-        print("4) Desactivar creación automática de eventos")
-        print("5) Revocar conexión")
-        print("6) Volver al submenú anterior")
+        print("3) Configurar criterio para creación de evento")
+        print("4) Activar creación automática de eventos")
+        print("5) Desactivar creación automática de eventos")
+        print("6) Revocar conexión")
+        print("7) Cargar credenciales JSON (Google OAuth 2.0)")
+        print("8) Volver al submenú anterior")
         print(full_line(color=Fore.BLUE))
         choice = ask("Opción: ").strip()
         if choice == "1":
@@ -1611,12 +2114,16 @@ def _google_calendar_menu() -> None:
         elif choice == "2":
             _google_calendar_configure_event()
         elif choice == "3":
-            _google_calendar_activate()
+            _google_calendar_configure_prompt()
         elif choice == "4":
-            _google_calendar_deactivate()
+            _google_calendar_activate()
         elif choice == "5":
-            _google_calendar_revoke()
+            _google_calendar_deactivate()
         elif choice == "6":
+            _google_calendar_revoke()
+        elif choice == "7":
+            _google_calendar_load_credentials_json()
+        elif choice == "8":
             break
         else:
             warn("Opción inválida.")
@@ -1907,10 +2414,14 @@ def _infer_lead_tag(
     return _DEFAULT_LEAD_TAG
 
 
-def _build_conversation_note(account: str, recipient: str, conversation: str) -> str:
+def _build_conversation_note(
+    account: str, recipient: str, conversation: str, status: Optional[str] = None
+) -> str:
     header = [f"Cuenta IG: @{account}"]
     if recipient:
         header.append(f"Usuario: @{recipient}")
+    if status:
+        header.append(f"Estado detectado: {status}")
     header.append("Historial completo:")
     return "\n".join(header + [conversation])
 
@@ -1986,7 +2497,44 @@ def _render_calendar_summary(template: str, username: str) -> str:
     return template.replace("{{username}}", username or "Lead")
 
 
-def _create_gohighlevel_contact(api_key: str, payload: Dict[str, object]) -> Optional[str]:
+def _parse_gohighlevel_contact_id(data: Dict[str, object]) -> Optional[str]:
+    if not isinstance(data, dict):
+        return None
+    contact = data.get("contact") if isinstance(data.get("contact"), dict) else None
+    if isinstance(contact, dict):
+        for key in ("id", "Id", "contactId"):
+            if contact.get(key):
+                return str(contact[key])
+    for key in ("contactId", "id", "Id"):
+        value = data.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _update_gohighlevel_contact(
+    api_key: str, contact_id: str, payload: Dict[str, object]
+) -> Optional[str]:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    url = f"{_GOHIGHLEVEL_BASE}/contacts/{contact_id}"
+    response = requests.put(url, json=payload, headers=headers, timeout=15)  # type: ignore[call-arg]
+    response.raise_for_status()
+    data: Dict[str, object] = {}
+    if response.content:
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+    return _parse_gohighlevel_contact_id(data) or contact_id
+
+
+def _create_gohighlevel_contact(
+    api_key: str, payload: Dict[str, object]
+) -> tuple[Optional[str], bool]:
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -2000,26 +2548,20 @@ def _create_gohighlevel_contact(api_key: str, payload: Dict[str, object]) -> Opt
             data = response.json()
         except ValueError:
             data = {}
-        contact = data.get("contact") if isinstance(data.get("contact"), dict) else None
-        contact_id = data.get("contactId") or (contact.get("id") if contact else None)
+        contact_id = _parse_gohighlevel_contact_id(data)
         if contact_id:
-            return str(contact_id)
+            updated_id = _update_gohighlevel_contact(api_key, str(contact_id), payload)
+            return updated_id, False
     response.raise_for_status()
     if response.content:
         try:
             data = response.json()
         except ValueError:
             data = {}
-    contact_data = data.get("contact") if isinstance(data.get("contact"), dict) else {}
-    if isinstance(contact_data, dict):
-        for key in ("id", "Id", "contactId"):
-            if contact_data.get(key):
-                return str(contact_data[key])
-    for key in ("contactId", "id", "Id"):
-        value = data.get(key)
-        if value:
-            return str(value)
-    return None
+    contact_id = _parse_gohighlevel_contact_id(data)
+    if contact_id:
+        return contact_id, True
+    return None, True
 
 
 def _attach_gohighlevel_note(api_key: str, contact_id: str, note: str) -> None:
@@ -2040,6 +2582,7 @@ def _send_lead_to_gohighlevel(
     conversation: str,
     phone_numbers: List[str],
     status: Optional[str],
+    openai_api_key: Optional[str] = None,
 ) -> None:
     if requests is None:
         logger.warning("GoHighLevel no disponible: falta la librería requests.")
@@ -2066,6 +2609,15 @@ def _send_lead_to_gohighlevel(
     if _gohighlevel_already_sent(alias, normalized_lead, main_phone):
         return
 
+    if not _gohighlevel_lead_qualifies(
+        entry,
+        conversation,
+        status,
+        phone_numbers,
+        openai_api_key,
+    ):
+        return
+
     contact_payload: Dict[str, object] = {
         "name": recipient or "Lead Instagram",
         "phone": main_phone,
@@ -2073,25 +2625,35 @@ def _send_lead_to_gohighlevel(
     email = _extract_email_from_text(conversation)
     if email:
         contact_payload["email"] = email
-    note_text = _build_conversation_note(account, recipient, conversation)
+    note_text = _build_conversation_note(account, recipient, conversation, status)
     lead_tag = _infer_lead_tag(conversation, phone_numbers, status)
-    successes = 0
+    successes: List[str] = []
     for location_id in location_ids:
         payload = dict(contact_payload)
         payload["locationId"] = location_id
         if lead_tag:
             payload["tags"] = [lead_tag]
         try:
-            contact_id = _create_gohighlevel_contact(api_key, payload)
+            contact_id, created = _create_gohighlevel_contact(api_key, payload)
             if not contact_id:
+                message = (
+                    "No se obtuvo contactId al crear contacto en GoHighLevel para %s (location %s)."
+                )
                 logger.warning(
-                    "No se obtuvo contactId al crear contacto en GoHighLevel para %s (location %s).",
+                    message,
                     recipient or "(sin usuario)",
                     location_id,
                 )
+                print(
+                    f"❌ Falló el envío a GHL (Location {location_id}): no se recibió identificador del contacto"
+                )
                 continue
             _attach_gohighlevel_note(api_key, contact_id, note_text)
-            successes += 1
+            successes.append(location_id)
+            action = "creado" if created else "actualizado"
+            print(
+                f"✅ Lead enviado a GHL (Location {location_id}) — contacto {action} (ID {contact_id})"
+            )
         except RequestException as exc:  # pragma: no cover - depende de red externa
             logger.warning(
                 "Error enviando lead a GoHighLevel (location %s): %s",
@@ -2099,6 +2661,7 @@ def _send_lead_to_gohighlevel(
                 exc,
                 exc_info=False,
             )
+            print(f"❌ Falló el envío a GHL (Location {location_id}): {exc}")
         except Exception as exc:  # pragma: no cover - manejo defensivo
             logger.warning(
                 "Fallo inesperado con GoHighLevel (location %s): %s",
@@ -2106,6 +2669,7 @@ def _send_lead_to_gohighlevel(
                 exc,
                 exc_info=False,
             )
+            print(f"❌ Falló el envío a GHL (Location {location_id}): {exc}")
     if not successes:
         return
 
@@ -2115,7 +2679,7 @@ def _send_lead_to_gohighlevel(
         alias,
         account,
         recipient or "(sin usuario)",
-        ",".join(location_ids),
+        ",".join(successes),
         lead_tag,
     )
 
@@ -2126,10 +2690,9 @@ def _maybe_schedule_google_calendar_event(
     conversation: str,
     phone_numbers: List[str],
     status: Optional[str],
+    openai_api_key: Optional[str] = None,
 ) -> Optional[str]:
     if ACTIVE_ALIAS is None:
-        return None
-    if not phone_numbers:
         return None
     if status and status.strip().lower() == "no interesado":
         return None
@@ -2138,17 +2701,27 @@ def _maybe_schedule_google_calendar_event(
         return None
     if requests is None and (Credentials is None or build is None):
         return None
-    normalized_convo = _normalize_text_for_match(conversation)
-    if not any(keyword in normalized_convo for keyword in _CALL_KEYWORDS):
-        return None
     tz_label = str(entry.get("timezone") or _default_timezone_label())
     meeting_dt = _detect_meeting_datetime(conversation, tz_label)
     if not meeting_dt:
         return None
-    main_phone = _normalize_phone(phone_numbers[0])
-    if not main_phone:
+    normalized_convo = _normalize_text_for_match(conversation)
+    prompt_text = str(entry.get("schedule_prompt") or "").strip()
+    if not prompt_text and not any(
+        keyword in normalized_convo for keyword in _CALL_KEYWORDS
+    ):
         return None
-    normalized_lead = recipient or main_phone
+    if not _google_calendar_lead_qualifies(
+        entry,
+        conversation,
+        status,
+        phone_numbers,
+        meeting_dt,
+        openai_api_key,
+    ):
+        return None
+    main_phone = _normalize_phone(phone_numbers[0]) if phone_numbers else ""
+    normalized_lead = recipient or main_phone or f"{account}-lead"
     if _google_calendar_already_scheduled(alias, normalized_lead, main_phone):
         return None
     access_token = _google_calendar_ensure_token(alias, entry)
@@ -2171,7 +2744,10 @@ def _maybe_schedule_google_calendar_event(
     ]
     if recipient:
         description_lines.append(f"Usuario IG: @{recipient}")
-    description_lines.append(f"Teléfono: {main_phone}")
+    if main_phone:
+        description_lines.append(f"Teléfono: {main_phone}")
+    else:
+        description_lines.append("Teléfono: (sin proporcionar)")
     if email:
         description_lines.append(f"Email: {email}")
     if status:
@@ -2206,19 +2782,22 @@ def _maybe_schedule_google_calendar_event(
     event_id = event.get("id") if isinstance(event, dict) else None
     if not event_id:
         return None
-    link = ""
+    event_link = ""
+    backup_link = ""
     if isinstance(event, dict):
-        link = event.get("htmlLink") or event.get("hangoutLink") or ""
-        if not link:
+        event_link = str(event.get("htmlLink") or "")
+        backup_link = str(event.get("hangoutLink") or "")
+        if not backup_link:
             conference_data = event.get("conferenceData") if isinstance(event.get("conferenceData"), dict) else {}
             if isinstance(conference_data, dict):
                 entry_points = conference_data.get("entryPoints")
                 if isinstance(entry_points, list):
                     for item in entry_points:
                         if isinstance(item, dict) and item.get("uri"):
-                            link = str(item["uri"])
+                            backup_link = str(item["uri"])
                             break
-    _google_calendar_mark_scheduled(alias, normalized_lead, main_phone, event_id, link)
+    stored_link = event_link or backup_link
+    _google_calendar_mark_scheduled(alias, normalized_lead, main_phone, event_id, stored_link)
     logger.info(
         "Evento programado en Google Calendar | alias=%s | cuenta=%s | lead=%s | inicio=%s",
         alias,
@@ -2228,10 +2807,15 @@ def _maybe_schedule_google_calendar_event(
     )
     formatted_dt = start_dt.strftime("%d/%m/%Y %H:%M")
     message_lines = [
-        f"Listo, agendé nuestra llamada para {formatted_dt} ({tz_label}).",
+        f"Listo, ya agendé nuestra llamada para {formatted_dt} ({tz_label}).",
     ]
-    if link:
-        message_lines.append(f"Podés ver los detalles acá: {link}")
+    if event_link:
+        message_lines.append(
+            "Te paso el link del evento para que lo tengas a mano y puedas "
+            f"sumarlo a tu calendario: {event_link}"
+        )
+    elif stored_link:
+        message_lines.append(f"Te compartí los detalles en nuestro calendario: {stored_link}")
     else:
         message_lines.append("Te compartí los detalles en nuestro calendario.")
     return "\n".join(message_lines)
@@ -2277,21 +2861,26 @@ def _process_inbox(
                 ts_value = int(msg_ts.timestamp())
             log_conversation_status(user, recipient_username, status, timestamp=ts_value)
         phone_numbers = _extract_phone_numbers(last.text or "")
+        if not phone_numbers:
+            phone_numbers = _extract_phone_numbers(convo)
         calendar_message: Optional[str] = None
-        if phone_numbers and status != "No interesado":
-            _send_lead_to_gohighlevel(
-                user,
-                recipient_username,
-                convo,
-                phone_numbers,
-                status,
-            )
+        if status != "No interesado":
+            if phone_numbers:
+                _send_lead_to_gohighlevel(
+                    user,
+                    recipient_username,
+                    convo,
+                    phone_numbers,
+                    status,
+                    api_key,
+                )
             calendar_message = _maybe_schedule_google_calendar_event(
                 user,
                 recipient_username,
                 convo,
                 phone_numbers,
                 status,
+                api_key,
             )
         try:
             reply = _gen_response(api_key, system_prompt, convo)
