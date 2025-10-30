@@ -322,6 +322,11 @@ def _build_accounts_for_alias(alias: str) -> list[Dict]:
             if ask("¿Iniciar sesión ahora? (s/N): ").strip().lower() == "s":
                 for account, _ in remaining:
                     username = account["username"]
+                    if auto_login_with_saved_password(username, account=account) and _ensure_session(username):
+                        refreshed = get_account(username) or account
+                        if refreshed not in verified:
+                            verified.append(refreshed)
+                        continue
                     if prompt_login(username, interactive=False) and _ensure_session(username):
                         refreshed = get_account(username) or account
                         if refreshed not in verified:

@@ -537,6 +537,10 @@ def _filter_valid_sessions(targets: list[str]) -> list[str]:
                 print(f" - @{user}: {reason}")
             if ask("¿Iniciar sesión ahora? (s/N): ").strip().lower() == "s":
                 for user, _ in remaining:
+                    if auto_login_with_saved_password(user) and _ensure_session(user):
+                        if user not in verified:
+                            verified.append(user)
+                        continue
                     if prompt_login(user, interactive=False) and _ensure_session(user):
                         if user not in verified:
                             verified.append(user)

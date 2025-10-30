@@ -83,6 +83,8 @@ def _ensure_account_ready(username: str) -> bool:
         if auto_login_with_saved_password(username) and has_session(username):
             return _ensure_account_ready(username)
         if ask("¿Iniciar sesión ahora? (s/N): ").strip().lower() == "s":
+            if auto_login_with_saved_password(username) and has_session(username):
+                return _ensure_account_ready(username)
             if prompt_login(username, interactive=False):
                 return _ensure_account_ready(username)
         return False
@@ -94,6 +96,8 @@ def _ensure_account_ready(username: str) -> bool:
         if auto_login_with_saved_password(username) and has_session(username):
             return _ensure_account_ready(username)
         if ask("¿Reintentar login ahora? (s/N): ").strip().lower() == "s":
+            if auto_login_with_saved_password(username) and has_session(username):
+                return _ensure_account_ready(username)
             if prompt_login(username, interactive=False):
                 return _ensure_account_ready(username)
         return False

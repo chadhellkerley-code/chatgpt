@@ -1899,7 +1899,10 @@ def menu_accounts():
                 "se solicitará solo si es necesario."
             )
             for it in [x for x in _load() if x.get("alias") == alias]:
-                prompt_login(it["username"], interactive=False)
+                username = it["username"]
+                if auto_login_with_saved_password(username, account=it) and has_session(username):
+                    continue
+                prompt_login(username, interactive=False)
             press_enter()
         elif op == "6":
             group = [x for x in _load() if x.get("alias") == alias]
@@ -1939,7 +1942,10 @@ def menu_accounts():
                 press_enter()
                 continue
             for acct in targets:
-                prompt_login(acct["username"], interactive=False)
+                username = acct["username"]
+                if auto_login_with_saved_password(username, account=acct) and has_session(username):
+                    continue
+                prompt_login(username, interactive=False)
             press_enter()
         elif op == "7":
             _launch_hashtag_mode(alias)
