@@ -15,7 +15,13 @@ from pathlib import Path
 from queue import Empty, Queue
 from typing import List, Optional, Sequence
 
-from accounts import get_account, list_all, mark_connected, prompt_login
+from accounts import (
+    auto_login_with_saved_password,
+    get_account,
+    list_all,
+    mark_connected,
+    prompt_login,
+)
 from config import SETTINGS
 from proxy_manager import apply_proxy_to_client, record_proxy_failure, should_retry_proxy
 from runtime import (
@@ -136,8 +142,10 @@ def _client_for(username: str):
 def _ensure_account_ready(username: str) -> bool:
     if not has_session(username):
         warn(f"@{username} no tiene sesión guardada.")
+        if auto_login_with_saved_password(username) and has_session(username):
+            return _ensure_account_ready(username)
         if ask("¿Iniciar sesión ahora? (s/N): ").strip().lower() == "s":
-            if prompt_login(username):
+            if prompt_login(username, interactive=False):
                 return _ensure_account_ready(username)
         return False
     try:
@@ -145,8 +153,10 @@ def _ensure_account_ready(username: str) -> bool:
         return True
     except Exception as exc:
         warn(str(exc))
+        if auto_login_with_saved_password(username) and has_session(username):
+            return _ensure_account_ready(username)
         if ask("¿Reintentar login ahora? (s/N): ").strip().lower() == "s":
-            if prompt_login(username):
+            if prompt_login(username, interactive=False):
                 return _ensure_account_ready(username)
         return False
 
