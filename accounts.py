@@ -6,6 +6,7 @@ import csv
 import getpass
 import io
 import json
+import re
 import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import logging
+from urllib.parse import urlparse
 
 from config import SETTINGS
 from proxy_manager import (
@@ -39,6 +41,44 @@ BASE.mkdir(parents=True, exist_ok=True)
 DATA = BASE / "data"
 DATA.mkdir(exist_ok=True)
 FILE = DATA / "accounts.json"
+_PASSWORD_FILE = DATA / "passwords.json"
+
+
+def _password_key(username: str | None) -> str:
+    if not username:
+        return ""
+    return username.strip().lstrip("@").lower()
+
+
+def _load_password_cache() -> Dict[str, str]:
+    if not _PASSWORD_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(_PASSWORD_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    cache: Dict[str, str] = {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                continue
+            normalized = key.strip().lower()
+            if not normalized or not value:
+                continue
+            cache[normalized] = value
+    return cache
+
+
+def _save_password_cache(cache: Dict[str, str]) -> None:
+    try:
+        _PASSWORD_FILE.write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+_PASSWORD_CACHE: Dict[str, str] = _load_password_cache()
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +151,7 @@ def _normalize_account(record: Dict) -> Dict:
     result.setdefault("alias", "default")
     result.setdefault("active", True)
     result.setdefault("connected", False)
+    result.setdefault("password", "")
     result.setdefault("proxy_url", "")
     result.setdefault("proxy_user", "")
     result.setdefault("proxy_pass", "")
@@ -122,6 +163,11 @@ def _normalize_account(record: Dict) -> Dict:
     result["proxy_sticky_minutes"] = max(1, sticky_value)
     username = result.get("username")
     if username:
+        key = _password_key(username)
+        if not result.get("password") and key:
+            cached = _PASSWORD_CACHE.get(key)
+            if cached:
+                result["password"] = cached
         result["has_totp"] = has_totp_secret(username)
     else:
         result.setdefault("has_totp", False)
@@ -300,6 +346,10 @@ def remove_account(username: str) -> None:
     remove_totp_secret(username)
     clear_proxy(username)
     _invalidate_health(username)
+    key = _password_key(username)
+    if key and key in _PASSWORD_CACHE:
+        _PASSWORD_CACHE.pop(key, None)
+        _save_password_cache(_PASSWORD_CACHE)
     ok("Eliminada (si existía).")
 
 
@@ -496,16 +546,137 @@ def _login_and_save_session(account: Dict, password: str) -> bool:
         return False
 
 
-def prompt_login(username: str) -> bool:
+def _session_active(
+    username: str,
+    *,
+    account: Optional[Dict] = None,
+    reason: str = "session-check",
+) -> bool:
+    if not username or not has_session(username):
+        return False
+
+    account = account or get_account(username)
+
+    try:
+        from instagrapi import Client
+    except Exception as exc:  # pragma: no cover - dependencia externa opcional
+        logger.debug("No se pudo importar instagrapi para validar sesión: %s", exc)
+        return False
+
+    try:
+        cl = Client()
+    except Exception as exc:  # pragma: no cover - inicialización opcional
+        logger.debug("No se pudo crear el cliente de Instagram: %s", exc)
+        return False
+
+    binding = None
+    try:
+        binding = apply_proxy_to_client(cl, username, account, reason=reason)
+    except Exception as exc:
+        if account and account.get("proxy_url"):
+            record_proxy_failure(username, exc)
+        logger.debug("No se pudo aplicar el proxy de @%s: %s", username, exc)
+
+    try:
+        load_into(cl, username)
+    except FileNotFoundError:
+        mark_connected(username, False)
+        return False
+    except Exception as exc:
+        if binding and should_retry_proxy(exc):
+            record_proxy_failure(username, exc)
+        mark_connected(username, False)
+        logger.debug("Error cargando sesión para @%s: %s", username, exc)
+        return False
+
+    try:
+        cl.get_timeline_feed()
+        mark_connected(username, True)
+        return True
+    except Exception as exc:
+        if binding and should_retry_proxy(exc):
+            record_proxy_failure(username, exc)
+        mark_connected(username, False)
+        logger.debug("Error validando sesión para @%s: %s", username, exc)
+        return False
+
+
+def auto_login_with_saved_password(
+    username: str, *, account: Optional[Dict] = None
+) -> bool:
+    """Intenta iniciar sesión reutilizando la contraseña almacenada."""
+
+    account = account or get_account(username)
+    if not account:
+        return False
+
+    if _session_active(username, account=account, reason="auto-login-check"):
+        return True
+
+    stored_password = _account_password(account).strip()
+    if not stored_password:
+        return False
+
+    return _login_and_save_session(account, stored_password)
+
+
+def prompt_login(username: str, *, interactive: bool = True) -> bool:
     account = get_account(username)
     if not account:
         warn("No existe la cuenta indicada.")
         return False
-    pwd = getpass.getpass(f"Password @{account['username']}: ")
-    if not pwd:
-        warn("Se canceló el inicio de sesión.")
+
+    if _session_active(username, account=account, reason="prompt-login"):
+        return True
+    stored_password = _account_password(account).strip()
+    original_stored = stored_password
+    attempted_auto = False
+
+    if stored_password:
+        attempted_auto = True
+        if auto_login_with_saved_password(username, account=account):
+            return True
+
+    while True:
+        if attempted_auto and stored_password:
+            changed = (
+                ask("¿Cambiaste la contraseña de esta cuenta? (s/N): ")
+                .strip()
+                .lower()
+            )
+            if changed != "s":
+                warn(
+                    "Instagram rechazó la sesión guardada. Posiblemente haya un challenge o chequeo de seguridad pendiente."
+                )
+                return False
+            password = getpass.getpass(
+                f"Nueva password @{account['username']}: "
+            )
+        else:
+            password = getpass.getpass(
+                f"Password @{account['username']}: "
+            )
+
+        if not password:
+            warn("Se canceló el inicio de sesión.")
+            return False
+
+        success = _login_and_save_session(account, password)
+        if success:
+            if password != original_stored:
+                _store_account_password(username, password)
+            return True
+
+        attempted_auto = False
+        stored_password = ""
+        if interactive and (
+            ask("¿Intentar ingresar nuevamente? (s/N): ")
+            .strip()
+            .lower()
+            == "s"
+        ):
+            continue
         return False
-    return _login_and_save_session(account, pwd)
 
 
 def _proxy_indicator(account: Dict) -> str:
@@ -559,7 +730,218 @@ def _badge_for_display(account: Dict) -> tuple[str, bool]:
     return "[🟡 En riesgo: unknown]", True
 
 
+def _account_status_from_badge(account: Dict, badge: str) -> str:
+    if not account.get("active"):
+        return "inactiva"
+
+    lowered = (badge or "").lower()
+    if "desactivada" in lowered:
+        return "baneada"
+    if any(keyword in lowered for keyword in ("action_block", "challenge", "checkpoint")):
+        return "bloqueada"
+    if "sesión expirada" in lowered or "sesion expirada" in lowered:
+        return "no se puede iniciar sesión"
+    if not account.get("connected"):
+        return "no se puede iniciar sesión"
+    return "activa"
+
+
+def _proxy_status_from_badge(account: Dict, badge: str) -> str:
+    lowered = (badge or "").lower()
+    if "proxy" in lowered and any(term in lowered for term in ("caído", "caido", "bloqueado")):
+        return "bloqueado"
+    return "activo"
+
+
+def _current_totp_code(username: str) -> str:
+    if not username:
+        return ""
+    try:
+        code = generate_totp_code(username)
+    except Exception:
+        return ""
+    return code or ""
+
+
+def _proxy_components(account: Dict) -> tuple[str, str, str, str]:
+    raw_url = (account.get("proxy_url") or "").strip()
+    ip = ""
+    port = ""
+    if raw_url:
+        parsed = urlparse(raw_url if "://" in raw_url else f"http://{raw_url}")
+        ip = (parsed.hostname or "").strip()
+        port = str(parsed.port) if parsed.port else ""
+    proxy_user = (account.get("proxy_user") or "").strip()
+    proxy_pass = (account.get("proxy_pass") or "").strip()
+    return ip, port, proxy_user, proxy_pass
+
+
+def _alias_slug(alias: str) -> str:
+    candidate = re.sub(r"[^0-9A-Za-z_-]", "_", alias.strip())
+    candidate = candidate.strip("_")
+    return candidate or "default"
+
+
+def _export_path(alias: str) -> Path:
+    base_dir = Path.home() / "Desktop" / "archivos CSV"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{_alias_slug(alias)}_accounts_{timestamp}.csv"
+    return base_dir / filename
+
+
+def _account_password(account: Dict) -> str:
+    value = account.get("password")
+    if isinstance(value, str) and value:
+        return value
+    key = _password_key(account.get("username"))
+    if key:
+        cached = _PASSWORD_CACHE.get(key)
+        if cached:
+            return cached
+    return ""
+
+
+def _store_account_password(username: str, password: str) -> None:
+    if not password:
+        return
+    update_account(username, {"password": password})
+    key = _password_key(username)
+    if not key:
+        return
+    if _PASSWORD_CACHE.get(key) == password:
+        return
+    _PASSWORD_CACHE[key] = password
+    _save_password_cache(_PASSWORD_CACHE)
+
+
+def _export_accounts_csv(alias: str) -> None:
+    accounts = [acct for acct in _load() if acct.get("alias") == alias]
+    destination = _export_path(alias)
+    headers = [
+        "Username",
+        "Contraseña",
+        "Código 2FA",
+        "Proxy IP",
+        "Proxy Puerto",
+        "Proxy Usuario",
+        "Proxy Contraseña",
+        "Estado de la cuenta",
+        "Estado del proxy",
+    ]
+
+    with destination.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(headers)
+        for account in accounts:
+            username = (account.get("username") or "").strip()
+            badge, _ = _badge_for_display(account)
+            account_status = _account_status_from_badge(account, badge)
+            proxy_status = _proxy_status_from_badge(account, badge)
+            proxy_ip, proxy_port, proxy_user, proxy_pass = _proxy_components(account)
+            writer.writerow(
+                [
+                    username,
+                    _account_password(account),
+                    _current_totp_code(username),
+                    proxy_ip,
+                    proxy_port,
+                    proxy_user,
+                    proxy_pass,
+                    account_status,
+                    proxy_status,
+                ]
+            )
+
+    ok(f"Archivo CSV generado en: {destination}")
+    press_enter()
+
+
+def _prompt_destination_alias(current_alias: str) -> Optional[str]:
+    items = _load()
+    aliases = sorted({(it.get("alias") or "default") for it in items} | {"default"})
+    alias_lookup = {alias.lower(): alias for alias in aliases}
+    normalized_current = current_alias.lower()
+    if normalized_current not in alias_lookup:
+        alias_lookup[normalized_current] = current_alias
+        aliases.append(current_alias)
+
+    if aliases:
+        print("\nAlias disponibles para mover: " + ", ".join(sorted(set(aliases))))
+
+    while True:
+        destination = ask("Alias destino (Enter para cancelar): ").strip()
+        if not destination:
+            return None
+
+        normalized = destination.lower()
+        if normalized == normalized_current:
+            warn("El alias destino es el mismo que el origen. Seleccioná otro alias.")
+            continue
+
+        if normalized in alias_lookup:
+            return alias_lookup[normalized]
+
+        create = (
+            ask(
+                f"El alias '{destination}' no existe. ¿Crear automáticamente y continuar? (s/N): "
+            )
+            .strip()
+            .lower()
+        )
+        if create == "s":
+            ok(f"Alias '{destination}' creado.")
+            return destination
+
+
+def _move_accounts_to_alias(alias: str) -> None:
+    usernames = _select_usernames_for_modifications(alias)
+    if not usernames:
+        return
+
+    destination = _prompt_destination_alias(alias)
+    if not destination:
+        warn("Operación cancelada.")
+        press_enter()
+        return
+
+    selected = {username.lower() for username in usernames if username}
+    if not selected:
+        warn("No se seleccionaron cuentas válidas.")
+        press_enter()
+        return
+
+    items = _load()
+    moved: set[str] = set()
+    for idx, item in enumerate(items):
+        username = (item.get("username") or "").strip()
+        if not username:
+            continue
+        if item.get("alias") != alias:
+            continue
+        if username.lower() not in selected:
+            continue
+        updated = dict(item)
+        updated["alias"] = destination
+        items[idx] = _normalize_account(updated)
+        moved.add(username)
+
+    if not moved:
+        warn("No se movieron cuentas.")
+        press_enter()
+        return
+
+    _save(items)
+    for username in moved:
+        _invalidate_health(username)
+
+    ok(f"Se movieron {len(moved)} cuenta(s) al alias '{destination}'.")
+    press_enter()
+
+
 def _schedule_health_refresh(accounts_to_refresh: List[Dict]) -> None:
+    if SETTINGS.client_distribution:
+        return
     for account in accounts_to_refresh:
         username = account.get("username", "")
         key = _health_cache_key(username)
@@ -671,6 +1053,8 @@ def _import_accounts_from_csv(alias: str) -> None:
                 continue
 
         successes += 1
+
+        _store_account_password(username, password)
 
         account = get_account(username)
         if account and not _login_and_save_session(account, password):
@@ -1559,7 +1943,9 @@ def menu_accounts():
         print("8) Subir contenidos (Historias / Post / Reels)")
         print("9) Interacciones (Comentar / Ver & Like Reels)")
         print("10) Modificación de cuentas de Instagram")
-        print("11) Volver\n")
+        print("11) Exportar cuentas a CSV")
+        print("12) Mover cuentas a otro alias")
+        print("13) Volver\n")
 
         op = ask("Opción: ").strip()
         if op == "1":
@@ -1583,9 +1969,63 @@ def menu_accounts():
         elif op == "2":
             _import_accounts_from_csv(alias)
         elif op == "3":
-            u = ask("Username a eliminar: ").strip().lstrip("@")
-            remove_account(u)
-            press_enter()
+            if not group:
+                warn("No hay cuentas para eliminar en este alias.")
+                press_enter()
+                continue
+            print("\n¿Querés eliminar una cuenta, varias o todas las del alias?")
+            print("1) Una")
+            print("2) Varias (selección múltiple)")
+            print("3) Todas las del alias")
+            mode = ask("Opción: ").strip() or "1"
+            if mode == "1":
+                u = ask("Username a eliminar: ").strip().lstrip("@")
+                if not u:
+                    warn("No se ingresó username.")
+                else:
+                    remove_account(u)
+                press_enter()
+            elif mode == "2":
+                print("Seleccioná cuentas por número o username (coma separada):")
+                for idx, acct in enumerate(group, start=1):
+                    print(f" {idx}) @{acct['username']}")
+                raw = ask("Selección: ").strip()
+                if not raw:
+                    warn("Sin selección.")
+                    press_enter()
+                    continue
+                chosen = set()
+                for part in raw.split(","):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    if part.isdigit():
+                        idx = int(part)
+                        if 1 <= idx <= len(group):
+                            chosen.add(group[idx - 1]["username"])
+                    else:
+                        chosen.add(part.lstrip("@"))
+                if not chosen:
+                    warn("No se encontraron cuentas con esos datos.")
+                    press_enter()
+                    continue
+                for acct in group:
+                    if acct["username"] in chosen:
+                        remove_account(acct["username"])
+                press_enter()
+            elif mode == "3":
+                confirm = ask(
+                    "¿Confirmás eliminar TODAS las cuentas de este alias? (s/N): "
+                ).strip().lower()
+                if confirm == "s":
+                    for acct in group:
+                        remove_account(acct["username"])
+                else:
+                    warn("Operación cancelada.")
+                press_enter()
+            else:
+                warn("Opción inválida.")
+                press_enter()
         elif op == "4":
             u = ask("Username: ").strip().lstrip("@")
             account = get_account(u)
@@ -1630,9 +2070,15 @@ def menu_accounts():
             else:
                 continue
         elif op == "5":
-            print("Se pedirá contraseña por cada cuenta...")
+            print(
+                "Se reutilizará la contraseña guardada cuando esté disponible; "
+                "se solicitará solo si es necesario."
+            )
             for it in [x for x in _load() if x.get("alias") == alias]:
-                prompt_login(it["username"])
+                username = it["username"]
+                if auto_login_with_saved_password(username, account=it) and has_session(username):
+                    continue
+                prompt_login(username, interactive=False)
             press_enter()
         elif op == "6":
             group = [x for x in _load() if x.get("alias") == alias]
@@ -1672,7 +2118,10 @@ def menu_accounts():
                 press_enter()
                 continue
             for acct in targets:
-                prompt_login(acct["username"])
+                username = acct["username"]
+                if auto_login_with_saved_password(username, account=acct) and has_session(username):
+                    continue
+                prompt_login(username, interactive=False)
             press_enter()
         elif op == "7":
             _launch_hashtag_mode(alias)
@@ -1683,6 +2132,10 @@ def menu_accounts():
         elif op == "10":
             _modification_menu(alias)
         elif op == "11":
+            _export_accounts_csv(alias)
+        elif op == "12":
+            _move_accounts_to_alias(alias)
+        elif op == "13":
             break
         else:
             warn("Opción inválida.")
