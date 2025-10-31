@@ -16,7 +16,14 @@ from typing import Callable, Iterable, List, Optional, Sequence
 
 from json import JSONDecodeError
 
-from accounts import get_account, list_all, mark_connected, prompt_login
+from accounts import (
+    auto_login_with_saved_password,
+    get_account,
+    has_valid_session_settings,
+    list_all,
+    mark_connected,
+    prompt_login,
+)
 from actions.interactions_adapters import fetch_hashtag_reels
 from config import SETTINGS
 from proxy_manager import apply_proxy_to_client, record_proxy_failure, should_retry_proxy
@@ -201,24 +208,25 @@ def _client_for(username: str):
         mark_connected(username, False)
         raise
 
-    try:
-        cl.get_timeline_feed()
-        mark_connected(username, True)
-    except Exception as exc:
-        if binding and should_retry_proxy(exc):
-            record_proxy_failure(username, exc)
+    if not has_valid_session_settings(cl):
         mark_connected(username, False)
         raise RuntimeError(
-            f"La sesión guardada para {username} no es válida. Iniciá sesión nuevamente."
-        ) from exc
+            f"La sesión guardada para {username} no contiene credenciales activas. Iniciá sesión nuevamente."
+        )
+
+    mark_connected(username, True)
     return cl
 
 
 def _ensure_account_ready(username: str) -> bool:
     if not has_session(username):
         warn(f"@{username} no tiene sesión guardada.")
+        if auto_login_with_saved_password(username) and has_session(username):
+            return _ensure_account_ready(username)
         if ask("¿Iniciar sesión ahora? (s/N): ").strip().lower() == "s":
-            if prompt_login(username):
+            if auto_login_with_saved_password(username) and has_session(username):
+                return _ensure_account_ready(username)
+            if prompt_login(username, interactive=False):
                 return _ensure_account_ready(username)
         return False
     try:
@@ -226,8 +234,12 @@ def _ensure_account_ready(username: str) -> bool:
         return True
     except Exception as exc:
         _report_account_error(username, exc)
+        if auto_login_with_saved_password(username) and has_session(username):
+            return _ensure_account_ready(username)
         if ask("¿Reintentar login ahora? (s/N): ").strip().lower() == "s":
-            if prompt_login(username):
+            if auto_login_with_saved_password(username) and has_session(username):
+                return _ensure_account_ready(username)
+            if prompt_login(username, interactive=False):
                 return _ensure_account_ready(username)
         return False
 
