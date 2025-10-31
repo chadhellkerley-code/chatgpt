@@ -546,6 +546,61 @@ def _login_and_save_session(account: Dict, password: str) -> bool:
         return False
 
 
+def _session_active(
+    username: str,
+    *,
+    account: Optional[Dict] = None,
+    reason: str = "session-check",
+) -> bool:
+    if not username or not has_session(username):
+        return False
+
+    account = account or get_account(username)
+
+    try:
+        from instagrapi import Client
+    except Exception as exc:  # pragma: no cover - dependencia externa opcional
+        logger.debug("No se pudo importar instagrapi para validar sesión: %s", exc)
+        return False
+
+    try:
+        cl = Client()
+    except Exception as exc:  # pragma: no cover - inicialización opcional
+        logger.debug("No se pudo crear el cliente de Instagram: %s", exc)
+        return False
+
+    binding = None
+    try:
+        binding = apply_proxy_to_client(cl, username, account, reason=reason)
+    except Exception as exc:
+        if account and account.get("proxy_url"):
+            record_proxy_failure(username, exc)
+        logger.debug("No se pudo aplicar el proxy de @%s: %s", username, exc)
+
+    try:
+        load_into(cl, username)
+    except FileNotFoundError:
+        mark_connected(username, False)
+        return False
+    except Exception as exc:
+        if binding and should_retry_proxy(exc):
+            record_proxy_failure(username, exc)
+        mark_connected(username, False)
+        logger.debug("Error cargando sesión para @%s: %s", username, exc)
+        return False
+
+    try:
+        cl.get_timeline_feed()
+        mark_connected(username, True)
+        return True
+    except Exception as exc:
+        if binding and should_retry_proxy(exc):
+            record_proxy_failure(username, exc)
+        mark_connected(username, False)
+        logger.debug("Error validando sesión para @%s: %s", username, exc)
+        return False
+
+
 def auto_login_with_saved_password(
     username: str, *, account: Optional[Dict] = None
 ) -> bool:
@@ -554,6 +609,9 @@ def auto_login_with_saved_password(
     account = account or get_account(username)
     if not account:
         return False
+
+    if _session_active(username, account=account, reason="auto-login-check"):
+        return True
 
     stored_password = _account_password(account).strip()
     if not stored_password:
@@ -567,6 +625,9 @@ def prompt_login(username: str, *, interactive: bool = True) -> bool:
     if not account:
         warn("No existe la cuenta indicada.")
         return False
+
+    if _session_active(username, account=account, reason="prompt-login"):
+        return True
     stored_password = _account_password(account).strip()
     original_stored = stored_password
     attempted_auto = False
