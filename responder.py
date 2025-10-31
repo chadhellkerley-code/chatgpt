@@ -1452,6 +1452,24 @@ def _google_calendar_summary_line() -> str:
     return f"Google Calendar: activo para {', '.join(labels)}"
 
 
+def _google_calendar_candidate_keys(lead: str, phone: str) -> list[str]:
+    normalized_lead = _normalize_lead_id(lead)
+    normalized_phone = _normalize_phone(phone)
+    keys = [f"{normalized_lead}|{normalized_phone}"]
+    if normalized_lead:
+        keys.append(f"{normalized_lead}|")
+    if normalized_phone:
+        keys.append(f"|{normalized_phone}")
+    keys.append("||")
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for key in keys:
+        if key not in seen:
+            seen.add(key)
+            ordered.append(key)
+    return ordered
+
+
 def _google_calendar_mark_scheduled(
     alias: str,
     lead: str,
@@ -1460,10 +1478,18 @@ def _google_calendar_mark_scheduled(
     link: str | None,
     start_iso: str,
 ) -> None:
-    lead_key = f"{_normalize_lead_id(lead)}|{_normalize_phone(phone)}"
     entry = _get_google_calendar_entry(alias)
     scheduled = entry.setdefault("scheduled", {})
-    scheduled[lead_key] = {
+    candidate_keys = _google_calendar_candidate_keys(lead, phone)
+    canonical_key = candidate_keys[0]
+    existing_key = None
+    for key in candidate_keys:
+        if key in scheduled:
+            existing_key = key
+            break
+    if existing_key and existing_key != canonical_key:
+        scheduled.pop(existing_key, None)
+    scheduled[canonical_key] = {
         "event_id": event_id,
         "link": link or "",
         "start": start_iso,
@@ -1475,8 +1501,22 @@ def _google_calendar_mark_scheduled(
 def _google_calendar_already_scheduled(alias: str, lead: str, phone: str) -> bool:
     entry = _get_google_calendar_entry(alias)
     scheduled = entry.get("scheduled") or {}
-    lead_key = f"{_normalize_lead_id(lead)}|{_normalize_phone(phone)}"
-    return lead_key in scheduled
+    for key in _google_calendar_candidate_keys(lead, phone):
+        if key in scheduled:
+            return True
+    return False
+
+
+def _google_calendar_get_scheduled(
+    alias: str, lead: str, phone: str
+) -> tuple[Optional[Dict[str, object]], Optional[str]]:
+    entry = _get_google_calendar_entry(alias)
+    scheduled = entry.get("scheduled") or {}
+    for key in _google_calendar_candidate_keys(lead, phone):
+        data = scheduled.get(key)
+        if isinstance(data, dict):
+            return data, key
+    return None, None
 
 
 def _google_calendar_get_scheduled(
@@ -1735,6 +1775,122 @@ def _google_calendar_create_event_via_requests(
     return None
 
 
+def _google_calendar_fetch_event_via_service(
+    alias: str,
+    entry: Dict[str, object],
+    event_id: str,
+) -> Optional[Dict[str, object]]:
+    if build is None or Credentials is None:
+        return None
+    creds = _google_calendar_credentials_from_entry(alias, entry)
+    if not creds:
+        return None
+    try:
+        service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "No se pudo inicializar el cliente de Google Calendar para leer evento: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    try:
+        event = (
+            service.events()  # type: ignore[call-arg]
+            .get(calendarId="primary", eventId=event_id)
+            .execute()
+        )
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "Error al obtener evento de Google Calendar mediante googleapiclient: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    _google_calendar_update_tokens_from_credentials(alias, entry, creds)
+    if isinstance(event, dict):
+        return event
+    return None
+
+
+def _google_calendar_fetch_event_via_requests(
+    alias: str,
+    entry: Dict[str, object],
+    event_id: str,
+    access_token: Optional[str],
+) -> Optional[Dict[str, object]]:
+    if requests is None and (Credentials is None or build is None):
+        return None
+    token_value = access_token or entry.get("access_token")
+    if not token_value:
+        return None
+    headers = {
+        "Authorization": f"Bearer {token_value}",
+        "Content-Type": "application/json",
+    }
+    params = {"fields": "id,htmlLink,hangoutLink,conferenceData,start"}
+    url = f"{_GOOGLE_CALENDAR_BASE}/calendars/primary/events/{event_id}"
+    try:
+        response = requests.get(  # type: ignore[call-arg]
+            url,
+            headers=headers,
+            params=params,
+            timeout=20,
+        )
+    except RequestException as exc:  # pragma: no cover - depende de red externa
+        logger.warning(
+            "No se pudo leer el evento en Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    if response.status_code == 401:
+        new_token = _google_calendar_refresh_access_token(alias, entry)
+        if not new_token:
+            return None
+        headers["Authorization"] = f"Bearer {new_token}"
+        try:
+            response = requests.get(  # type: ignore[call-arg]
+                url,
+                headers=headers,
+                params=params,
+                timeout=20,
+            )
+        except RequestException as exc:  # pragma: no cover - depende de red externa
+            logger.warning(
+                "No se pudo leer el evento en Google Calendar tras refrescar token: %s",
+                exc,
+                exc_info=False,
+            )
+            return None
+    if response.status_code != 200:
+        logger.warning(
+            "Respuesta inesperada al obtener evento de Google Calendar (%s): %s",
+            response.status_code,
+            response.text,
+        )
+        return None
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _google_calendar_fetch_event(
+    alias: str,
+    entry: Dict[str, object],
+    event_id: str,
+    access_token: Optional[str],
+) -> Optional[Dict[str, object]]:
+    event = _google_calendar_fetch_event_via_service(alias, entry, event_id)
+    if event:
+        return event
+    return _google_calendar_fetch_event_via_requests(alias, entry, event_id, access_token)
+
+
 def _google_calendar_create_event(
     alias: str,
     entry: Dict[str, object],
@@ -1746,6 +1902,138 @@ def _google_calendar_create_event(
     if event:
         return event
     return _google_calendar_create_event_via_requests(alias, entry, payload, params, access_token)
+
+
+def _google_calendar_update_event_via_service(
+    alias: str,
+    entry: Dict[str, object],
+    event_id: str,
+    payload: Dict[str, object],
+    params: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    if build is None or Credentials is None:
+        return None
+    creds = _google_calendar_credentials_from_entry(alias, entry)
+    if not creds:
+        return None
+    try:
+        service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "No se pudo inicializar el cliente de Google Calendar para actualizar evento: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    kwargs: Dict[str, object] = {}
+    if params.get("conferenceDataVersion"):
+        kwargs["conferenceDataVersion"] = params["conferenceDataVersion"]
+    try:
+        event = (
+            service.events()  # type: ignore[call-arg]
+            .patch(calendarId="primary", eventId=event_id, body=payload, **kwargs)
+            .execute()
+        )
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "Error al actualizar evento de Google Calendar mediante googleapiclient: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    _google_calendar_update_tokens_from_credentials(alias, entry, creds)
+    if isinstance(event, dict):
+        return event
+    return None
+
+
+def _google_calendar_update_event_via_requests(
+    alias: str,
+    entry: Dict[str, object],
+    event_id: str,
+    payload: Dict[str, object],
+    params: Dict[str, object],
+    access_token: Optional[str],
+) -> Optional[Dict[str, object]]:
+    if requests is None and (Credentials is None or build is None):
+        return None
+    token_value = access_token or entry.get("access_token")
+    if not token_value:
+        return None
+    headers = {
+        "Authorization": f"Bearer {token_value}",
+        "Content-Type": "application/json",
+    }
+    url = f"{_GOOGLE_CALENDAR_BASE}/calendars/primary/events/{event_id}"
+    try:
+        response = requests.patch(  # type: ignore[call-arg]
+            url,
+            headers=headers,
+            json=payload,
+            params=params or None,
+            timeout=20,
+        )
+    except RequestException as exc:  # pragma: no cover - depende de red externa
+        logger.warning(
+            "No se pudo actualizar el evento en Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    if response.status_code == 401:
+        new_token = _google_calendar_refresh_access_token(alias, entry)
+        if not new_token:
+            return None
+        headers["Authorization"] = f"Bearer {new_token}"
+        try:
+            response = requests.patch(  # type: ignore[call-arg]
+                url,
+                headers=headers,
+                json=payload,
+                params=params or None,
+                timeout=20,
+            )
+        except RequestException as exc:  # pragma: no cover - depende de red externa
+            logger.warning(
+                "No se pudo actualizar el evento en Google Calendar tras refrescar token: %s",
+                exc,
+                exc_info=False,
+            )
+            return None
+    if response.status_code not in {200}:  # 200 OK al actualizar
+        if response.status_code == 404:
+            logger.info(
+                "El evento de Google Calendar no existe; se creará uno nuevo. (%s)",
+                event_id,
+            )
+            return None
+        logger.warning(
+            "Respuesta inesperada al actualizar evento de Google Calendar (%s): %s",
+            response.status_code,
+            response.text,
+        )
+        return None
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _google_calendar_update_event(
+    alias: str,
+    entry: Dict[str, object],
+    event_id: str,
+    payload: Dict[str, object],
+    params: Dict[str, object],
+    access_token: Optional[str],
+) -> Optional[Dict[str, object]]:
+    event = _google_calendar_update_event_via_service(alias, entry, event_id, payload, params)
+    if event:
+        return event
+    return _google_calendar_update_event_via_requests(alias, entry, event_id, payload, params, access_token)
 
 
 def _google_calendar_update_event_via_service(
@@ -2063,70 +2351,6 @@ def _gohighlevel_enabled_entry_for(username: str) -> tuple[Optional[str], Dict[s
         if api_key and entry.get("enabled"):
             return alias, entry
     return None, {}
-
-
-def _gohighlevel_lead_qualifies(
-    entry: Dict[str, object],
-    conversation: str,
-    status: Optional[str],
-    phone_numbers: List[str],
-    api_key: Optional[str],
-) -> bool:
-    prompt_text = str(entry.get("qualify_prompt") or "").strip()
-    if not prompt_text:
-        return True
-    if not api_key:
-        return True
-    try:  # pragma: no cover - depende de dependencia externa
-        from openai import OpenAI
-    except Exception as exc:  # pragma: no cover - entorno sin openai
-        logger.warning(
-            "No se pudo importar OpenAI para evaluar GoHighLevel: %s", exc, exc_info=False
-        )
-        return True
-    try:  # pragma: no cover - depende de credenciales externas
-        client = OpenAI(api_key=api_key)
-    except Exception as exc:
-        logger.warning(
-            "No se pudo inicializar OpenAI para evaluar GoHighLevel: %s",
-            exc,
-            exc_info=False,
-        )
-        return True
-
-    system_prompt = (
-        prompt_text
-        + "\n\nResponde únicamente con 'SI' o 'NO' indicando si se debe enviar el lead a GoHighLevel."
-    )
-    context_lines = [
-        f"Estado detectado: {status or 'desconocido'}",
-        "Teléfonos detectados: "
-        + (", ".join(phone_numbers) if phone_numbers else "(sin teléfono)"),
-        "Conversación completa:",
-        conversation,
-    ]
-    user_content = "\n".join(context_lines)
-    try:  # pragma: no cover - depende de red externa
-        response = client.responses.create(
-            model="gpt-4o-mini",
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0,
-            max_output_tokens=20,
-        )
-        decision = (response.output_text or "").strip().lower()
-    except Exception as exc:  # pragma: no cover - depende de red externa
-        logger.warning(
-            "No se pudo evaluar el criterio de GoHighLevel con OpenAI: %s",
-            exc,
-            exc_info=False,
-        )
-        return True
-
-    normalized = _normalize_text_for_match(decision)
-    return normalized.startswith("s")
 
 
 def _gohighlevel_lead_qualifies(
@@ -3568,7 +3792,9 @@ def _maybe_schedule_google_calendar_event(
         return None
     main_phone = _normalize_phone(phone_numbers[0]) if phone_numbers else ""
     normalized_lead = recipient or main_phone or f"{account}-lead"
-    scheduled_entry = _google_calendar_get_scheduled(alias, normalized_lead, main_phone)
+    scheduled_entry, _ = _google_calendar_get_scheduled(
+        alias, normalized_lead, main_phone
+    )
     previous_start: Optional[datetime] = None
     previous_link = ""
     event_id_to_update: Optional[str] = None
@@ -3681,6 +3907,28 @@ def _maybe_schedule_google_calendar_event(
                         if isinstance(item, dict) and item.get("uri"):
                             backup_link = str(item["uri"])
                             break
+    if not event_link:
+        fetched_event = _google_calendar_fetch_event(
+            alias, entry, event_id, access_token
+        )
+        if isinstance(fetched_event, dict):
+            event = fetched_event
+            event_link = str(fetched_event.get("htmlLink") or "")
+            if not backup_link:
+                backup_link = str(fetched_event.get("hangoutLink") or "")
+                if not backup_link:
+                    conference_data = (
+                        fetched_event.get("conferenceData")
+                        if isinstance(fetched_event.get("conferenceData"), dict)
+                        else {}
+                    )
+                    if isinstance(conference_data, dict):
+                        entry_points = conference_data.get("entryPoints")
+                        if isinstance(entry_points, list):
+                            for item in entry_points:
+                                if isinstance(item, dict) and item.get("uri"):
+                                    backup_link = str(item["uri"])
+                                    break
     stored_link = event_link or backup_link or previous_link
     _google_calendar_mark_scheduled(
         alias,
