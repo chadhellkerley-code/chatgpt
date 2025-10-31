@@ -599,12 +599,13 @@ def _print_table(rows: list[tuple[str, str, str, str]], page: int) -> tuple[int,
     page_rows = rows[start:end]
 
     headers = ("Fecha y hora", "Emisor", "Receptor", "Estado")
-    widths = [17, 22, 22, 18]
+    widths = [17, 22, 22, 44]
+    total_width = sum(widths) + 3 * (len(widths) - 1)
 
-    print("\n" + "=" * 72)
+    print("\n" + "=" * total_width)
     header_line = " | ".join(_truncate(h, w) for h, w in zip(headers, widths))
     print(header_line)
-    print("-" * 72)
+    print("-" * total_width)
 
     if not page_rows:
         print("(Sin conversaciones registradas)")
@@ -612,7 +613,7 @@ def _print_table(rows: list[tuple[str, str, str, str]], page: int) -> tuple[int,
         for row in page_rows:
             print(" | ".join(_truncate(cell, width) for cell, width in zip(row, widths)))
 
-    print("-" * 72)
+    print("-" * total_width)
     print(f"Página {page + 1} de {total_pages}  (Total: {total})")
     return total_pages, page
 
