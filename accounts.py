@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import logging
 from urllib.parse import urlparse
@@ -546,6 +546,38 @@ def _login_and_save_session(account: Dict, password: str) -> bool:
         return False
 
 
+def _authorization_payload(client: Any) -> Dict[str, Any]:
+    """Extract the authorization payload from an instagrapi client."""
+
+    candidates: list[dict[str, Any] | None] = []
+
+    auth = getattr(client, "authorization_data", None)
+    if isinstance(auth, dict):
+        candidates.append(auth)
+
+    try:
+        settings = client.get_settings()
+        if isinstance(settings, dict):
+            candidates.append(settings.get("authorization_data"))
+    except Exception:
+        pass
+
+    for payload in candidates:
+        if isinstance(payload, dict):
+            return payload
+
+    return {}
+
+
+def has_valid_session_settings(client: Any) -> bool:
+    """Return True if the loaded client contains a usable session token."""
+
+    payload = _authorization_payload(client)
+    session_id = str(payload.get("sessionid") or payload.get("session_id") or "").strip()
+    user_id = str(payload.get("user_id") or payload.get("ds_user_id") or "").strip()
+    return bool(session_id and user_id)
+
+
 def _session_active(
     username: str,
     *,
@@ -589,16 +621,13 @@ def _session_active(
         logger.debug("Error cargando sesión para @%s: %s", username, exc)
         return False
 
-    try:
-        cl.get_timeline_feed()
+    if has_valid_session_settings(cl):
         mark_connected(username, True)
         return True
-    except Exception as exc:
-        if binding and should_retry_proxy(exc):
-            record_proxy_failure(username, exc)
-        mark_connected(username, False)
-        logger.debug("Error validando sesión para @%s: %s", username, exc)
-        return False
+
+    mark_connected(username, False)
+    logger.debug("La sesión cargada para @%s no contiene credenciales activas.", username)
+    return False
 
 
 def auto_login_with_saved_password(
@@ -1210,16 +1239,14 @@ def _client_for_account_action(account: Dict, *, reason: str):
         warn(f"No se pudo cargar la sesión de @{username}: {exc}")
         return None
 
-    try:
-        cl.account_info()
-        mark_connected(username, True)
-    except Exception as exc:
-        if binding and should_retry_proxy(exc):
-            record_proxy_failure(username, exc)
+    if not has_valid_session_settings(cl):
         mark_connected(username, False)
-        warn(f"Instagram rechazó la sesión de @{username}: {exc}")
+        warn(
+            f"La sesión guardada para @{username} no contiene credenciales activas. Iniciá sesión nuevamente."
+        )
         return None
 
+    mark_connected(username, True)
     return cl
 
 

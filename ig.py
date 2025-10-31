@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from accounts import (
     auto_login_with_saved_password,
     get_account,
+    has_valid_session_settings,
     list_all,
     mark_connected,
     prompt_login,
@@ -149,16 +150,13 @@ def _client_for(username: str):
         mark_connected(username, False)
         raise
 
-    try:
-        cl.get_timeline_feed()
-        mark_connected(username, True)
-    except Exception as exc:
-        if binding and should_retry_proxy(exc):
-            record_proxy_failure(username, exc)
+    if not has_valid_session_settings(cl):
         mark_connected(username, False)
         raise RuntimeError(
-            f"La sesión guardada para {username} no es válida. Iniciá sesión nuevamente."
-        ) from exc
+            f"La sesión guardada para {username} no contiene credenciales activas. Iniciá sesión nuevamente."
+        )
+
+    mark_connected(username, True)
     return cl
 
 
