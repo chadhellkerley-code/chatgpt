@@ -233,6 +233,613 @@ _WEEKDAY_KEYWORDS = {
     "domingo": 6,
 }
 
+_FOLLOWUP_FILE = (
+    runtime_base(Path(__file__).resolve().parent) / "storage" / "followups.json"
+)
+_FOLLOWUP_STATE: Dict[str, dict] | None = None
+_DEFAULT_FOLLOWUP_PROMPT = (
+    "Diseñá un plan de seguimiento amable para leads de Instagram. "
+    "Enviá el primer recordatorio cuando hayan pasado al menos 6 horas sin respuesta. "
+    "Si después de 12 horas más no responden, enviá un segundo y último mensaje. "
+    "No envíes más de dos seguimientos y evitá sonar insistente."
+)
+_FOLLOWUP_MIN_INTERVAL = 300
+_FOLLOWUP_HISTORY_MAX_AGE = 14 * 24 * 3600
+
+
+def _normalize_username(value: str) -> str:
+    return value.strip().lstrip("@").lower()
+
+
+def _read_followup_state(refresh: bool = False) -> Dict[str, dict]:
+    global _FOLLOWUP_STATE
+    if refresh or _FOLLOWUP_STATE is None:
+        data: Dict[str, dict] = {"aliases": {}}
+        if _FOLLOWUP_FILE.exists():
+            try:
+                loaded = json.loads(_FOLLOWUP_FILE.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data.update(loaded)
+            except Exception:
+                data = {"aliases": {}}
+        aliases = data.get("aliases")
+        if not isinstance(aliases, dict):
+            data["aliases"] = {}
+        _FOLLOWUP_STATE = data
+    return _FOLLOWUP_STATE
+
+
+def _write_followup_state(state: Dict[str, dict]) -> None:
+    state.setdefault("aliases", {})
+    _FOLLOWUP_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _FOLLOWUP_FILE.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    _read_followup_state(refresh=True)
+
+
+def _followup_prune_history(history: Dict[str, dict]) -> Dict[str, dict]:
+    now = time.time()
+    cleaned: Dict[str, dict] = {}
+    for key, record in history.items():
+        if not isinstance(record, dict):
+            continue
+        last_ts = record.get("last_sent_ts") or record.get("last_eval_ts")
+        try:
+            ts_value = float(last_ts)
+        except Exception:
+            ts_value = 0.0
+        if ts_value and now - ts_value > _FOLLOWUP_HISTORY_MAX_AGE:
+            continue
+        cleaned[key] = record
+    return cleaned
+
+
+def _get_followup_entry(alias: str) -> Dict[str, object]:
+    state = _read_followup_state()
+    key = _normalize_alias_key(alias)
+    aliases: Dict[str, dict] = state.get("aliases", {})
+    entry = aliases.get(key)
+    if not isinstance(entry, dict):
+        return {}
+    entry.setdefault("alias", alias.strip() or alias)
+    entry.setdefault("enabled", False)
+    entry.setdefault("accounts", [])
+    entry.setdefault("prompt", _DEFAULT_FOLLOWUP_PROMPT)
+    entry.setdefault("history", {})
+    history = entry.get("history")
+    if isinstance(history, dict):
+        entry["history"] = _followup_prune_history(history)
+    return entry
+
+
+def _set_followup_entry(alias: str, updates: Dict[str, object]) -> None:
+    alias = alias.strip()
+    if not alias:
+        warn("Alias inválido.")
+        return
+    state = _read_followup_state()
+    aliases: Dict[str, dict] = state.setdefault("aliases", {})
+    key = _normalize_alias_key(alias)
+    entry = aliases.get(key, {})
+    entry.setdefault("alias", alias)
+    entry.setdefault("prompt", _DEFAULT_FOLLOWUP_PROMPT)
+    normalized_updates: Dict[str, object] = {}
+    for key_name, value in updates.items():
+        if key_name == "accounts":
+            normalized: List[str] = []
+            if isinstance(value, (list, tuple, set)):
+                seen: set[str] = set()
+                for raw in value:
+                    if not isinstance(raw, str):
+                        continue
+                    norm = _normalize_username(raw)
+                    if norm and norm not in seen:
+                        seen.add(norm)
+                        normalized.append(norm)
+            elif isinstance(value, str):
+                norm = _normalize_username(value)
+                if norm:
+                    normalized = [norm]
+            normalized_updates[key_name] = normalized
+        elif key_name == "enabled":
+            normalized_updates[key_name] = bool(value)
+        elif key_name == "prompt":
+            normalized_updates[key_name] = str(value or "")
+        elif key_name == "history":
+            if isinstance(value, dict):
+                normalized_updates[key_name] = _followup_prune_history(value)
+        else:
+            normalized_updates[key_name] = value
+    entry.update(normalized_updates)
+    aliases[key] = entry
+    _write_followup_state(state)
+
+
+def _followup_status_lines() -> List[str]:
+    state = _read_followup_state()
+    aliases: Dict[str, dict] = state.get("aliases", {})
+    if not aliases:
+        return ["(sin configuraciones)"]
+    rows: List[str] = []
+    for key in sorted(aliases.keys()):
+        entry = aliases[key]
+        if not isinstance(entry, dict):
+            continue
+        alias_label = str(entry.get("alias") or key)
+        enabled = bool(entry.get("enabled"))
+        accounts = entry.get("accounts") or []
+        if accounts:
+            preview_accounts = [f"@{acc}" for acc in accounts[:3]]
+            if len(accounts) > 3:
+                preview_accounts.append(f"+{len(accounts) - 3}")
+            accounts_label = ", ".join(preview_accounts)
+        else:
+            accounts_label = "todas las cuentas del alias"
+        prompt_preview = _preview_prompt(str(entry.get("prompt") or ""))
+        status_label = "Activo" if enabled else "Inactivo"
+        rows.append(
+            f" - {alias_label}: {status_label} • Cuentas: {accounts_label} • Prompt: {prompt_preview}"
+        )
+    return rows
+
+
+def _followup_summary_line() -> str:
+    state = _read_followup_state()
+    aliases: Dict[str, dict] = state.get("aliases", {})
+    active = [
+        str(entry.get("alias") or key)
+        for key, entry in aliases.items()
+        if isinstance(entry, dict) and entry.get("enabled")
+    ]
+    if not active:
+        return "Seguimiento: (sin configurar)"
+    return f"Seguimiento: activo para {', '.join(sorted(active))}"
+
+
+def _followup_accounts_for_alias(alias: str) -> List[str]:
+    targets = _choose_targets(alias)
+    normalized = {_normalize_username(user) for user in targets}
+    return sorted(account for account in normalized if account)
+
+
+def _followup_enabled_entry_for(username: str) -> tuple[Optional[str], Dict[str, object]]:
+    alias_candidates: List[str] = []
+    if ACTIVE_ALIAS:
+        alias_candidates.append(ACTIVE_ALIAS)
+    account_data = get_account(username) or {}
+    account_alias = str(account_data.get("alias") or "").strip()
+    if account_alias:
+        alias_candidates.append(account_alias)
+    alias_candidates.append(username)
+    alias_candidates.append("ALL")
+
+    seen: set[str] = set()
+    for alias in alias_candidates:
+        norm = _normalize_alias_key(alias)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        entry = _get_followup_entry(alias)
+        if not entry or not entry.get("enabled"):
+            continue
+        accounts = entry.get("accounts") or []
+        if accounts:
+            norm_user = _normalize_username(username)
+            if norm_user not in accounts:
+                continue
+        return alias, entry
+    return None, {}
+
+
+def _followup_configure_accounts() -> None:
+    banner()
+    print(style_text("Seguimiento automático • Cuentas", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.BLUE))
+    for line in _followup_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _prompt_alias_selection()
+    if not alias:
+        return
+    available = _followup_accounts_for_alias(alias)
+    if not available:
+        warn("No se encontraron cuentas activas para ese alias.")
+        press_enter()
+        return
+    entry = _get_followup_entry(alias)
+    stored_accounts = set(entry.get("accounts") or [])
+    use_all = entry.get("enabled") and not stored_accounts
+    print("Seleccioná las cuentas que usarán seguimiento automático:")
+    for idx, account in enumerate(available, start=1):
+        selected = use_all or account in stored_accounts
+        marker = "[x]" if selected else "[ ]"
+        print(f" {idx:>2}) {marker} @{account}")
+    print("  0) Todas las cuentas del alias")
+    choice = ask(
+        "Números separados por coma (vacío cancela, 0 = todas): "
+    ).strip()
+    if not choice:
+        warn("No se realizaron cambios.")
+        press_enter()
+        return
+    if choice.lower() in {"0", "todas", "all"}:
+        _set_followup_entry(alias, {"accounts": [], "enabled": True})
+        ok("Seguimiento habilitado para todas las cuentas del alias.")
+        press_enter()
+        return
+    tokens = re.split(r"[\s,;]+", choice)
+    indices: List[int] = []
+    for token in tokens:
+        if not token:
+            continue
+        if not token.isdigit():
+            continue
+        idx = int(token)
+        if 1 <= idx <= len(available):
+            if idx not in indices:
+                indices.append(idx)
+    if not indices:
+        warn("No se seleccionaron cuentas válidas.")
+        press_enter()
+        return
+    selected_accounts = [available[i - 1] for i in indices]
+    _set_followup_entry(alias, {"accounts": selected_accounts, "enabled": True})
+    ok(f"Seguimiento habilitado para {len(selected_accounts)} cuentas.")
+    press_enter()
+
+
+def _followup_configure_prompt() -> None:
+    banner()
+    print(style_text("Seguimiento automático • Prompt", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.BLUE))
+    for line in _followup_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _prompt_alias_selection()
+    if not alias:
+        return
+    entry = _get_followup_entry(alias)
+    current_prompt = str(entry.get("prompt") or _DEFAULT_FOLLOWUP_PROMPT)
+    print(style_text("Prompt actual:", color=Fore.BLUE))
+    print(current_prompt.strip() or "(sin definir)")
+    print(full_line(color=Fore.BLUE))
+    print("Elegí una opción:")
+    print("  E) Editar prompt")
+    print("  D) Restaurar valor predeterminado")
+    print("  Enter) Cancelar")
+    action = ask("Acción: ").strip().lower()
+    if not action:
+        warn("No se realizaron cambios.")
+        press_enter()
+        return
+    if action in {"d", "default", "predeterminado"}:
+        _set_followup_entry(alias, {"prompt": _DEFAULT_FOLLOWUP_PROMPT})
+        ok("Se restauró el prompt predeterminado de seguimiento.")
+        press_enter()
+        return
+    if action not in {"e", "editar"}:
+        warn("Opción inválida.")
+        press_enter()
+        return
+    print(
+        style_text(
+            "Pegá el nuevo prompt y finalizá con una línea que diga <<<END>>>.",
+            color=Fore.CYAN,
+        )
+    )
+    lines: List[str] = []
+    while True:
+        line = ask("› ")
+        if line.strip() == "<<<END>>>":
+            break
+        lines.append(line.replace("\r", ""))
+    new_prompt = "\n".join(lines).strip()
+    _set_followup_entry(alias, {"prompt": new_prompt})
+    if new_prompt:
+        ok(f"Prompt actualizado. Longitud: {len(new_prompt)} caracteres.")
+    else:
+        ok("Se eliminó el prompt personalizado. Se usará el valor predeterminado.")
+    press_enter()
+
+
+def _followup_disable() -> None:
+    banner()
+    print(style_text("Seguimiento automático • Desactivar", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.BLUE))
+    for line in _followup_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _prompt_alias_selection()
+    if not alias:
+        return
+    entry = _get_followup_entry(alias)
+    if not entry or not entry.get("enabled"):
+        warn("El seguimiento ya está inactivo para ese alias.")
+        press_enter()
+        return
+    _set_followup_entry(alias, {"enabled": False, "history": {}})
+    ok("Seguimiento desactivado para ese alias.")
+    press_enter()
+
+
+def _followup_menu() -> None:
+    while True:
+        banner()
+        print(style_text("Seguimiento automático", color=Fore.CYAN, bold=True))
+        print(full_line(color=Fore.BLUE))
+        for line in _followup_status_lines():
+            print(line)
+        print(full_line(color=Fore.BLUE))
+        print("1) Configurar cuentas con seguimiento")
+        print("2) Configurar prompt de seguimiento")
+        print("3) Desactivar seguimiento para un alias")
+        print("4) Volver")
+        choice = ask("Opción: ").strip()
+        if choice == "1":
+            _followup_configure_accounts()
+        elif choice == "2":
+            _followup_configure_prompt()
+        elif choice == "3":
+            _followup_disable()
+        elif choice == "4":
+            break
+        else:
+            warn("Opción inválida.")
+            press_enter()
+
+
+def _followup_decision(
+    api_key: str,
+    prompt_text: str,
+    conversation: str,
+    metadata: Dict[str, object],
+) -> Optional[tuple[str, int]]:
+    prompt_text = prompt_text.strip()
+    if not prompt_text or not api_key:
+        return None
+    try:  # pragma: no cover - depende de dependencia externa
+        from openai import OpenAI
+    except Exception as exc:
+        logger.warning(
+            "No se pudo importar OpenAI para seguimiento: %s", exc, exc_info=False
+        )
+        return None
+    try:  # pragma: no cover - depende de credenciales externas
+        client = OpenAI(api_key=api_key)
+    except Exception as exc:
+        logger.warning(
+            "No se pudo inicializar OpenAI para seguimiento: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+
+    system_prompt = (
+        "Sos un asistente que decide si enviar un mensaje de seguimiento en Instagram. "
+        "Debés seguir estrictamente las reglas provistas y responder SOLO con un objeto "
+        "JSON con las claves 'enviar' (booleano), 'mensaje' (texto) y 'etapa' (número entero). "
+        "Si no corresponde enviar, devolvé enviar=false, mensaje=\"\" y usá la etapa actual."
+    )
+    context_lines = ["Prompt de seguimiento personalizado:", prompt_text, "", "Contexto:"]
+    for key, value in metadata.items():
+        context_lines.append(f"- {key}: {value}")
+    context_lines.append("")
+    context_lines.append("Conversación completa (orden cronológico):")
+    context_lines.append(conversation)
+    user_content = "\n".join(context_lines)
+
+    try:  # pragma: no cover - depende de red externa
+        response = client.responses.create(
+            model="gpt-4o-mini",
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0.2,
+            max_output_tokens=240,
+        )
+        raw_text = (response.output_text or "").strip()
+    except Exception as exc:
+        logger.warning(
+            "No se pudo evaluar el seguimiento con OpenAI: %s", exc, exc_info=False
+        )
+        return None
+    if not raw_text:
+        return None
+    data: Optional[dict] = None
+    try:
+        data = json.loads(raw_text)
+    except Exception:
+        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+            except Exception:
+                data = None
+    if not isinstance(data, dict):
+        return None
+    enviar = data.get("enviar")
+    if isinstance(enviar, str):
+        enviar = enviar.strip().lower() in {"true", "1", "si", "sí", "yes"}
+    if not enviar:
+        return None
+    message = str(data.get("mensaje") or "").strip()
+    if not message:
+        return None
+    etapa_value = data.get("etapa")
+    try:
+        etapa_int = int(etapa_value)
+    except Exception:
+        etapa_int = int(metadata.get("seguimientos_previos", 0)) + 1
+    etapa_int = max(1, etapa_int)
+    return message, etapa_int
+
+
+def _process_followups(client, user: str, api_key: str) -> None:
+    alias, entry = _followup_enabled_entry_for(user)
+    if not alias or not entry or not entry.get("enabled"):
+        return
+    prompt_text = str(entry.get("prompt") or _DEFAULT_FOLLOWUP_PROMPT)
+    if not prompt_text.strip():
+        return
+    history_source = entry.get("history")
+    history: Dict[str, dict] = dict(history_source) if isinstance(history_source, dict) else {}
+    try:
+        threads = client.direct_threads(amount=15)
+    except Exception as exc:  # pragma: no cover - depende de SDK externo
+        logger.debug(
+            "No se pudieron obtener hilos para seguimiento de @%s: %s",
+            user,
+            exc,
+            exc_info=False,
+        )
+        return
+    now_ts = time.time()
+    account_norm = _normalize_username(user)
+    updated = False
+    for thread in threads:
+        if STOP_EVENT.is_set():
+            break
+        thread_id = getattr(thread, "id", None)
+        if not thread_id:
+            continue
+        unread_count = getattr(thread, "unread_count", None)
+        try:
+            unread_int = int(unread_count)
+        except Exception:
+            unread_int = 0
+        if unread_int > 0:
+            continue
+        participants = getattr(thread, "users", None)
+        recipient_id: Optional[int] = None
+        recipient_username = ""
+        if isinstance(participants, list):
+            for participant in participants:
+                pk = getattr(participant, "pk", None)
+                if pk and pk != client.user_id:
+                    recipient_id = pk
+                    recipient_username = getattr(participant, "username", str(pk))
+                    break
+        if not recipient_id:
+            continue
+        try:
+            messages = client.direct_messages(thread_id, amount=20)
+        except Exception as exc:  # pragma: no cover - depende de SDK externo
+            logger.debug(
+                "No se pudieron obtener mensajes del hilo %s para seguimiento: %s",
+                thread_id,
+                exc,
+                exc_info=False,
+            )
+            continue
+        if not messages:
+            continue
+        last_message = messages[0]
+        if last_message.user_id != client.user_id:
+            continue
+
+        def _msg_ts(msg: object) -> Optional[float]:
+            ts_obj = getattr(msg, "timestamp", None)
+            if isinstance(ts_obj, datetime):
+                return ts_obj.timestamp()
+            try:
+                return float(ts_obj)
+            except Exception:
+                return None
+
+        last_outbound_ts = _msg_ts(last_message)
+        if last_outbound_ts and now_ts - last_outbound_ts < 60:
+            continue
+
+        inbound_messages = [
+            msg
+            for msg in messages
+            if msg.user_id != client.user_id and isinstance(getattr(msg, "text", None), str)
+        ]
+        if not inbound_messages:
+            continue
+        last_inbound = inbound_messages[0]
+        last_inbound_ts = _msg_ts(last_inbound)
+        if last_inbound_ts and now_ts - last_inbound_ts < 60:
+            continue
+
+        history_key = f"{account_norm}|{thread_id}"
+        record = history.get(history_key, {})
+        last_eval_ts = record.get("last_eval_ts")
+        try:
+            last_eval_float = float(last_eval_ts)
+        except Exception:
+            last_eval_float = 0.0
+        if now_ts - last_eval_float < _FOLLOWUP_MIN_INTERVAL:
+            continue
+
+        followups_sent = int(record.get("count", 0) or 0)
+        last_followup_ts = record.get("last_sent_ts")
+        try:
+            last_followup_float = float(last_followup_ts)
+        except Exception:
+            last_followup_float = 0.0
+
+        conversation_lines: List[str] = []
+        for msg in reversed(messages[:40]):
+            text = getattr(msg, "text", "") or ""
+            prefix = "YO" if msg.user_id == client.user_id else "ELLOS"
+            conversation_lines.append(f"{prefix}: {text}")
+        conversation_text = "\n".join(conversation_lines[-40:])
+
+        metadata = {
+            "alias": alias,
+            "cuenta_origen": f"@{user}",
+            "lead": recipient_username or str(recipient_id),
+            "seguimientos_previos": followups_sent,
+            "segundos_desde_ultimo_seguimiento": int(now_ts - last_followup_float)
+            if last_followup_float
+            else "nunca",
+            "segundos_desde_ultima_respuesta": int(now_ts - last_inbound_ts)
+            if last_inbound_ts
+            else "desconocido",
+            "segundos_desde_ultimo_mensaje_enviado": int(now_ts - last_outbound_ts)
+            if last_outbound_ts
+            else "desconocido",
+        }
+        decision = _followup_decision(api_key, prompt_text, conversation_text, metadata)
+        record["last_eval_ts"] = now_ts
+        if not decision:
+            history[history_key] = record
+            updated = True
+            continue
+        message_text, stage = decision
+        try:
+            dm = client.direct_send(message_text, [recipient_id])
+            message_id = getattr(dm, "id", "")
+        except Exception as exc:  # pragma: no cover - depende de SDK externo
+            logger.warning(
+                "No se pudo enviar seguimiento automático a %s desde @%s: %s",
+                recipient_username or recipient_id,
+                user,
+                exc,
+                exc_info=False,
+            )
+            record["last_error"] = str(exc)
+            history[history_key] = record
+            updated = True
+            continue
+        record["count"] = stage
+        record["last_sent_ts"] = now_ts
+        record["last_message_id"] = message_id or ""
+        record.pop("last_error", None)
+        history[history_key] = record
+        updated = True
+        print(
+            style_text(
+                f"[Seguimiento] @{user} → @{recipient_username}: mensaje etapa {stage}",
+                color=Fore.MAGENTA,
+            )
+        )
+    if updated:
+        _set_followup_entry(alias, {"history": history})
+
 _POSITIVE_KEYWORDS = (
     "si",
     "quiero saber mas",
@@ -2271,10 +2878,11 @@ def autoresponder_menu_options() -> List[str]:
         "1) Configurar API Key",
         "2) Configurar System Prompt",
         "3) Activar bot (alias/grupo)",
-        "4) Conectar con GoHighLevel",
-        "5) Conectar con Google Calendar",
-        "6) Desactivar bot",
-        "7) Volver",
+        "4) Seguimiento",
+        "5) Conectar con GoHighLevel",
+        "6) Conectar con Google Calendar",
+        "7) Desactivar bot",
+        "8) Volver",
     ]
 
 
@@ -2296,6 +2904,7 @@ def _print_menu_header() -> None:
     print(f"API Key: {_mask_key(api_key) or '(sin definir)'}")
     print(f"System prompt: {_preview_prompt(prompt)}")
     print(status)
+    print(_followup_summary_line())
     print(_gohighlevel_summary_line())
     print(_google_calendar_summary_line())
     print(full_line(color=Fore.BLUE))
@@ -2995,6 +3604,7 @@ def _activate_bot() -> None:
 
                     try:
                         _process_inbox(client, user, state, api_key, system_prompt, stats)
+                        _process_followups(client, user, api_key)
                     except KeyboardInterrupt:
                         raise
                     except Exception as exc:  # pragma: no cover - depende de SDK/insta
@@ -3050,12 +3660,14 @@ def menu_autoresponder():
         elif choice == "3":
             _activate_bot()
         elif choice == "4":
-            _gohighlevel_menu()
+            _followup_menu()
         elif choice == "5":
-            _google_calendar_menu()
+            _gohighlevel_menu()
         elif choice == "6":
-            _manual_stop()
+            _google_calendar_menu()
         elif choice == "7":
+            _manual_stop()
+        elif choice == "8":
             break
         else:
             warn("Opción inválida.")
