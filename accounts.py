@@ -1908,9 +1908,63 @@ def menu_accounts():
         elif op == "2":
             _import_accounts_from_csv(alias)
         elif op == "3":
-            u = ask("Username a eliminar: ").strip().lstrip("@")
-            remove_account(u)
-            press_enter()
+            if not group:
+                warn("No hay cuentas para eliminar en este alias.")
+                press_enter()
+                continue
+            print("\n¿Querés eliminar una cuenta, varias o todas las del alias?")
+            print("1) Una")
+            print("2) Varias (selección múltiple)")
+            print("3) Todas las del alias")
+            mode = ask("Opción: ").strip() or "1"
+            if mode == "1":
+                u = ask("Username a eliminar: ").strip().lstrip("@")
+                if not u:
+                    warn("No se ingresó username.")
+                else:
+                    remove_account(u)
+                press_enter()
+            elif mode == "2":
+                print("Seleccioná cuentas por número o username (coma separada):")
+                for idx, acct in enumerate(group, start=1):
+                    print(f" {idx}) @{acct['username']}")
+                raw = ask("Selección: ").strip()
+                if not raw:
+                    warn("Sin selección.")
+                    press_enter()
+                    continue
+                chosen = set()
+                for part in raw.split(","):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    if part.isdigit():
+                        idx = int(part)
+                        if 1 <= idx <= len(group):
+                            chosen.add(group[idx - 1]["username"])
+                    else:
+                        chosen.add(part.lstrip("@"))
+                if not chosen:
+                    warn("No se encontraron cuentas con esos datos.")
+                    press_enter()
+                    continue
+                for acct in group:
+                    if acct["username"] in chosen:
+                        remove_account(acct["username"])
+                press_enter()
+            elif mode == "3":
+                confirm = ask(
+                    "¿Confirmás eliminar TODAS las cuentas de este alias? (s/N): "
+                ).strip().lower()
+                if confirm == "s":
+                    for acct in group:
+                        remove_account(acct["username"])
+                else:
+                    warn("Operación cancelada.")
+                press_enter()
+            else:
+                warn("Opción inválida.")
+                press_enter()
         elif op == "4":
             u = ask("Username: ").strip().lstrip("@")
             account = get_account(u)
