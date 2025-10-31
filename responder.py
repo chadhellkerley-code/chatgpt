@@ -1519,6 +1519,18 @@ def _google_calendar_get_scheduled(
     return None, None
 
 
+def _google_calendar_get_scheduled(
+    alias: str, lead: str, phone: str
+) -> Optional[Dict[str, object]]:
+    entry = _get_google_calendar_entry(alias)
+    scheduled = entry.get("scheduled") or {}
+    lead_key = f"{_normalize_lead_id(lead)}|{_normalize_phone(phone)}"
+    data = scheduled.get(lead_key)
+    if isinstance(data, dict):
+        return data
+    return None
+
+
 def _google_calendar_token_is_valid(entry: Dict[str, object]) -> bool:
     expires_at = entry.get("token_expires_at")
     try:
@@ -1890,6 +1902,138 @@ def _google_calendar_create_event(
     if event:
         return event
     return _google_calendar_create_event_via_requests(alias, entry, payload, params, access_token)
+
+
+def _google_calendar_update_event_via_service(
+    alias: str,
+    entry: Dict[str, object],
+    event_id: str,
+    payload: Dict[str, object],
+    params: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    if build is None or Credentials is None:
+        return None
+    creds = _google_calendar_credentials_from_entry(alias, entry)
+    if not creds:
+        return None
+    try:
+        service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "No se pudo inicializar el cliente de Google Calendar para actualizar evento: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    kwargs: Dict[str, object] = {}
+    if params.get("conferenceDataVersion"):
+        kwargs["conferenceDataVersion"] = params["conferenceDataVersion"]
+    try:
+        event = (
+            service.events()  # type: ignore[call-arg]
+            .patch(calendarId="primary", eventId=event_id, body=payload, **kwargs)
+            .execute()
+        )
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "Error al actualizar evento de Google Calendar mediante googleapiclient: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    _google_calendar_update_tokens_from_credentials(alias, entry, creds)
+    if isinstance(event, dict):
+        return event
+    return None
+
+
+def _google_calendar_update_event_via_requests(
+    alias: str,
+    entry: Dict[str, object],
+    event_id: str,
+    payload: Dict[str, object],
+    params: Dict[str, object],
+    access_token: Optional[str],
+) -> Optional[Dict[str, object]]:
+    if requests is None and (Credentials is None or build is None):
+        return None
+    token_value = access_token or entry.get("access_token")
+    if not token_value:
+        return None
+    headers = {
+        "Authorization": f"Bearer {token_value}",
+        "Content-Type": "application/json",
+    }
+    url = f"{_GOOGLE_CALENDAR_BASE}/calendars/primary/events/{event_id}"
+    try:
+        response = requests.patch(  # type: ignore[call-arg]
+            url,
+            headers=headers,
+            json=payload,
+            params=params or None,
+            timeout=20,
+        )
+    except RequestException as exc:  # pragma: no cover - depende de red externa
+        logger.warning(
+            "No se pudo actualizar el evento en Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    if response.status_code == 401:
+        new_token = _google_calendar_refresh_access_token(alias, entry)
+        if not new_token:
+            return None
+        headers["Authorization"] = f"Bearer {new_token}"
+        try:
+            response = requests.patch(  # type: ignore[call-arg]
+                url,
+                headers=headers,
+                json=payload,
+                params=params or None,
+                timeout=20,
+            )
+        except RequestException as exc:  # pragma: no cover - depende de red externa
+            logger.warning(
+                "No se pudo actualizar el evento en Google Calendar tras refrescar token: %s",
+                exc,
+                exc_info=False,
+            )
+            return None
+    if response.status_code not in {200}:  # 200 OK al actualizar
+        if response.status_code == 404:
+            logger.info(
+                "El evento de Google Calendar no existe; se creará uno nuevo. (%s)",
+                event_id,
+            )
+            return None
+        logger.warning(
+            "Respuesta inesperada al actualizar evento de Google Calendar (%s): %s",
+            response.status_code,
+            response.text,
+        )
+        return None
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _google_calendar_update_event(
+    alias: str,
+    entry: Dict[str, object],
+    event_id: str,
+    payload: Dict[str, object],
+    params: Dict[str, object],
+    access_token: Optional[str],
+) -> Optional[Dict[str, object]]:
+    event = _google_calendar_update_event_via_service(alias, entry, event_id, payload, params)
+    if event:
+        return event
+    return _google_calendar_update_event_via_requests(alias, entry, event_id, payload, params, access_token)
 
 
 def _google_calendar_update_event_via_service(
@@ -3047,6 +3191,8 @@ def _google_calendar_menu() -> None:
             _google_calendar_load_credentials_json()
         elif choice == "8":
             break
+        elif choice == "7":
+            _google_calendar_load_credentials_json()
         else:
             warn("Opción inválida.")
             press_enter()
