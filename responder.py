@@ -1502,6 +1502,18 @@ def _google_calendar_candidate_keys(lead: str, phone: str) -> list[str]:
     return ordered
 
 
+def _google_calendar_share_link_from_event_id(event_id: str) -> str:
+    event_id = str(event_id or "").strip()
+    if not event_id:
+        return ""
+    if "@" in event_id:
+        event_id = event_id.split("@", 1)[0]
+    sanitized = re.sub(r"[^A-Za-z0-9_\-]", "", event_id)
+    if not sanitized:
+        return ""
+    return f"https://calendar.app.google/{sanitized}"
+
+
 def _google_calendar_preferred_link(link: Optional[str]) -> str:
     if not link:
         return ""
@@ -1538,7 +1550,10 @@ def _google_calendar_preferred_link(link: Optional[str]) -> str:
         return str(link)
     if any(ch for ch in event_id if ord(ch) < 33):
         return str(link)
-    return f"https://calendar.app.google/{event_id}"
+    share_link = _google_calendar_share_link_from_event_id(event_id)
+    if share_link:
+        return share_link
+    return str(link)
 
 
 def _google_calendar_mark_scheduled(
@@ -3818,6 +3833,7 @@ def _maybe_schedule_google_calendar_event(
     event_id = event.get("id") if isinstance(event, dict) else None
     if not event_id:
         return None
+    share_link = _google_calendar_share_link_from_event_id(event_id)
     event_link = ""
     backup_link = ""
     if isinstance(event, dict):
@@ -3832,6 +3848,10 @@ def _maybe_schedule_google_calendar_event(
                         if isinstance(item, dict) and item.get("uri"):
                             backup_link = str(item["uri"])
                             break
+        if share_link and (
+            not event_link or "calendar.app.google" not in event_link
+        ):
+            event_link = share_link
     if not event_link:
         fetched_event = _google_calendar_fetch_event(
             alias, entry, event_id, access_token
@@ -3841,6 +3861,10 @@ def _maybe_schedule_google_calendar_event(
             event_link = _google_calendar_preferred_link(
                 str(fetched_event.get("htmlLink") or "")
             )
+            if share_link and (
+                not event_link or "calendar.app.google" not in event_link
+            ):
+                event_link = share_link
             if not backup_link:
                 backup_link = str(fetched_event.get("hangoutLink") or "")
                 if not backup_link:
@@ -3856,7 +3880,7 @@ def _maybe_schedule_google_calendar_event(
                                 if isinstance(item, dict) and item.get("uri"):
                                     backup_link = str(item["uri"])
                                     break
-    stored_link = event_link or backup_link or previous_link
+    stored_link = event_link or share_link or backup_link or previous_link
     stored_link = _google_calendar_preferred_link(stored_link)
     _google_calendar_mark_scheduled(
         alias,
