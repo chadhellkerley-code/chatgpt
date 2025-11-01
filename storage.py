@@ -5,11 +5,24 @@ import json
 import re
 import time
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta, time as dtime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional
 
-from zoneinfo import ZoneInfo
+try:  # pragma: no cover - depende de la versión de Python
+    from zoneinfo import ZoneInfo as _BuiltinZoneInfo
+except Exception:  # pragma: no cover - fallback si falta la stdlib
+    _BuiltinZoneInfo = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - depende de dependencia opcional
+    from backports import zoneinfo as _backports_zoneinfo  # type: ignore
+except Exception:  # pragma: no cover - fallback si falta el backport
+    _backports_zoneinfo = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - depende de dependencia opcional
+    from dateutil import tz as _dateutil_tz  # type: ignore
+except Exception:  # pragma: no cover - si falta dateutil
+    _dateutil_tz = None  # type: ignore[assignment]
 
 from config import SETTINGS, read_env_local, update_env_local
 from ui import Fore, banner, full_line, style_text
@@ -28,10 +41,27 @@ EXPORTS = STO / "exports"
 EXPORTS.mkdir(exist_ok=True)
 
 TZ_LABEL = "America/Argentina/Cordoba"
-try:
-    TZ = ZoneInfo(TZ_LABEL)
-except Exception:  # pragma: no cover - fallback si falta la zona
-    TZ = ZoneInfo("UTC")
+
+
+def _load_timezone(label: str):
+    """Obtiene una zona horaria válida sin importar la disponibilidad de zoneinfo."""
+
+    for provider in (_BuiltinZoneInfo, getattr(_backports_zoneinfo, "ZoneInfo", None)):
+        if provider is None:
+            continue
+        try:
+            return provider(label)
+        except Exception:
+            continue
+    if _dateutil_tz is not None:
+        tzinfo = _dateutil_tz.gettz(label)
+        if tzinfo is not None:
+            return tzinfo
+    return timezone.utc
+
+
+TZ = _load_timezone(TZ_LABEL)
+_UTC_TZ = _load_timezone("UTC")
 
 
 def _now_local() -> datetime:
@@ -83,7 +113,7 @@ def _iter_records() -> Iterator[dict]:
             if ts is None:
                 continue
             try:
-                dt = datetime.fromtimestamp(float(ts), tz=ZoneInfo("UTC")).astimezone(TZ)
+                dt = datetime.fromtimestamp(float(ts), tz=_UTC_TZ).astimezone(TZ)
             except Exception:
                 continue
             obj["local_dt"] = dt
@@ -122,7 +152,7 @@ def _iter_conversation_events() -> Iterator[dict]:
             if ts is None:
                 continue
             try:
-                dt = datetime.fromtimestamp(float(ts), tz=ZoneInfo("UTC")).astimezone(TZ)
+                dt = datetime.fromtimestamp(float(ts), tz=_UTC_TZ).astimezone(TZ)
             except Exception:
                 continue
             obj["local_dt"] = dt
@@ -218,7 +248,7 @@ def purge_conversations_before(cutoff: datetime) -> int:
         return 0
 
     try:
-        cutoff_utc = cutoff.astimezone(ZoneInfo("UTC"))
+        cutoff_utc = cutoff.astimezone(_UTC_TZ)
     except Exception:
         cutoff_utc = cutoff
 
@@ -238,7 +268,7 @@ def purge_conversations_before(cutoff: datetime) -> int:
             kept_lines.append(raw)
             continue
         try:
-            dt_utc = datetime.fromtimestamp(float(ts), tz=ZoneInfo("UTC"))
+            dt_utc = datetime.fromtimestamp(float(ts), tz=_UTC_TZ)
         except Exception:
             kept_lines.append(raw)
             continue
@@ -366,7 +396,7 @@ def _print_records(records: Iterable[dict], limit: int | None = None) -> None:
     for obj in records:
         if limit is not None and shown >= limit:
             break
-        ts = obj.get("local_dt") or datetime.fromtimestamp(obj.get("ts", 0), tz=ZoneInfo("UTC")).astimezone(TZ)
+        ts = obj.get("local_dt") or datetime.fromtimestamp(obj.get("ts", 0), tz=_UTC_TZ).astimezone(TZ)
         status = "OK" if obj.get("ok") else "ERROR"
         detail = obj.get("detail", "")
         timestamp = ts.strftime("%Y-%m-%d %H:%M:%S")
@@ -443,7 +473,7 @@ def _export_csv(records: list[dict]) -> None:
     with path.open("w", encoding="utf-8") as fh:
         fh.write("timestamp,account,to,status,detail\n")
         for rec in records:
-            ts = rec.get("local_dt") or datetime.fromtimestamp(rec.get("ts", 0), tz=ZoneInfo("UTC")).astimezone(TZ)
+            ts = rec.get("local_dt") or datetime.fromtimestamp(rec.get("ts", 0), tz=_UTC_TZ).astimezone(TZ)
             status = "OK" if rec.get("ok") else "ERROR"
             detail = str(rec.get("detail", "")).replace("\n", " ").replace(",", " ")
             fh.write(

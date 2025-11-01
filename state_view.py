@@ -8,10 +8,24 @@ import csv
 import math
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
-from zoneinfo import ZoneInfo
+
+try:  # pragma: no cover - depende de la versión de Python
+    from zoneinfo import ZoneInfo as _BuiltinZoneInfo
+except Exception:  # pragma: no cover - fallback si falta la stdlib
+    _BuiltinZoneInfo = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - depende de dependencia opcional
+    from backports.zoneinfo import ZoneInfo as _BackportZoneInfo  # type: ignore
+except Exception:  # pragma: no cover - fallback si falta el backport
+    _BackportZoneInfo = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - depende de dependencia opcional
+    from dateutil import tz as _dateutil_tz  # type: ignore
+except Exception:  # pragma: no cover - si falta dateutil
+    _dateutil_tz = None  # type: ignore[assignment]
 
 from accounts import has_valid_session_settings, list_all, mark_connected
 from proxy_manager import apply_proxy_to_client, record_proxy_failure, should_retry_proxy
@@ -290,7 +304,24 @@ def _contains_any(text: str, keywords: Iterable[str]) -> bool:
     return False
 
 
-_UTC = ZoneInfo("UTC")
+
+
+def _load_timezone(label: str):
+    for provider in (_BuiltinZoneInfo, _BackportZoneInfo):
+        if provider is None:
+            continue
+        try:
+            return provider(label)
+        except Exception:
+            continue
+    if _dateutil_tz is not None:
+        tzinfo = _dateutil_tz.gettz(label)
+        if tzinfo is not None:
+            return tzinfo
+    return timezone.utc
+
+
+_UTC = _load_timezone("UTC")
 
 
 def _to_local(dt: Optional[datetime]) -> datetime:

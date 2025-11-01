@@ -9,9 +9,23 @@ import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime, timedelta, time as dt_time, timezone
 from typing import Callable, Dict, Optional
-from zoneinfo import ZoneInfo
+
+try:  # pragma: no cover - depende de la versión de Python
+    from zoneinfo import ZoneInfo as _BuiltinZoneInfo
+except Exception:  # pragma: no cover - fallback si falta la stdlib
+    _BuiltinZoneInfo = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - depende de dependencia opcional
+    from backports.zoneinfo import ZoneInfo as _BackportZoneInfo  # type: ignore
+except Exception:  # pragma: no cover - fallback si falta el backport
+    _BackportZoneInfo = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - depende de dependencia opcional
+    from dateutil import tz as _dateutil_tz  # type: ignore
+except Exception:  # pragma: no cover - si falta dateutil
+    _dateutil_tz = None  # type: ignore[assignment]
 
 from accounts import (
     auto_login_with_saved_password,
@@ -53,7 +67,23 @@ class SendEvent:
 _LIVE_COUNTS = {"base_ok": 0, "base_fail": 0, "run_ok": 0, "run_fail": 0}
 _LIVE_LOCK = threading.Lock()
 
-AR_TZ = ZoneInfo("America/Argentina/Cordoba")
+
+def _load_timezone(label: str):
+    for provider in (_BuiltinZoneInfo, _BackportZoneInfo):
+        if provider is None:
+            continue
+        try:
+            return provider(label)
+        except Exception:
+            continue
+    if _dateutil_tz is not None:
+        tzinfo = _dateutil_tz.gettz(label)
+        if tzinfo is not None:
+            return tzinfo
+    return timezone.utc
+
+
+AR_TZ = _load_timezone("America/Argentina/Cordoba")
 
 
 def today_ar():
