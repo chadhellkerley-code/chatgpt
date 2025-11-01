@@ -8,12 +8,26 @@ import csv
 import math
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
-from zoneinfo import ZoneInfo
 
-from accounts import list_all, mark_connected
+try:  # pragma: no cover - depende de la versión de Python
+    from zoneinfo import ZoneInfo as _BuiltinZoneInfo
+except Exception:  # pragma: no cover - fallback si falta la stdlib
+    _BuiltinZoneInfo = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - depende de dependencia opcional
+    from backports.zoneinfo import ZoneInfo as _BackportZoneInfo  # type: ignore
+except Exception:  # pragma: no cover - fallback si falta el backport
+    _BackportZoneInfo = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - depende de dependencia opcional
+    from dateutil import tz as _dateutil_tz  # type: ignore
+except Exception:  # pragma: no cover - si falta dateutil
+    _dateutil_tz = None  # type: ignore[assignment]
+
+from accounts import has_valid_session_settings, list_all, mark_connected
 from proxy_manager import apply_proxy_to_client, record_proxy_failure, should_retry_proxy
 from session_store import has_session, load_into
 from storage import TZ
@@ -290,7 +304,24 @@ def _contains_any(text: str, keywords: Iterable[str]) -> bool:
     return False
 
 
-_UTC = ZoneInfo("UTC")
+
+
+def _load_timezone(label: str):
+    for provider in (_BuiltinZoneInfo, _BackportZoneInfo):
+        if provider is None:
+            continue
+        try:
+            return provider(label)
+        except Exception:
+            continue
+    if _dateutil_tz is not None:
+        tzinfo = _dateutil_tz.gettz(label)
+        if tzinfo is not None:
+            return tzinfo
+    return timezone.utc
+
+
+_UTC = _load_timezone("UTC")
 
 
 def _to_local(dt: Optional[datetime]) -> datetime:
@@ -500,14 +531,13 @@ def _client_for(account_record: Dict) -> Optional:
         mark_connected(username, False)
         raise
 
-    try:
-        cl.get_timeline_feed()
-        mark_connected(username, True)
-    except Exception as exc:
-        if binding and should_retry_proxy(exc):
-            record_proxy_failure(username, exc)
+    if not has_valid_session_settings(cl):
         mark_connected(username, False)
-        raise
+        raise RuntimeError(
+            f"La sesión guardada para @{username} no contiene credenciales activas. Iniciá sesión nuevamente."
+        )
+
+    mark_connected(username, True)
     return cl
 
 
@@ -600,12 +630,13 @@ def _print_table(rows: list[tuple[str, str, str, str]], page: int) -> tuple[int,
     page_rows = rows[start:end]
 
     headers = ("Fecha y hora", "Emisor", "Receptor", "Estado")
-    widths = [17, 22, 22, 18]
+    widths = [17, 22, 22, 44]
+    total_width = sum(widths) + 3 * (len(widths) - 1)
 
-    print("\n" + "=" * 72)
+    print("\n" + "=" * total_width)
     header_line = " | ".join(_truncate(h, w) for h, w in zip(headers, widths))
     print(header_line)
-    print("-" * 72)
+    print("-" * total_width)
 
     if not page_rows:
         print("(Sin conversaciones registradas)")
@@ -613,7 +644,7 @@ def _print_table(rows: list[tuple[str, str, str, str]], page: int) -> tuple[int,
         for row in page_rows:
             print(" | ".join(_truncate(cell, width) for cell, width in zip(row, widths)))
 
-    print("-" * 72)
+    print("-" * total_width)
     print(f"Página {page + 1} de {total_pages}  (Total: {total})")
     return total_pages, page
 
