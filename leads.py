@@ -1,6 +1,7 @@
 # leads.py
 # -*- coding: utf-8 -*-
 import csv
+import logging
 import os
 import random
 import shutil
@@ -294,6 +295,12 @@ def _client_for_scraping(username: str):
 
     account = get_account(username)
     cl = Client()
+    try:
+        cl.logger.setLevel(logging.WARNING)
+        for handler in list(cl.logger.handlers):
+            handler.setLevel(logging.WARNING)
+    except Exception:
+        pass
     binding = None
     try:
         binding = apply_proxy_to_client(cl, username, account, reason="lead-scraper")
@@ -496,7 +503,13 @@ class ScrapeProgress:
     def _clear_screen(self) -> None:
         if not self._is_tty:
             return
-        print("\033[2J\033[H", end="", flush=True)
+        try:
+            if os.name == "nt":
+                os.system("cls")
+            else:
+                print("\033c", end="", flush=True)
+        except Exception:
+            print("\033[2J\033[H", end="", flush=True)
 
 
 class _KeyPressMonitor:
