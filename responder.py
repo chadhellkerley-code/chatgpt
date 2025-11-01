@@ -1,6 +1,9 @@
+import base64
 import json
 import logging
 import re
+import subprocess
+import sys
 import time
 import unicodedata
 import uuid
@@ -10,8 +13,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, time as dt_time, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
+from urllib.parse import parse_qs, urlparse
 
-from accounts import get_account, list_all, mark_connected, prompt_login
+from accounts import (
+    auto_login_with_saved_password,
+    get_account,
+    has_valid_session_settings,
+    list_all,
+    mark_connected,
+    prompt_login,
+)
 from config import (
     SETTINGS,
     read_app_config,
@@ -34,12 +45,20 @@ from session_store import has_session, load_into
 from storage import get_auto_state, log_conversation_status, save_auto_state
 from ui import Fore, full_line, style_text
 from utils import ask, ask_int, banner, ok, press_enter, warn
-from zoneinfo import ZoneInfo
+try:  # pragma: no cover - compatibilidad con versiones antiguas de Python
+    from zoneinfo import ZoneInfo  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - fallback para entornos sin zoneinfo
+    try:
+        from backports.zoneinfo import ZoneInfo  # type: ignore
+    except Exception:  # pragma: no cover - sin soporte de zoneinfo
+        ZoneInfo = None  # type: ignore[misc,assignment]
 
 try:  # pragma: no cover - depende de dependencia opcional
     from dateutil import parser as date_parser
+    from dateutil import tz as dateutil_tz
 except Exception:  # pragma: no cover - fallback si falta dependencia
     date_parser = None  # type: ignore[assignment]
+    dateutil_tz = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - depende de dependencia opcional
     import requests
@@ -56,6 +75,11 @@ except Exception:  # pragma: no cover - si faltan dependencias opcionales
     Credentials = None  # type: ignore
     build = None  # type: ignore
     GoogleAuthRequest = None  # type: ignore
+
+try:  # pragma: no cover - depende de dependencias opcionales
+    from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore
+except Exception:  # pragma: no cover - si falta dependencia opcional
+    InstalledAppFlow = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +103,13 @@ _GOHIGHLEVEL_BASE = "https://rest.gohighlevel.com/v1"
 _PHONE_PATTERN = re.compile(r"(?<!\d)(?:\+?\d[\d\s().-]{7,}\d)")
 _EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
 _GOHIGHLEVEL_STATE: Dict[str, dict] | None = None
+_DEFAULT_GOHIGHLEVEL_PROMPT = (
+    "Sos un asistente que evalúa conversaciones de Instagram y determina si un lead está "
+    "calificado para enviarse automáticamente al CRM GoHighLevel. Respondé únicamente "
+    "con 'SI' cuando corresponda enviarlo y 'NO' cuando no cumpla con los criterios. "
+    "Considerá el contexto, el interés real del lead y si el equipo comercial debería "
+    "contactarlo."
+)
 
 _PROMPT_STORAGE_DIR = runtime_base(Path(__file__).resolve().parent) / "data" / "autoresponder"
 _PROMPT_DEFAULT_ALIAS = "default"
@@ -141,7 +172,9 @@ _GOOGLE_DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code"
 _GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 _GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 _GOOGLE_CALENDAR_BASE = "https://www.googleapis.com/calendar/v3"
-_GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+_GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar"
+_DEFAULT_GOOGLE_CALENDAR_PROMPT = ""
+_GOOGLE_REDIRECT_URI = "http://localhost"
 _GOOGLE_STATE: Dict[str, dict] | None = None
 _MEETING_TIME_PATTERN = re.compile(
     r"(?P<hour>\b[01]?\d|2[0-3])(?:(?:[:h\.])(?P<minute>[0-5]\d))?\s*(?P<ampm>am|pm)?\s*(?P<label>hs|hrs|horas)?",
@@ -184,7 +217,7 @@ _GOOGLE_DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code"
 _GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 _GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 _GOOGLE_CALENDAR_BASE = "https://www.googleapis.com/calendar/v3"
-_GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+_GOOGLE_SCOPE = "https://www.googleapis.com/auth/calendar"
 _GOOGLE_STATE: Dict[str, dict] | None = None
 _MEETING_TIME_PATTERN = re.compile(
     r"(?P<hour>\b[01]?\d|2[0-3])(?:(?:[:h\.])(?P<minute>[0-5]\d))?\s*(?P<ampm>am|pm)?\s*(?P<label>hs|hrs|horas)?",
@@ -210,6 +243,613 @@ _WEEKDAY_KEYWORDS = {
     "sábado": 5,
     "domingo": 6,
 }
+
+_FOLLOWUP_FILE = (
+    runtime_base(Path(__file__).resolve().parent) / "storage" / "followups.json"
+)
+_FOLLOWUP_STATE: Dict[str, dict] | None = None
+_DEFAULT_FOLLOWUP_PROMPT = (
+    "Diseñá un plan de seguimiento amable para leads de Instagram. "
+    "Enviá el primer recordatorio cuando hayan pasado al menos 6 horas sin respuesta. "
+    "Si después de 12 horas más no responden, enviá un segundo y último mensaje. "
+    "No envíes más de dos seguimientos y evitá sonar insistente."
+)
+_FOLLOWUP_MIN_INTERVAL = 300
+_FOLLOWUP_HISTORY_MAX_AGE = 14 * 24 * 3600
+
+
+def _normalize_username(value: str) -> str:
+    return value.strip().lstrip("@").lower()
+
+
+def _read_followup_state(refresh: bool = False) -> Dict[str, dict]:
+    global _FOLLOWUP_STATE
+    if refresh or _FOLLOWUP_STATE is None:
+        data: Dict[str, dict] = {"aliases": {}}
+        if _FOLLOWUP_FILE.exists():
+            try:
+                loaded = json.loads(_FOLLOWUP_FILE.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data.update(loaded)
+            except Exception:
+                data = {"aliases": {}}
+        aliases = data.get("aliases")
+        if not isinstance(aliases, dict):
+            data["aliases"] = {}
+        _FOLLOWUP_STATE = data
+    return _FOLLOWUP_STATE
+
+
+def _write_followup_state(state: Dict[str, dict]) -> None:
+    state.setdefault("aliases", {})
+    _FOLLOWUP_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _FOLLOWUP_FILE.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    _read_followup_state(refresh=True)
+
+
+def _followup_prune_history(history: Dict[str, dict]) -> Dict[str, dict]:
+    now = time.time()
+    cleaned: Dict[str, dict] = {}
+    for key, record in history.items():
+        if not isinstance(record, dict):
+            continue
+        last_ts = record.get("last_sent_ts") or record.get("last_eval_ts")
+        try:
+            ts_value = float(last_ts)
+        except Exception:
+            ts_value = 0.0
+        if ts_value and now - ts_value > _FOLLOWUP_HISTORY_MAX_AGE:
+            continue
+        cleaned[key] = record
+    return cleaned
+
+
+def _get_followup_entry(alias: str) -> Dict[str, object]:
+    state = _read_followup_state()
+    key = _normalize_alias_key(alias)
+    aliases: Dict[str, dict] = state.get("aliases", {})
+    entry = aliases.get(key)
+    if not isinstance(entry, dict):
+        return {}
+    entry.setdefault("alias", alias.strip() or alias)
+    entry.setdefault("enabled", False)
+    entry.setdefault("accounts", [])
+    entry.setdefault("prompt", _DEFAULT_FOLLOWUP_PROMPT)
+    entry.setdefault("history", {})
+    history = entry.get("history")
+    if isinstance(history, dict):
+        entry["history"] = _followup_prune_history(history)
+    return entry
+
+
+def _set_followup_entry(alias: str, updates: Dict[str, object]) -> None:
+    alias = alias.strip()
+    if not alias:
+        warn("Alias inválido.")
+        return
+    state = _read_followup_state()
+    aliases: Dict[str, dict] = state.setdefault("aliases", {})
+    key = _normalize_alias_key(alias)
+    entry = aliases.get(key, {})
+    entry.setdefault("alias", alias)
+    entry.setdefault("prompt", _DEFAULT_FOLLOWUP_PROMPT)
+    normalized_updates: Dict[str, object] = {}
+    for key_name, value in updates.items():
+        if key_name == "accounts":
+            normalized: List[str] = []
+            if isinstance(value, (list, tuple, set)):
+                seen: set[str] = set()
+                for raw in value:
+                    if not isinstance(raw, str):
+                        continue
+                    norm = _normalize_username(raw)
+                    if norm and norm not in seen:
+                        seen.add(norm)
+                        normalized.append(norm)
+            elif isinstance(value, str):
+                norm = _normalize_username(value)
+                if norm:
+                    normalized = [norm]
+            normalized_updates[key_name] = normalized
+        elif key_name == "enabled":
+            normalized_updates[key_name] = bool(value)
+        elif key_name == "prompt":
+            normalized_updates[key_name] = str(value or "")
+        elif key_name == "history":
+            if isinstance(value, dict):
+                normalized_updates[key_name] = _followup_prune_history(value)
+        else:
+            normalized_updates[key_name] = value
+    entry.update(normalized_updates)
+    aliases[key] = entry
+    _write_followup_state(state)
+
+
+def _followup_status_lines() -> List[str]:
+    state = _read_followup_state()
+    aliases: Dict[str, dict] = state.get("aliases", {})
+    if not aliases:
+        return ["(sin configuraciones)"]
+    rows: List[str] = []
+    for key in sorted(aliases.keys()):
+        entry = aliases[key]
+        if not isinstance(entry, dict):
+            continue
+        alias_label = str(entry.get("alias") or key)
+        enabled = bool(entry.get("enabled"))
+        accounts = entry.get("accounts") or []
+        if accounts:
+            preview_accounts = [f"@{acc}" for acc in accounts[:3]]
+            if len(accounts) > 3:
+                preview_accounts.append(f"+{len(accounts) - 3}")
+            accounts_label = ", ".join(preview_accounts)
+        else:
+            accounts_label = "todas las cuentas del alias"
+        prompt_preview = _preview_prompt(str(entry.get("prompt") or ""))
+        status_label = "Activo" if enabled else "Inactivo"
+        rows.append(
+            f" - {alias_label}: {status_label} • Cuentas: {accounts_label} • Prompt: {prompt_preview}"
+        )
+    return rows
+
+
+def _followup_summary_line() -> str:
+    state = _read_followup_state()
+    aliases: Dict[str, dict] = state.get("aliases", {})
+    active = [
+        str(entry.get("alias") or key)
+        for key, entry in aliases.items()
+        if isinstance(entry, dict) and entry.get("enabled")
+    ]
+    if not active:
+        return "Seguimiento: (sin configurar)"
+    return f"Seguimiento: activo para {', '.join(sorted(active))}"
+
+
+def _followup_accounts_for_alias(alias: str) -> List[str]:
+    targets = _choose_targets(alias)
+    normalized = {_normalize_username(user) for user in targets}
+    return sorted(account for account in normalized if account)
+
+
+def _followup_enabled_entry_for(username: str) -> tuple[Optional[str], Dict[str, object]]:
+    alias_candidates: List[str] = []
+    if ACTIVE_ALIAS:
+        alias_candidates.append(ACTIVE_ALIAS)
+    account_data = get_account(username) or {}
+    account_alias = str(account_data.get("alias") or "").strip()
+    if account_alias:
+        alias_candidates.append(account_alias)
+    alias_candidates.append(username)
+    alias_candidates.append("ALL")
+
+    seen: set[str] = set()
+    for alias in alias_candidates:
+        norm = _normalize_alias_key(alias)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        entry = _get_followup_entry(alias)
+        if not entry or not entry.get("enabled"):
+            continue
+        accounts = entry.get("accounts") or []
+        if accounts:
+            norm_user = _normalize_username(username)
+            if norm_user not in accounts:
+                continue
+        return alias, entry
+    return None, {}
+
+
+def _followup_configure_accounts() -> None:
+    banner()
+    print(style_text("Seguimiento automático • Cuentas", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.BLUE))
+    for line in _followup_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _prompt_alias_selection()
+    if not alias:
+        return
+    available = _followup_accounts_for_alias(alias)
+    if not available:
+        warn("No se encontraron cuentas activas para ese alias.")
+        press_enter()
+        return
+    entry = _get_followup_entry(alias)
+    stored_accounts = set(entry.get("accounts") or [])
+    use_all = entry.get("enabled") and not stored_accounts
+    print("Seleccioná las cuentas que usarán seguimiento automático:")
+    for idx, account in enumerate(available, start=1):
+        selected = use_all or account in stored_accounts
+        marker = "[x]" if selected else "[ ]"
+        print(f" {idx:>2}) {marker} @{account}")
+    print("  0) Todas las cuentas del alias")
+    choice = ask(
+        "Números separados por coma (vacío cancela, 0 = todas): "
+    ).strip()
+    if not choice:
+        warn("No se realizaron cambios.")
+        press_enter()
+        return
+    if choice.lower() in {"0", "todas", "all"}:
+        _set_followup_entry(alias, {"accounts": [], "enabled": True})
+        ok("Seguimiento habilitado para todas las cuentas del alias.")
+        press_enter()
+        return
+    tokens = re.split(r"[\s,;]+", choice)
+    indices: List[int] = []
+    for token in tokens:
+        if not token:
+            continue
+        if not token.isdigit():
+            continue
+        idx = int(token)
+        if 1 <= idx <= len(available):
+            if idx not in indices:
+                indices.append(idx)
+    if not indices:
+        warn("No se seleccionaron cuentas válidas.")
+        press_enter()
+        return
+    selected_accounts = [available[i - 1] for i in indices]
+    _set_followup_entry(alias, {"accounts": selected_accounts, "enabled": True})
+    ok(f"Seguimiento habilitado para {len(selected_accounts)} cuentas.")
+    press_enter()
+
+
+def _followup_configure_prompt() -> None:
+    banner()
+    print(style_text("Seguimiento automático • Prompt", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.BLUE))
+    for line in _followup_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _prompt_alias_selection()
+    if not alias:
+        return
+    entry = _get_followup_entry(alias)
+    current_prompt = str(entry.get("prompt") or _DEFAULT_FOLLOWUP_PROMPT)
+    print(style_text("Prompt actual:", color=Fore.BLUE))
+    print(current_prompt.strip() or "(sin definir)")
+    print(full_line(color=Fore.BLUE))
+    print("Elegí una opción:")
+    print("  E) Editar prompt")
+    print("  D) Restaurar valor predeterminado")
+    print("  Enter) Cancelar")
+    action = ask("Acción: ").strip().lower()
+    if not action:
+        warn("No se realizaron cambios.")
+        press_enter()
+        return
+    if action in {"d", "default", "predeterminado"}:
+        _set_followup_entry(alias, {"prompt": _DEFAULT_FOLLOWUP_PROMPT})
+        ok("Se restauró el prompt predeterminado de seguimiento.")
+        press_enter()
+        return
+    if action not in {"e", "editar"}:
+        warn("Opción inválida.")
+        press_enter()
+        return
+    print(
+        style_text(
+            "Pegá el nuevo prompt y finalizá con una línea que diga <<<END>>>.",
+            color=Fore.CYAN,
+        )
+    )
+    lines: List[str] = []
+    while True:
+        line = ask("› ")
+        if line.strip() == "<<<END>>>":
+            break
+        lines.append(line.replace("\r", ""))
+    new_prompt = "\n".join(lines).strip()
+    _set_followup_entry(alias, {"prompt": new_prompt})
+    if new_prompt:
+        ok(f"Prompt actualizado. Longitud: {len(new_prompt)} caracteres.")
+    else:
+        ok("Se eliminó el prompt personalizado. Se usará el valor predeterminado.")
+    press_enter()
+
+
+def _followup_disable() -> None:
+    banner()
+    print(style_text("Seguimiento automático • Desactivar", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.BLUE))
+    for line in _followup_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _prompt_alias_selection()
+    if not alias:
+        return
+    entry = _get_followup_entry(alias)
+    if not entry or not entry.get("enabled"):
+        warn("El seguimiento ya está inactivo para ese alias.")
+        press_enter()
+        return
+    _set_followup_entry(alias, {"enabled": False, "history": {}})
+    ok("Seguimiento desactivado para ese alias.")
+    press_enter()
+
+
+def _followup_menu() -> None:
+    while True:
+        banner()
+        print(style_text("Seguimiento automático", color=Fore.CYAN, bold=True))
+        print(full_line(color=Fore.BLUE))
+        for line in _followup_status_lines():
+            print(line)
+        print(full_line(color=Fore.BLUE))
+        print("1) Configurar cuentas con seguimiento")
+        print("2) Configurar prompt de seguimiento")
+        print("3) Desactivar seguimiento para un alias")
+        print("4) Volver")
+        choice = ask("Opción: ").strip()
+        if choice == "1":
+            _followup_configure_accounts()
+        elif choice == "2":
+            _followup_configure_prompt()
+        elif choice == "3":
+            _followup_disable()
+        elif choice == "4":
+            break
+        else:
+            warn("Opción inválida.")
+            press_enter()
+
+
+def _followup_decision(
+    api_key: str,
+    prompt_text: str,
+    conversation: str,
+    metadata: Dict[str, object],
+) -> Optional[tuple[str, int]]:
+    prompt_text = prompt_text.strip()
+    if not prompt_text or not api_key:
+        return None
+    try:  # pragma: no cover - depende de dependencia externa
+        from openai import OpenAI
+    except Exception as exc:
+        logger.warning(
+            "No se pudo importar OpenAI para seguimiento: %s", exc, exc_info=False
+        )
+        return None
+    try:  # pragma: no cover - depende de credenciales externas
+        client = OpenAI(api_key=api_key)
+    except Exception as exc:
+        logger.warning(
+            "No se pudo inicializar OpenAI para seguimiento: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+
+    system_prompt = (
+        "Sos un asistente que decide si enviar un mensaje de seguimiento en Instagram. "
+        "Debés seguir estrictamente las reglas provistas y responder SOLO con un objeto "
+        "JSON con las claves 'enviar' (booleano), 'mensaje' (texto) y 'etapa' (número entero). "
+        "Si no corresponde enviar, devolvé enviar=false, mensaje=\"\" y usá la etapa actual."
+    )
+    context_lines = ["Prompt de seguimiento personalizado:", prompt_text, "", "Contexto:"]
+    for key, value in metadata.items():
+        context_lines.append(f"- {key}: {value}")
+    context_lines.append("")
+    context_lines.append("Conversación completa (orden cronológico):")
+    context_lines.append(conversation)
+    user_content = "\n".join(context_lines)
+
+    try:  # pragma: no cover - depende de red externa
+        response = client.responses.create(
+            model="gpt-4o-mini",
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0.2,
+            max_output_tokens=240,
+        )
+        raw_text = (response.output_text or "").strip()
+    except Exception as exc:
+        logger.warning(
+            "No se pudo evaluar el seguimiento con OpenAI: %s", exc, exc_info=False
+        )
+        return None
+    if not raw_text:
+        return None
+    data: Optional[dict] = None
+    try:
+        data = json.loads(raw_text)
+    except Exception:
+        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+            except Exception:
+                data = None
+    if not isinstance(data, dict):
+        return None
+    enviar = data.get("enviar")
+    if isinstance(enviar, str):
+        enviar = enviar.strip().lower() in {"true", "1", "si", "sí", "yes"}
+    if not enviar:
+        return None
+    message = str(data.get("mensaje") or "").strip()
+    if not message:
+        return None
+    etapa_value = data.get("etapa")
+    try:
+        etapa_int = int(etapa_value)
+    except Exception:
+        etapa_int = int(metadata.get("seguimientos_previos", 0)) + 1
+    etapa_int = max(1, etapa_int)
+    return message, etapa_int
+
+
+def _process_followups(client, user: str, api_key: str) -> None:
+    alias, entry = _followup_enabled_entry_for(user)
+    if not alias or not entry or not entry.get("enabled"):
+        return
+    prompt_text = str(entry.get("prompt") or _DEFAULT_FOLLOWUP_PROMPT)
+    if not prompt_text.strip():
+        return
+    history_source = entry.get("history")
+    history: Dict[str, dict] = dict(history_source) if isinstance(history_source, dict) else {}
+    try:
+        threads = client.direct_threads(amount=15)
+    except Exception as exc:  # pragma: no cover - depende de SDK externo
+        logger.debug(
+            "No se pudieron obtener hilos para seguimiento de @%s: %s",
+            user,
+            exc,
+            exc_info=False,
+        )
+        return
+    now_ts = time.time()
+    account_norm = _normalize_username(user)
+    updated = False
+    for thread in threads:
+        if STOP_EVENT.is_set():
+            break
+        thread_id = getattr(thread, "id", None)
+        if not thread_id:
+            continue
+        unread_count = getattr(thread, "unread_count", None)
+        try:
+            unread_int = int(unread_count)
+        except Exception:
+            unread_int = 0
+        if unread_int > 0:
+            continue
+        participants = getattr(thread, "users", None)
+        recipient_id: Optional[int] = None
+        recipient_username = ""
+        if isinstance(participants, list):
+            for participant in participants:
+                pk = getattr(participant, "pk", None)
+                if pk and pk != client.user_id:
+                    recipient_id = pk
+                    recipient_username = getattr(participant, "username", str(pk))
+                    break
+        if not recipient_id:
+            continue
+        try:
+            messages = client.direct_messages(thread_id, amount=20)
+        except Exception as exc:  # pragma: no cover - depende de SDK externo
+            logger.debug(
+                "No se pudieron obtener mensajes del hilo %s para seguimiento: %s",
+                thread_id,
+                exc,
+                exc_info=False,
+            )
+            continue
+        if not messages:
+            continue
+        last_message = messages[0]
+        if last_message.user_id != client.user_id:
+            continue
+
+        def _msg_ts(msg: object) -> Optional[float]:
+            ts_obj = getattr(msg, "timestamp", None)
+            if isinstance(ts_obj, datetime):
+                return ts_obj.timestamp()
+            try:
+                return float(ts_obj)
+            except Exception:
+                return None
+
+        last_outbound_ts = _msg_ts(last_message)
+        if last_outbound_ts and now_ts - last_outbound_ts < 60:
+            continue
+
+        inbound_messages = [
+            msg
+            for msg in messages
+            if msg.user_id != client.user_id and isinstance(getattr(msg, "text", None), str)
+        ]
+        if not inbound_messages:
+            continue
+        last_inbound = inbound_messages[0]
+        last_inbound_ts = _msg_ts(last_inbound)
+        if last_inbound_ts and now_ts - last_inbound_ts < 60:
+            continue
+
+        history_key = f"{account_norm}|{thread_id}"
+        record = history.get(history_key, {})
+        last_eval_ts = record.get("last_eval_ts")
+        try:
+            last_eval_float = float(last_eval_ts)
+        except Exception:
+            last_eval_float = 0.0
+        if now_ts - last_eval_float < _FOLLOWUP_MIN_INTERVAL:
+            continue
+
+        followups_sent = int(record.get("count", 0) or 0)
+        last_followup_ts = record.get("last_sent_ts")
+        try:
+            last_followup_float = float(last_followup_ts)
+        except Exception:
+            last_followup_float = 0.0
+
+        conversation_lines: List[str] = []
+        for msg in reversed(messages[:40]):
+            text = getattr(msg, "text", "") or ""
+            prefix = "YO" if msg.user_id == client.user_id else "ELLOS"
+            conversation_lines.append(f"{prefix}: {text}")
+        conversation_text = "\n".join(conversation_lines[-40:])
+
+        metadata = {
+            "alias": alias,
+            "cuenta_origen": f"@{user}",
+            "lead": recipient_username or str(recipient_id),
+            "seguimientos_previos": followups_sent,
+            "segundos_desde_ultimo_seguimiento": int(now_ts - last_followup_float)
+            if last_followup_float
+            else "nunca",
+            "segundos_desde_ultima_respuesta": int(now_ts - last_inbound_ts)
+            if last_inbound_ts
+            else "desconocido",
+            "segundos_desde_ultimo_mensaje_enviado": int(now_ts - last_outbound_ts)
+            if last_outbound_ts
+            else "desconocido",
+        }
+        decision = _followup_decision(api_key, prompt_text, conversation_text, metadata)
+        record["last_eval_ts"] = now_ts
+        if not decision:
+            history[history_key] = record
+            updated = True
+            continue
+        message_text, stage = decision
+        try:
+            dm = client.direct_send(message_text, [recipient_id])
+            message_id = getattr(dm, "id", "")
+        except Exception as exc:  # pragma: no cover - depende de SDK externo
+            logger.warning(
+                "No se pudo enviar seguimiento automático a %s desde @%s: %s",
+                recipient_username or recipient_id,
+                user,
+                exc,
+                exc_info=False,
+            )
+            record["last_error"] = str(exc)
+            history[history_key] = record
+            updated = True
+            continue
+        record["count"] = stage
+        record["last_sent_ts"] = now_ts
+        record["last_message_id"] = message_id or ""
+        record.pop("last_error", None)
+        history[history_key] = record
+        updated = True
+        print(
+            style_text(
+                f"[Seguimiento] @{user} → @{recipient_username}: mensaje etapa {stage}",
+                color=Fore.MAGENTA,
+            )
+        )
+    if updated:
+        _set_followup_entry(alias, {"history": history})
 
 _POSITIVE_KEYWORDS = (
     "si",
@@ -272,23 +912,37 @@ def _default_timezone_label() -> str:
     return "UTC"
 
 
-def _safe_timezone(label: str) -> ZoneInfo:
-    try:
-        return ZoneInfo(label)
-    except Exception:
+def _safe_timezone(label: str):
+    if ZoneInfo is not None:
         try:
-            return ZoneInfo(_default_timezone_label())
+            return ZoneInfo(label)
         except Exception:
-            return ZoneInfo("UTC")
+            try:
+                return ZoneInfo(_default_timezone_label())
+            except Exception:
+                try:
+                    return ZoneInfo("UTC")
+                except Exception:
+                    pass
+    if dateutil_tz is not None:  # pragma: no cover - depende de dateutil
+        for candidate in (label, _default_timezone_label(), "UTC"):
+            tzinfo = dateutil_tz.gettz(candidate)
+            if tzinfo is not None:
+                return tzinfo
+    return timezone.utc
 
 
-def _print_response_summary(index: int, sender: str, recipient: str, success: bool) -> None:
+def _print_response_summary(
+    index: int, sender: str, recipient: str, success: bool, extra: Optional[str] = None
+) -> None:
     icon = "✔️" if success else "❌"
     status = "OK" if success else "ERROR"
     print(
         f"[{icon}] Respuesta {index} | Emisor: {_format_handle(sender)} | "
         f"Receptor: {_format_handle(recipient)} | Estado: {status}"
     )
+    if extra:
+        print(style_text(extra, color=Fore.GREEN, bold=True))
 
 
 @contextmanager
@@ -415,16 +1069,13 @@ def _client_for(username: str):
             record_proxy_failure(username, exc)
         mark_connected(username, False)
         raise
-    try:
-        cl.get_timeline_feed()
-        mark_connected(username, True)
-    except Exception as exc:
-        if binding and should_retry_proxy(exc):
-            record_proxy_failure(username, exc)
+    if not has_valid_session_settings(cl):
         mark_connected(username, False)
         raise RuntimeError(
-            f"La sesión guardada para {username} no es válida. Iniciá sesión nuevamente."
-        ) from exc
+            f"La sesión guardada para {username} no contiene credenciales activas. Iniciá sesión nuevamente."
+        )
+
+    mark_connected(username, True)
     return cl
 
 
@@ -501,16 +1152,29 @@ def _filter_valid_sessions(targets: list[str]) -> list[str]:
         verified.append(user)
 
     if needing_login:
-        print("\nLas siguientes cuentas necesitan volver a iniciar sesión:")
+        remaining: list[tuple[str, str]] = []
         for user, reason in needing_login:
-            print(f" - @{user}: {reason}")
-        if ask("¿Iniciar sesión ahora? (s/N): ").strip().lower() == "s":
-            for user, _ in needing_login:
-                if prompt_login(user) and _ensure_session(user):
-                    if user not in verified:
-                        verified.append(user)
-        else:
-            warn("Se omitieron las cuentas sin sesión válida.")
+            if auto_login_with_saved_password(user) and _ensure_session(user):
+                if user not in verified:
+                    verified.append(user)
+            else:
+                remaining.append((user, reason))
+
+        if remaining:
+            print("\nLas siguientes cuentas necesitan volver a iniciar sesión:")
+            for user, reason in remaining:
+                print(f" - @{user}: {reason}")
+            if ask("¿Iniciar sesión ahora? (s/N): ").strip().lower() == "s":
+                for user, _ in remaining:
+                    if auto_login_with_saved_password(user) and _ensure_session(user):
+                        if user not in verified:
+                            verified.append(user)
+                        continue
+                    if prompt_login(user, interactive=False) and _ensure_session(user):
+                        if user not in verified:
+                            verified.append(user)
+            else:
+                warn("Se omitieron las cuentas sin sesión válida.")
     return verified
 
 
@@ -674,6 +1338,7 @@ def _get_gohighlevel_entry(alias: str) -> Dict[str, dict]:
     if isinstance(entry, dict):
         entry.setdefault("alias", alias.strip())
         entry.setdefault("sent", {})
+        entry.setdefault("qualify_prompt", _DEFAULT_GOHIGHLEVEL_PROMPT)
         if "location_ids" in entry:
             entry["location_ids"] = _sanitize_location_ids(entry.get("location_ids"))
         return entry
@@ -716,6 +1381,7 @@ def _get_google_calendar_entry(alias: str) -> Dict[str, object]:
         entry.setdefault("duration_minutes", 30)
         entry.setdefault("timezone", _default_timezone_label())
         entry.setdefault("auto_meet", True)
+        entry.setdefault("schedule_prompt", _DEFAULT_GOOGLE_CALENDAR_PROMPT)
         return entry
     return {}
 
@@ -735,6 +1401,7 @@ def _set_google_calendar_entry(alias: str, updates: Dict[str, object]) -> None:
     entry.setdefault("duration_minutes", 30)
     entry.setdefault("timezone", _default_timezone_label())
     entry.setdefault("auto_meet", True)
+    entry.setdefault("schedule_prompt", _DEFAULT_GOOGLE_CALENDAR_PROMPT)
     normalized_updates: Dict[str, object] = {}
     for key_name, value in updates.items():
         if value is None:
@@ -752,6 +1419,8 @@ def _set_google_calendar_entry(alias: str, updates: Dict[str, object]) -> None:
             except Exception:
                 warn("Zona horaria inválida; se mantiene el valor previo.")
                 continue
+        elif key_name == "schedule_prompt":
+            normalized_updates[key_name] = str(value)
         else:
             normalized_updates[key_name] = value
     entry.update(normalized_updates)
@@ -803,15 +1472,86 @@ def _google_calendar_summary_line() -> str:
     return f"Google Calendar: activo para {', '.join(labels)}"
 
 
+def _google_calendar_candidate_keys(lead: str, phone: str) -> list[str]:
+    normalized_lead = _normalize_lead_id(lead)
+    normalized_phone = _normalize_phone(phone)
+    keys = [f"{normalized_lead}|{normalized_phone}"]
+    if normalized_lead:
+        keys.append(f"{normalized_lead}|")
+    if normalized_phone:
+        keys.append(f"|{normalized_phone}")
+    keys.append("||")
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for key in keys:
+        if key not in seen:
+            seen.add(key)
+            ordered.append(key)
+    return ordered
+
+
+def _google_calendar_preferred_link(link: Optional[str]) -> str:
+    if not link:
+        return ""
+    try:
+        parsed = urlparse(str(link))
+    except Exception:
+        return str(link)
+    host = parsed.netloc.lower()
+    if host.startswith("calendar.app.google"):
+        return str(link)
+    if "google.com" not in host:
+        return str(link)
+    query = parse_qs(parsed.query)
+    eid_values = query.get("eid") or []
+    eid = next((value for value in eid_values if value), "")
+    if not eid:
+        return str(link)
+    eid = eid.strip()
+    if not eid:
+        return str(link)
+    padding = "=" * (-len(eid) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode((eid + padding).encode("ascii", "ignore"))
+    except Exception:
+        return str(link)
+    try:
+        decoded_text = decoded.decode("utf-8", "ignore").strip()
+    except Exception:
+        decoded_text = ""
+    if not decoded_text:
+        return str(link)
+    event_id = decoded_text.split()[0].strip()
+    if not event_id:
+        return str(link)
+    if any(ch for ch in event_id if ord(ch) < 33):
+        return str(link)
+    return f"https://calendar.app.google/{event_id}"
+
+
 def _google_calendar_mark_scheduled(
-    alias: str, lead: str, phone: str, event_id: str, link: str | None
+    alias: str,
+    lead: str,
+    phone: str,
+    event_id: str,
+    link: str | None,
+    start_iso: str,
 ) -> None:
-    lead_key = f"{_normalize_lead_id(lead)}|{_normalize_phone(phone)}"
     entry = _get_google_calendar_entry(alias)
     scheduled = entry.setdefault("scheduled", {})
-    scheduled[lead_key] = {
+    candidate_keys = _google_calendar_candidate_keys(lead, phone)
+    canonical_key = candidate_keys[0]
+    existing_key = None
+    for key in candidate_keys:
+        if key in scheduled:
+            existing_key = key
+            break
+    if existing_key and existing_key != canonical_key:
+        scheduled.pop(existing_key, None)
+    scheduled[canonical_key] = {
         "event_id": event_id,
-        "link": link or "",
+        "link": _google_calendar_preferred_link(link) if link else "",
+        "start": start_iso,
         "ts": int(time.time()),
     }
     _set_google_calendar_entry(alias, {"scheduled": scheduled})
@@ -820,8 +1560,22 @@ def _google_calendar_mark_scheduled(
 def _google_calendar_already_scheduled(alias: str, lead: str, phone: str) -> bool:
     entry = _get_google_calendar_entry(alias)
     scheduled = entry.get("scheduled") or {}
-    lead_key = f"{_normalize_lead_id(lead)}|{_normalize_phone(phone)}"
-    return lead_key in scheduled
+    for key in _google_calendar_candidate_keys(lead, phone):
+        if key in scheduled:
+            return True
+    return False
+
+
+def _google_calendar_get_scheduled(
+    alias: str, lead: str, phone: str
+) -> tuple[Optional[Dict[str, object]], Optional[str]]:
+    entry = _get_google_calendar_entry(alias)
+    scheduled = entry.get("scheduled") or {}
+    for key in _google_calendar_candidate_keys(lead, phone):
+        data = scheduled.get(key)
+        if isinstance(data, dict):
+            return data, key
+    return None, None
 
 
 def _google_calendar_token_is_valid(entry: Dict[str, object]) -> bool:
@@ -1068,6 +1822,122 @@ def _google_calendar_create_event_via_requests(
     return None
 
 
+def _google_calendar_fetch_event_via_service(
+    alias: str,
+    entry: Dict[str, object],
+    event_id: str,
+) -> Optional[Dict[str, object]]:
+    if build is None or Credentials is None:
+        return None
+    creds = _google_calendar_credentials_from_entry(alias, entry)
+    if not creds:
+        return None
+    try:
+        service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "No se pudo inicializar el cliente de Google Calendar para leer evento: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    try:
+        event = (
+            service.events()  # type: ignore[call-arg]
+            .get(calendarId="primary", eventId=event_id)
+            .execute()
+        )
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "Error al obtener evento de Google Calendar mediante googleapiclient: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    _google_calendar_update_tokens_from_credentials(alias, entry, creds)
+    if isinstance(event, dict):
+        return event
+    return None
+
+
+def _google_calendar_fetch_event_via_requests(
+    alias: str,
+    entry: Dict[str, object],
+    event_id: str,
+    access_token: Optional[str],
+) -> Optional[Dict[str, object]]:
+    if requests is None and (Credentials is None or build is None):
+        return None
+    token_value = access_token or entry.get("access_token")
+    if not token_value:
+        return None
+    headers = {
+        "Authorization": f"Bearer {token_value}",
+        "Content-Type": "application/json",
+    }
+    params = {"fields": "id,htmlLink,hangoutLink,conferenceData,start"}
+    url = f"{_GOOGLE_CALENDAR_BASE}/calendars/primary/events/{event_id}"
+    try:
+        response = requests.get(  # type: ignore[call-arg]
+            url,
+            headers=headers,
+            params=params,
+            timeout=20,
+        )
+    except RequestException as exc:  # pragma: no cover - depende de red externa
+        logger.warning(
+            "No se pudo leer el evento en Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    if response.status_code == 401:
+        new_token = _google_calendar_refresh_access_token(alias, entry)
+        if not new_token:
+            return None
+        headers["Authorization"] = f"Bearer {new_token}"
+        try:
+            response = requests.get(  # type: ignore[call-arg]
+                url,
+                headers=headers,
+                params=params,
+                timeout=20,
+            )
+        except RequestException as exc:  # pragma: no cover - depende de red externa
+            logger.warning(
+                "No se pudo leer el evento en Google Calendar tras refrescar token: %s",
+                exc,
+                exc_info=False,
+            )
+            return None
+    if response.status_code != 200:
+        logger.warning(
+            "Respuesta inesperada al obtener evento de Google Calendar (%s): %s",
+            response.status_code,
+            response.text,
+        )
+        return None
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _google_calendar_fetch_event(
+    alias: str,
+    entry: Dict[str, object],
+    event_id: str,
+    access_token: Optional[str],
+) -> Optional[Dict[str, object]]:
+    event = _google_calendar_fetch_event_via_service(alias, entry, event_id)
+    if event:
+        return event
+    return _google_calendar_fetch_event_via_requests(alias, entry, event_id, access_token)
+
+
 def _google_calendar_create_event(
     alias: str,
     entry: Dict[str, object],
@@ -1079,6 +1949,138 @@ def _google_calendar_create_event(
     if event:
         return event
     return _google_calendar_create_event_via_requests(alias, entry, payload, params, access_token)
+
+
+def _google_calendar_update_event_via_service(
+    alias: str,
+    entry: Dict[str, object],
+    event_id: str,
+    payload: Dict[str, object],
+    params: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    if build is None or Credentials is None:
+        return None
+    creds = _google_calendar_credentials_from_entry(alias, entry)
+    if not creds:
+        return None
+    try:
+        service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "No se pudo inicializar el cliente de Google Calendar para actualizar evento: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    kwargs: Dict[str, object] = {}
+    if params.get("conferenceDataVersion"):
+        kwargs["conferenceDataVersion"] = params["conferenceDataVersion"]
+    try:
+        event = (
+            service.events()  # type: ignore[call-arg]
+            .patch(calendarId="primary", eventId=event_id, body=payload, **kwargs)
+            .execute()
+        )
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "Error al actualizar evento de Google Calendar mediante googleapiclient: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    _google_calendar_update_tokens_from_credentials(alias, entry, creds)
+    if isinstance(event, dict):
+        return event
+    return None
+
+
+def _google_calendar_update_event_via_requests(
+    alias: str,
+    entry: Dict[str, object],
+    event_id: str,
+    payload: Dict[str, object],
+    params: Dict[str, object],
+    access_token: Optional[str],
+) -> Optional[Dict[str, object]]:
+    if requests is None and (Credentials is None or build is None):
+        return None
+    token_value = access_token or entry.get("access_token")
+    if not token_value:
+        return None
+    headers = {
+        "Authorization": f"Bearer {token_value}",
+        "Content-Type": "application/json",
+    }
+    url = f"{_GOOGLE_CALENDAR_BASE}/calendars/primary/events/{event_id}"
+    try:
+        response = requests.patch(  # type: ignore[call-arg]
+            url,
+            headers=headers,
+            json=payload,
+            params=params or None,
+            timeout=20,
+        )
+    except RequestException as exc:  # pragma: no cover - depende de red externa
+        logger.warning(
+            "No se pudo actualizar el evento en Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    if response.status_code == 401:
+        new_token = _google_calendar_refresh_access_token(alias, entry)
+        if not new_token:
+            return None
+        headers["Authorization"] = f"Bearer {new_token}"
+        try:
+            response = requests.patch(  # type: ignore[call-arg]
+                url,
+                headers=headers,
+                json=payload,
+                params=params or None,
+                timeout=20,
+            )
+        except RequestException as exc:  # pragma: no cover - depende de red externa
+            logger.warning(
+                "No se pudo actualizar el evento en Google Calendar tras refrescar token: %s",
+                exc,
+                exc_info=False,
+            )
+            return None
+    if response.status_code not in {200}:  # 200 OK al actualizar
+        if response.status_code == 404:
+            logger.info(
+                "El evento de Google Calendar no existe; se creará uno nuevo. (%s)",
+                event_id,
+            )
+            return None
+        logger.warning(
+            "Respuesta inesperada al actualizar evento de Google Calendar (%s): %s",
+            response.status_code,
+            response.text,
+        )
+        return None
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _google_calendar_update_event(
+    alias: str,
+    entry: Dict[str, object],
+    event_id: str,
+    payload: Dict[str, object],
+    params: Dict[str, object],
+    access_token: Optional[str],
+) -> Optional[Dict[str, object]]:
+    event = _google_calendar_update_event_via_service(alias, entry, event_id, payload, params)
+    if event:
+        return event
+    return _google_calendar_update_event_via_requests(alias, entry, event_id, payload, params, access_token)
 
 
 def _google_calendar_ensure_token(alias: str, entry: Dict[str, object]) -> Optional[str]:
@@ -1112,6 +2114,74 @@ def _google_calendar_enabled_entry_for(username: str) -> tuple[Optional[str], Di
             if access_token and refresh_token:
                 return alias, entry
     return None, {}
+
+
+def _google_calendar_lead_qualifies(
+    entry: Dict[str, object],
+    conversation: str,
+    status: Optional[str],
+    phone_numbers: List[str],
+    meeting_dt: datetime,
+    api_key: Optional[str],
+) -> bool:
+    prompt_text = str(entry.get("schedule_prompt") or "").strip()
+    if not prompt_text:
+        return True
+    if not api_key:
+        return True
+    try:  # pragma: no cover - depende de dependencia externa
+        from openai import OpenAI
+    except Exception as exc:  # pragma: no cover - entorno sin openai
+        logger.warning(
+            "No se pudo importar OpenAI para evaluar Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return True
+    try:  # pragma: no cover - depende de credenciales externas
+        client = OpenAI(api_key=api_key)
+    except Exception as exc:
+        logger.warning(
+            "No se pudo inicializar OpenAI para evaluar Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return True
+
+    system_prompt = (
+        prompt_text
+        + "\n\nResponde únicamente con 'SI' o 'NO' indicando si se debe crear un evento en Google Calendar."
+    )
+    context_lines = [
+        f"Estado detectado: {status or 'desconocido'}",
+        "Teléfonos detectados: "
+        + (", ".join(phone_numbers) if phone_numbers else "(sin teléfono)"),
+        f"Fecha/hora detectada: {meeting_dt.isoformat()}",
+        "Conversación completa:",
+        conversation,
+    ]
+    user_content = "\n".join(context_lines)
+    try:  # pragma: no cover - depende de red externa
+        response = client.responses.create(
+            model="gpt-4o-mini",
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0,
+            max_output_tokens=20,
+        )
+        decision = (response.output_text or "").strip().lower()
+    except Exception as exc:  # pragma: no cover - depende de red externa
+        logger.warning(
+            "No se pudo evaluar el criterio de Google Calendar con OpenAI: %s",
+            exc,
+            exc_info=False,
+        )
+        return True
+
+    normalized = _normalize_text_for_match(decision)
+    return normalized.startswith("s")
 
 
 def _mask_gohighlevel_status(entry: Dict[str, object]) -> str:
@@ -1198,6 +2268,70 @@ def _gohighlevel_enabled_entry_for(username: str) -> tuple[Optional[str], Dict[s
     return None, {}
 
 
+def _gohighlevel_lead_qualifies(
+    entry: Dict[str, object],
+    conversation: str,
+    status: Optional[str],
+    phone_numbers: List[str],
+    api_key: Optional[str],
+) -> bool:
+    prompt_text = str(entry.get("qualify_prompt") or "").strip()
+    if not prompt_text:
+        return True
+    if not api_key:
+        return True
+    try:  # pragma: no cover - depende de dependencia externa
+        from openai import OpenAI
+    except Exception as exc:  # pragma: no cover - entorno sin openai
+        logger.warning(
+            "No se pudo importar OpenAI para evaluar GoHighLevel: %s", exc, exc_info=False
+        )
+        return True
+    try:  # pragma: no cover - depende de credenciales externas
+        client = OpenAI(api_key=api_key)
+    except Exception as exc:
+        logger.warning(
+            "No se pudo inicializar OpenAI para evaluar GoHighLevel: %s",
+            exc,
+            exc_info=False,
+        )
+        return True
+
+    system_prompt = (
+        prompt_text
+        + "\n\nResponde únicamente con 'SI' o 'NO' indicando si se debe enviar el lead a GoHighLevel."
+    )
+    context_lines = [
+        f"Estado detectado: {status or 'desconocido'}",
+        "Teléfonos detectados: "
+        + (", ".join(phone_numbers) if phone_numbers else "(sin teléfono)"),
+        "Conversación completa:",
+        conversation,
+    ]
+    user_content = "\n".join(context_lines)
+    try:  # pragma: no cover - depende de red externa
+        response = client.responses.create(
+            model="gpt-4o-mini",
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0,
+            max_output_tokens=20,
+        )
+        decision = (response.output_text or "").strip().lower()
+    except Exception as exc:  # pragma: no cover - depende de red externa
+        logger.warning(
+            "No se pudo evaluar el criterio de GoHighLevel con OpenAI: %s",
+            exc,
+            exc_info=False,
+        )
+        return True
+
+    normalized = _normalize_text_for_match(decision)
+    return normalized.startswith("s")
+
+
 def _require_requests() -> bool:
     if requests is None:  # pragma: no cover - entorno sin dependencia
         warn("La librería 'requests' no está disponible. Instalála para usar GoHighLevel.")
@@ -1258,11 +2392,42 @@ def _gohighlevel_configure_locations() -> None:
     print()
     prompt = (
         "Ingresá uno o más Location IDs (separados por coma o espacio).\n"
-        "Escribí 'limpiar' para eliminar los existentes o dejá vacío para cancelar: "
+        "Escribí 'eliminar N' para borrar uno específico (usa el número de la lista),\n"
+        "'limpiar' para eliminar todos o dejá vacío para cancelar: "
     )
     raw = ask(prompt).strip()
     if not raw:
         warn("No se modificaron los Location IDs.")
+        press_enter()
+        return
+    if raw.lower().startswith("eliminar"):
+        if not current_ids:
+            warn("No hay Location IDs para eliminar.")
+            press_enter()
+            return
+        indexes = [token for token in re.split(r"[^0-9]+", raw) if token.isdigit()]
+        if not indexes:
+            warn("Indicá el número del Location ID a eliminar.")
+            press_enter()
+            return
+        to_remove: set[int] = set()
+        for token in indexes:
+            try:
+                idx = int(token)
+            except ValueError:
+                continue
+            if 1 <= idx <= len(current_ids):
+                to_remove.add(idx - 1)
+        if not to_remove:
+            warn("Los números indicados no coinciden con Location IDs existentes.")
+            press_enter()
+            return
+        remaining = [value for idx, value in enumerate(current_ids) if idx not in to_remove]
+        _set_gohighlevel_entry(alias, {"location_ids": remaining})
+        ok(
+            "Se eliminaron los Location IDs seleccionados. Total restante: "
+            f"{len(remaining)}"
+        )
         press_enter()
         return
     if raw.lower() in {"limpiar", "clear", "ninguno", "eliminar", "borrar"}:
@@ -1277,6 +2442,62 @@ def _gohighlevel_configure_locations() -> None:
         return
     _set_gohighlevel_entry(alias, {"location_ids": location_ids})
     ok(f"Location IDs guardados para {alias}. Total: {len(location_ids)}")
+    press_enter()
+
+
+def _gohighlevel_configure_prompt() -> None:
+    banner()
+    print(style_text("GoHighLevel • Criterios de envío", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.BLUE))
+    for line in _gohighlevel_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _gohighlevel_select_alias()
+    if not alias:
+        return
+    entry = _get_gohighlevel_entry(alias)
+    current_prompt = str(entry.get("qualify_prompt") or _DEFAULT_GOHIGHLEVEL_PROMPT)
+    print(style_text("Prompt actual:", color=Fore.BLUE))
+    print(current_prompt or "(sin definir)")
+    print(full_line(color=Fore.BLUE))
+    print("Elegí una opción:")
+    print("  E) Editar prompt")
+    print("  D) Restaurar prompt predeterminado")
+    print("  Enter) Cancelar")
+    action = ask("Acción: ").strip().lower()
+    if not action:
+        warn("No se modificó el prompt de calificación.")
+        press_enter()
+        return
+    if action in {"d", "default", "predeterminado"}:
+        _set_gohighlevel_entry(alias, {"qualify_prompt": _DEFAULT_GOHIGHLEVEL_PROMPT})
+        ok("Se restauró el prompt predeterminado para GoHighLevel.")
+        press_enter()
+        return
+    if action not in {"e", "editar"}:
+        warn("Opción inválida. No se modificó el prompt de calificación.")
+        press_enter()
+        return
+    print(
+        style_text(
+            "Pegá el nuevo prompt y finalizá con una línea que diga <<<END>>>."
+            " Dejá vacío para cancelar.",
+            color=Fore.CYAN,
+        )
+    )
+    lines: List[str] = []
+    while True:
+        line = ask("› ")
+        if line.strip() == "<<<END>>>":
+            break
+        lines.append(line.replace("\r", ""))
+    new_prompt = "\n".join(lines).strip()
+    if not new_prompt:
+        warn("No se modificó el prompt de calificación.")
+        press_enter()
+        return
+    _set_gohighlevel_entry(alias, {"qualify_prompt": new_prompt})
+    ok(f"Prompt actualizado. Longitud: {len(new_prompt)} caracteres.")
     press_enter()
 
 
@@ -1330,7 +2551,8 @@ def _gohighlevel_menu() -> None:
         print("2) Configurar Location IDs de GoHighLevel")
         print("3) Activar el envío automático de leads calificados al CRM de GoHighLevel")
         print("4) Desactivar conexión")
-        print("5) Volver al submenú anterior")
+        print("5) Configurar criterios de calificación")
+        print("6) Volver al submenú anterior")
         print(full_line(color=Fore.BLUE))
         choice = ask("Opción: ").strip()
         if choice == "1":
@@ -1342,6 +2564,8 @@ def _gohighlevel_menu() -> None:
         elif choice == "4":
             _gohighlevel_deactivate()
         elif choice == "5":
+            _gohighlevel_configure_prompt()
+        elif choice == "6":
             break
         else:
             warn("Opción inválida.")
@@ -1434,6 +2658,198 @@ def _google_calendar_perform_device_flow(
     return None
 
 
+def _google_calendar_validate_client_payload(
+    payload: Dict[str, object]
+) -> tuple[Optional[Dict[str, object]], Optional[str]]:
+    if not isinstance(payload, dict):
+        return None, "El archivo JSON no contiene una estructura válida."
+    installed = payload.get("installed")
+    if not isinstance(installed, dict):
+        return (
+            None,
+            "El archivo JSON debe corresponder a una 'Aplicación de escritorio' generada en Google Cloud Console.",
+        )
+    redirect_uris = installed.get("redirect_uris")
+    normalized_uris: set[str] = set()
+    if isinstance(redirect_uris, (list, tuple)):
+        normalized_uris = {
+            str(uri).strip().rstrip("/")
+            for uri in redirect_uris
+            if isinstance(uri, str) and uri.strip()
+        }
+    if _GOOGLE_REDIRECT_URI.rstrip("/") not in normalized_uris:
+        return (
+            None,
+            "El JSON debe incluir http://localhost como redirect URI autorizado en la consola de Google.",
+        )
+    client_id = installed.get("client_id")
+    if not client_id:
+        return None, "El archivo JSON no contiene un Client ID válido."
+    return installed, None
+
+
+def _google_calendar_extract_client_credentials(
+    payload: Dict[str, object]
+) -> tuple[Optional[str], Optional[str]]:
+    config, _ = _google_calendar_validate_client_payload(payload)
+    if not config:
+        return None, None
+    client_id = config.get("client_id")
+    client_secret = config.get("client_secret")
+    return (
+        (str(client_id) if client_id else None),
+        (str(client_secret) if client_secret else None),
+    )
+
+
+def _google_calendar_report_oauth_error(exc: Exception) -> None:
+    base_message = (
+        "Error de autenticación. Verificá que el JSON cargado sea válido, "
+        "que estés autorizado como tester y que el proyecto esté correctamente configurado."
+    )
+    details = str(exc).strip()
+    if details:
+        warn(f"{base_message} Detalle: {details}")
+    else:
+        warn(base_message)
+
+
+def _ensure_google_auth_oauthlib() -> bool:
+    global InstalledAppFlow
+    if InstalledAppFlow is not None:
+        return True
+    flow_cls = None
+    try:
+        from google_auth_oauthlib.flow import InstalledAppFlow as flow_cls  # type: ignore
+    except Exception:
+        warn("Esta opción requiere la librería google-auth-oauthlib.")
+        confirm = (
+            ask("¿Deseás que la instalemos automáticamente ahora? (s/n): ")
+            .strip()
+            .lower()
+        )
+        if confirm not in {"s", "si", "sí", "y", "yes"}:
+            warn("Instalación cancelada. Instalá google-auth-oauthlib para continuar.")
+            press_enter()
+            return False
+        python_bin = sys.executable or "python3"
+        print(
+            style_text(
+                "Instalando google-auth-oauthlib, por favor esperá...",
+                color=Fore.YELLOW,
+            )
+        )
+        try:
+            subprocess.check_call(
+                [python_bin, "-m", "pip", "install", "google-auth-oauthlib"]
+            )
+        except Exception as exc:
+            warn(f"No se pudo instalar google-auth-oauthlib automáticamente: {exc}")
+            press_enter()
+            return False
+        try:
+            from google_auth_oauthlib.flow import InstalledAppFlow as flow_cls  # type: ignore
+        except Exception as exc:
+            warn(f"La librería google-auth-oauthlib no pudo cargarse: {exc}")
+            press_enter()
+            return False
+        ok("La librería google-auth-oauthlib se instaló correctamente.")
+    if flow_cls is None:
+        warn("No se pudo cargar la librería google-auth-oauthlib.")
+        press_enter()
+        return False
+    InstalledAppFlow = flow_cls
+    return True
+
+
+def _google_calendar_load_credentials_json() -> None:
+    if not _ensure_google_auth_oauthlib():
+        return
+    banner()
+    print(
+        style_text(
+            "Google Calendar • Cargar credenciales JSON",
+            color=Fore.CYAN,
+            bold=True,
+        )
+    )
+    print(full_line(color=Fore.BLUE))
+    for line in _google_calendar_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _google_calendar_select_alias()
+    if not alias:
+        return
+    path_input = ask(
+        "Ruta del archivo JSON de Google (vacío para cancelar): "
+    ).strip()
+    if not path_input:
+        warn("No se cargó ningún archivo de credenciales.")
+        press_enter()
+        return
+    file_path = Path(path_input).expanduser()
+    if not file_path.exists():
+        warn("El archivo especificado no existe.")
+        press_enter()
+        return
+    try:
+        json_payload = json.loads(file_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        warn(f"No se pudo leer el archivo JSON: {exc}")
+        press_enter()
+        return
+    config, error = _google_calendar_validate_client_payload(json_payload)
+    if error:
+        warn(error)
+        press_enter()
+        return
+    client_id = str(config.get("client_id") or "")
+    client_secret_value = config.get("client_secret")
+    client_secret = str(client_secret_value) if client_secret_value else None
+    if not client_id:
+        warn("El archivo JSON no contiene un Client ID válido.")
+        press_enter()
+        return
+    _set_google_calendar_entry(
+        alias,
+        {"client_id": client_id, "client_secret": client_secret},
+    )
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file(
+            str(file_path), scopes=[_GOOGLE_SCOPE]
+        )
+        try:
+            flow.redirect_uri = _GOOGLE_REDIRECT_URI
+        except Exception:
+            # Algunos objetos Flow no exponen redirect_uri hasta ejecutar run_*.
+            pass
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        warn(f"No se pudo inicializar el flujo OAuth: {exc}")
+        press_enter()
+        return
+    try:
+        credentials = flow.run_local_server(port=0)
+    except Exception as exc_local:  # pragma: no cover - depende de librería externa
+        logger.debug(
+            "Fallo run_local_server para Google OAuth, se intenta modo consola",
+            exc_info=exc_local,
+        )
+        try:
+            credentials = flow.run_console()
+        except Exception as exc_console:  # pragma: no cover - depende de librería externa
+            _google_calendar_report_oauth_error(exc_console)
+            press_enter()
+            return
+    entry = _get_google_calendar_entry(alias)
+    _google_calendar_update_tokens_from_credentials(alias, entry, credentials)
+    entry = _get_google_calendar_entry(alias)
+    if entry.get("connected"):
+        ok(f"Google Calendar conectado para {alias}.")
+    else:
+        warn("No se pudo completar la conexión con Google Calendar.")
+    press_enter()
+
+
 def _google_calendar_connect() -> None:
     if not _require_requests():
         return
@@ -1523,6 +2939,72 @@ def _google_calendar_configure_event() -> None:
     press_enter()
 
 
+def _google_calendar_configure_prompt() -> None:
+    banner()
+    print(
+        style_text(
+            "Google Calendar • Criterio para creación de eventos",
+            color=Fore.CYAN,
+            bold=True,
+        )
+    )
+    print(full_line(color=Fore.BLUE))
+    for line in _google_calendar_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _google_calendar_select_alias()
+    if not alias:
+        return
+    entry = _get_google_calendar_entry(alias)
+    current_prompt = str(entry.get("schedule_prompt") or _DEFAULT_GOOGLE_CALENDAR_PROMPT)
+    print(style_text("Prompt actual:", color=Fore.BLUE))
+    print(current_prompt.strip() or "(sin definir)")
+    print(full_line(color=Fore.BLUE))
+    print("Elegí una opción:")
+    print("  E) Editar prompt")
+    print("  D) Restaurar valor predeterminado")
+    print("  Enter) Cancelar")
+    action = ask("Acción: ").strip().lower()
+    if not action:
+        warn("No se modificó el criterio de calendario.")
+        press_enter()
+        return
+    if action in {"d", "default", "predeterminado"}:
+        _set_google_calendar_entry(
+            alias,
+            {"schedule_prompt": _DEFAULT_GOOGLE_CALENDAR_PROMPT},
+        )
+        ok("Se restauró el criterio predeterminado de Google Calendar.")
+        press_enter()
+        return
+    if action not in {"e", "editar"}:
+        warn("Opción inválida. No se modificó el criterio de calendario.")
+        press_enter()
+        return
+    print(
+        style_text(
+            (
+                "Pegá el nuevo criterio y finalizá con una línea que diga <<<END>>>."
+                " Dejá vacío para cancelar."
+            ),
+            color=Fore.CYAN,
+        )
+    )
+    lines: List[str] = []
+    while True:
+        line = ask("› ")
+        if line.strip() == "<<<END>>>":
+            break
+        lines.append(line.replace("\r", ""))
+    new_prompt = "\n".join(lines).strip()
+    _set_google_calendar_entry(alias, {"schedule_prompt": new_prompt})
+    if new_prompt:
+        ok(f"Criterio actualizado. Longitud: {len(new_prompt)} caracteres.")
+    else:
+        ok("Se eliminó el criterio personalizado. Se usará la lógica automática predeterminada.")
+    press_enter()
+
+
 def _google_calendar_activate() -> None:
     banner()
     print(style_text("Google Calendar • Activar creación automática", color=Fore.CYAN, bold=True))
@@ -1600,10 +3082,12 @@ def _google_calendar_menu() -> None:
         print(full_line(color=Fore.BLUE))
         print("1) Conectar cuenta mediante OAuth")
         print("2) Configurar parámetros del evento")
-        print("3) Activar creación automática de eventos")
-        print("4) Desactivar creación automática de eventos")
-        print("5) Revocar conexión")
-        print("6) Volver al submenú anterior")
+        print("3) Configurar criterio para creación de evento")
+        print("4) Activar creación automática de eventos")
+        print("5) Desactivar creación automática de eventos")
+        print("6) Revocar conexión")
+        print("7) Cargar credenciales JSON (Google OAuth 2.0)")
+        print("8) Volver al submenú anterior")
         print(full_line(color=Fore.BLUE))
         choice = ask("Opción: ").strip()
         if choice == "1":
@@ -1611,12 +3095,16 @@ def _google_calendar_menu() -> None:
         elif choice == "2":
             _google_calendar_configure_event()
         elif choice == "3":
-            _google_calendar_activate()
+            _google_calendar_configure_prompt()
         elif choice == "4":
-            _google_calendar_deactivate()
+            _google_calendar_activate()
         elif choice == "5":
-            _google_calendar_revoke()
+            _google_calendar_deactivate()
         elif choice == "6":
+            _google_calendar_revoke()
+        elif choice == "7":
+            _google_calendar_load_credentials_json()
+        elif choice == "8":
             break
         else:
             warn("Opción inválida.")
@@ -1743,10 +3231,11 @@ def autoresponder_menu_options() -> List[str]:
         "1) Configurar API Key",
         "2) Configurar System Prompt",
         "3) Activar bot (alias/grupo)",
-        "4) Conectar con GoHighLevel",
-        "5) Conectar con Google Calendar",
-        "6) Desactivar bot",
-        "7) Volver",
+        "4) Seguimiento",
+        "5) Conectar con GoHighLevel",
+        "6) Conectar con Google Calendar",
+        "7) Desactivar bot",
+        "8) Volver",
     ]
 
 
@@ -1768,6 +3257,7 @@ def _print_menu_header() -> None:
     print(f"API Key: {_mask_key(api_key) or '(sin definir)'}")
     print(f"System prompt: {_preview_prompt(prompt)}")
     print(status)
+    print(_followup_summary_line())
     print(_gohighlevel_summary_line())
     print(_google_calendar_summary_line())
     print(full_line(color=Fore.BLUE))
@@ -1832,7 +3322,7 @@ def _handle_account_issue(user: str, exc: Exception, active: List[str]) -> None:
         return
 
     while choice == "r":
-        if prompt_login(user) and _ensure_session(user):
+        if prompt_login(user, interactive=False) and _ensure_session(user):
             mark_connected(user, True)
             ok(f"Sesión renovada para @{user}")
             return
@@ -1907,10 +3397,14 @@ def _infer_lead_tag(
     return _DEFAULT_LEAD_TAG
 
 
-def _build_conversation_note(account: str, recipient: str, conversation: str) -> str:
+def _build_conversation_note(
+    account: str, recipient: str, conversation: str, status: Optional[str] = None
+) -> str:
     header = [f"Cuenta IG: @{account}"]
     if recipient:
         header.append(f"Usuario: @{recipient}")
+    if status:
+        header.append(f"Estado detectado: {status}")
     header.append("Historial completo:")
     return "\n".join(header + [conversation])
 
@@ -1986,7 +3480,44 @@ def _render_calendar_summary(template: str, username: str) -> str:
     return template.replace("{{username}}", username or "Lead")
 
 
-def _create_gohighlevel_contact(api_key: str, payload: Dict[str, object]) -> Optional[str]:
+def _parse_gohighlevel_contact_id(data: Dict[str, object]) -> Optional[str]:
+    if not isinstance(data, dict):
+        return None
+    contact = data.get("contact") if isinstance(data.get("contact"), dict) else None
+    if isinstance(contact, dict):
+        for key in ("id", "Id", "contactId"):
+            if contact.get(key):
+                return str(contact[key])
+    for key in ("contactId", "id", "Id"):
+        value = data.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _update_gohighlevel_contact(
+    api_key: str, contact_id: str, payload: Dict[str, object]
+) -> Optional[str]:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    url = f"{_GOHIGHLEVEL_BASE}/contacts/{contact_id}"
+    response = requests.put(url, json=payload, headers=headers, timeout=15)  # type: ignore[call-arg]
+    response.raise_for_status()
+    data: Dict[str, object] = {}
+    if response.content:
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+    return _parse_gohighlevel_contact_id(data) or contact_id
+
+
+def _create_gohighlevel_contact(
+    api_key: str, payload: Dict[str, object]
+) -> tuple[Optional[str], bool]:
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -2000,26 +3531,20 @@ def _create_gohighlevel_contact(api_key: str, payload: Dict[str, object]) -> Opt
             data = response.json()
         except ValueError:
             data = {}
-        contact = data.get("contact") if isinstance(data.get("contact"), dict) else None
-        contact_id = data.get("contactId") or (contact.get("id") if contact else None)
+        contact_id = _parse_gohighlevel_contact_id(data)
         if contact_id:
-            return str(contact_id)
+            updated_id = _update_gohighlevel_contact(api_key, str(contact_id), payload)
+            return updated_id, False
     response.raise_for_status()
     if response.content:
         try:
             data = response.json()
         except ValueError:
             data = {}
-    contact_data = data.get("contact") if isinstance(data.get("contact"), dict) else {}
-    if isinstance(contact_data, dict):
-        for key in ("id", "Id", "contactId"):
-            if contact_data.get(key):
-                return str(contact_data[key])
-    for key in ("contactId", "id", "Id"):
-        value = data.get(key)
-        if value:
-            return str(value)
-    return None
+    contact_id = _parse_gohighlevel_contact_id(data)
+    if contact_id:
+        return contact_id, True
+    return None, True
 
 
 def _attach_gohighlevel_note(api_key: str, contact_id: str, note: str) -> None:
@@ -2040,6 +3565,7 @@ def _send_lead_to_gohighlevel(
     conversation: str,
     phone_numbers: List[str],
     status: Optional[str],
+    openai_api_key: Optional[str] = None,
 ) -> None:
     if requests is None:
         logger.warning("GoHighLevel no disponible: falta la librería requests.")
@@ -2066,6 +3592,15 @@ def _send_lead_to_gohighlevel(
     if _gohighlevel_already_sent(alias, normalized_lead, main_phone):
         return
 
+    if not _gohighlevel_lead_qualifies(
+        entry,
+        conversation,
+        status,
+        phone_numbers,
+        openai_api_key,
+    ):
+        return
+
     contact_payload: Dict[str, object] = {
         "name": recipient or "Lead Instagram",
         "phone": main_phone,
@@ -2073,25 +3608,35 @@ def _send_lead_to_gohighlevel(
     email = _extract_email_from_text(conversation)
     if email:
         contact_payload["email"] = email
-    note_text = _build_conversation_note(account, recipient, conversation)
+    note_text = _build_conversation_note(account, recipient, conversation, status)
     lead_tag = _infer_lead_tag(conversation, phone_numbers, status)
-    successes = 0
+    successes: List[str] = []
     for location_id in location_ids:
         payload = dict(contact_payload)
         payload["locationId"] = location_id
         if lead_tag:
             payload["tags"] = [lead_tag]
         try:
-            contact_id = _create_gohighlevel_contact(api_key, payload)
+            contact_id, created = _create_gohighlevel_contact(api_key, payload)
             if not contact_id:
+                message = (
+                    "No se obtuvo contactId al crear contacto en GoHighLevel para %s (location %s)."
+                )
                 logger.warning(
-                    "No se obtuvo contactId al crear contacto en GoHighLevel para %s (location %s).",
+                    message,
                     recipient or "(sin usuario)",
                     location_id,
                 )
+                print(
+                    f"❌ Falló el envío a GHL (Location {location_id}): no se recibió identificador del contacto"
+                )
                 continue
             _attach_gohighlevel_note(api_key, contact_id, note_text)
-            successes += 1
+            successes.append(location_id)
+            action = "creado" if created else "actualizado"
+            print(
+                f"✅ Lead enviado a GHL (Location {location_id}) — contacto {action} (ID {contact_id})"
+            )
         except RequestException as exc:  # pragma: no cover - depende de red externa
             logger.warning(
                 "Error enviando lead a GoHighLevel (location %s): %s",
@@ -2099,6 +3644,7 @@ def _send_lead_to_gohighlevel(
                 exc,
                 exc_info=False,
             )
+            print(f"❌ Falló el envío a GHL (Location {location_id}): {exc}")
         except Exception as exc:  # pragma: no cover - manejo defensivo
             logger.warning(
                 "Fallo inesperado con GoHighLevel (location %s): %s",
@@ -2106,6 +3652,7 @@ def _send_lead_to_gohighlevel(
                 exc,
                 exc_info=False,
             )
+            print(f"❌ Falló el envío a GHL (Location {location_id}): {exc}")
     if not successes:
         return
 
@@ -2115,7 +3662,7 @@ def _send_lead_to_gohighlevel(
         alias,
         account,
         recipient or "(sin usuario)",
-        ",".join(location_ids),
+        ",".join(successes),
         lead_tag,
     )
 
@@ -2126,10 +3673,9 @@ def _maybe_schedule_google_calendar_event(
     conversation: str,
     phone_numbers: List[str],
     status: Optional[str],
-) -> Optional[str]:
+    openai_api_key: Optional[str] = None,
+) -> Optional[tuple[str, str]]:
     if ACTIVE_ALIAS is None:
-        return None
-    if not phone_numbers:
         return None
     if status and status.strip().lower() == "no interesado":
         return None
@@ -2138,19 +3684,46 @@ def _maybe_schedule_google_calendar_event(
         return None
     if requests is None and (Credentials is None or build is None):
         return None
-    normalized_convo = _normalize_text_for_match(conversation)
-    if not any(keyword in normalized_convo for keyword in _CALL_KEYWORDS):
-        return None
     tz_label = str(entry.get("timezone") or _default_timezone_label())
     meeting_dt = _detect_meeting_datetime(conversation, tz_label)
     if not meeting_dt:
         return None
-    main_phone = _normalize_phone(phone_numbers[0])
-    if not main_phone:
+    normalized_convo = _normalize_text_for_match(conversation)
+    prompt_text = str(entry.get("schedule_prompt") or "").strip()
+    if not prompt_text and not any(
+        keyword in normalized_convo for keyword in _CALL_KEYWORDS
+    ):
         return None
-    normalized_lead = recipient or main_phone
-    if _google_calendar_already_scheduled(alias, normalized_lead, main_phone):
+    if not _google_calendar_lead_qualifies(
+        entry,
+        conversation,
+        status,
+        phone_numbers,
+        meeting_dt,
+        openai_api_key,
+    ):
         return None
+    main_phone = _normalize_phone(phone_numbers[0]) if phone_numbers else ""
+    normalized_lead = recipient or main_phone or f"{account}-lead"
+    scheduled_entry, _ = _google_calendar_get_scheduled(
+        alias, normalized_lead, main_phone
+    )
+    previous_start: Optional[datetime] = None
+    previous_link = ""
+    event_id_to_update: Optional[str] = None
+    if scheduled_entry:
+        event_id_value = scheduled_entry.get("event_id")
+        if isinstance(event_id_value, str) and event_id_value.strip():
+            event_id_to_update = event_id_value
+        start_value = scheduled_entry.get("start")
+        if isinstance(start_value, str) and start_value:
+            try:
+                previous_start = datetime.fromisoformat(start_value)
+            except Exception:
+                previous_start = None
+        link_value = scheduled_entry.get("link")
+        if isinstance(link_value, str):
+            previous_link = _google_calendar_preferred_link(link_value)
     access_token = _google_calendar_ensure_token(alias, entry)
     if not access_token and requests is None and (Credentials is None or build is None):
         return None
@@ -2171,7 +3744,10 @@ def _maybe_schedule_google_calendar_event(
     ]
     if recipient:
         description_lines.append(f"Usuario IG: @{recipient}")
-    description_lines.append(f"Teléfono: {main_phone}")
+    if main_phone:
+        description_lines.append(f"Teléfono: {main_phone}")
+    else:
+        description_lines.append("Teléfono: (sin proporcionar)")
     if email:
         description_lines.append(f"Email: {email}")
     if status:
@@ -2200,25 +3776,84 @@ def _maybe_schedule_google_calendar_event(
             }
         }
         params["conferenceDataVersion"] = 1
-    event = _google_calendar_create_event(alias, entry, payload, params, access_token)
+    event: Optional[Dict[str, object]] = None
+    event_action = "created"
+    skip_message = False
+    if event_id_to_update:
+        should_update = True
+        if previous_start:
+            delta = abs((previous_start - start_dt).total_seconds())
+            if delta < 60:
+                should_update = False
+        if should_update:
+            event = _google_calendar_update_event(
+                alias, entry, event_id_to_update, payload, params, access_token
+            )
+            if event:
+                event_action = "updated"
+        else:
+            skip_message = True
+        if not event and not skip_message:
+            event = _google_calendar_create_event(alias, entry, payload, params, access_token)
+            event_action = "created"
+    else:
+        event = _google_calendar_create_event(alias, entry, payload, params, access_token)
+        event_action = "created"
+    if skip_message:
+        return None
     if not event:
         return None
     event_id = event.get("id") if isinstance(event, dict) else None
     if not event_id:
         return None
-    link = ""
+    event_link = ""
+    backup_link = ""
     if isinstance(event, dict):
-        link = event.get("htmlLink") or event.get("hangoutLink") or ""
-        if not link:
+        event_link = _google_calendar_preferred_link(str(event.get("htmlLink") or ""))
+        backup_link = str(event.get("hangoutLink") or "")
+        if not backup_link:
             conference_data = event.get("conferenceData") if isinstance(event.get("conferenceData"), dict) else {}
             if isinstance(conference_data, dict):
                 entry_points = conference_data.get("entryPoints")
                 if isinstance(entry_points, list):
                     for item in entry_points:
                         if isinstance(item, dict) and item.get("uri"):
-                            link = str(item["uri"])
+                            backup_link = str(item["uri"])
                             break
-    _google_calendar_mark_scheduled(alias, normalized_lead, main_phone, event_id, link)
+    if not event_link:
+        fetched_event = _google_calendar_fetch_event(
+            alias, entry, event_id, access_token
+        )
+        if isinstance(fetched_event, dict):
+            event = fetched_event
+            event_link = _google_calendar_preferred_link(
+                str(fetched_event.get("htmlLink") or "")
+            )
+            if not backup_link:
+                backup_link = str(fetched_event.get("hangoutLink") or "")
+                if not backup_link:
+                    conference_data = (
+                        fetched_event.get("conferenceData")
+                        if isinstance(fetched_event.get("conferenceData"), dict)
+                        else {}
+                    )
+                    if isinstance(conference_data, dict):
+                        entry_points = conference_data.get("entryPoints")
+                        if isinstance(entry_points, list):
+                            for item in entry_points:
+                                if isinstance(item, dict) and item.get("uri"):
+                                    backup_link = str(item["uri"])
+                                    break
+    stored_link = event_link or backup_link or previous_link
+    stored_link = _google_calendar_preferred_link(stored_link)
+    _google_calendar_mark_scheduled(
+        alias,
+        normalized_lead,
+        main_phone,
+        event_id,
+        stored_link,
+        start_dt.isoformat(),
+    )
     logger.info(
         "Evento programado en Google Calendar | alias=%s | cuenta=%s | lead=%s | inicio=%s",
         alias,
@@ -2227,14 +3862,33 @@ def _maybe_schedule_google_calendar_event(
         start_dt.isoformat(),
     )
     formatted_dt = start_dt.strftime("%d/%m/%Y %H:%M")
-    message_lines = [
-        f"Listo, agendé nuestra llamada para {formatted_dt} ({tz_label}).",
-    ]
-    if link:
-        message_lines.append(f"Podés ver los detalles acá: {link}")
+    recipient_handle = _format_handle(recipient or main_phone or None)
+    if event_action == "updated":
+        message_lines = [
+            f"Perfecto, actualicé nuestra llamada para {formatted_dt} ({tz_label}).",
+        ]
     else:
-        message_lines.append("Te compartí los detalles en nuestro calendario.")
-    return "\n".join(message_lines)
+        message_lines = [
+            f"Listo, acabo de agendar nuestra llamada para {formatted_dt} ({tz_label}).",
+        ]
+    if event_link:
+        message_lines.append(
+            f"Te paso el link del evento para que confirmes la asistencia: {event_link}"
+        )
+    elif stored_link:
+        message_lines.append(
+            f"Te compartí los detalles de la reunión en nuestro calendario: {stored_link}"
+        )
+    else:
+        message_lines.append("Te compartí los detalles de la reunión en nuestro calendario.")
+    status_line = f"✅ Reunión agendada en Google Calendar para {recipient_handle}"
+    log_conversation_status(
+        account,
+        recipient or normalized_lead,
+        status_line,
+        timestamp=int(time.time()),
+    )
+    return "\n".join(message_lines), status_line
 
 
 def _process_inbox(
@@ -2277,22 +3931,30 @@ def _process_inbox(
                 ts_value = int(msg_ts.timestamp())
             log_conversation_status(user, recipient_username, status, timestamp=ts_value)
         phone_numbers = _extract_phone_numbers(last.text or "")
+        if not phone_numbers:
+            phone_numbers = _extract_phone_numbers(convo)
         calendar_message: Optional[str] = None
-        if phone_numbers and status != "No interesado":
-            _send_lead_to_gohighlevel(
+        calendar_status_line: Optional[str] = None
+        if status != "No interesado":
+            if phone_numbers:
+                _send_lead_to_gohighlevel(
+                    user,
+                    recipient_username,
+                    convo,
+                    phone_numbers,
+                    status,
+                    api_key,
+                )
+            calendar_result = _maybe_schedule_google_calendar_event(
                 user,
                 recipient_username,
                 convo,
                 phone_numbers,
                 status,
+                api_key,
             )
-            calendar_message = _maybe_schedule_google_calendar_event(
-                user,
-                recipient_username,
-                convo,
-                phone_numbers,
-                status,
-            )
+            if calendar_result:
+                calendar_message, calendar_status_line = calendar_result
         try:
             reply = _gen_response(api_key, system_prompt, convo)
             client.direct_send(reply, [last.user_id])
@@ -2307,7 +3969,7 @@ def _process_inbox(
         save_auto_state(state)
         index = stats.record_success(user)
         logger.info("Respuesta enviada por @%s en hilo %s", user, thread_id)
-        _print_response_summary(index, user, recipient_username, True)
+        _print_response_summary(index, user, recipient_username, True, calendar_status_line)
 
 
 def _print_bot_summary(stats: BotStats) -> None:
@@ -2384,6 +4046,7 @@ def _activate_bot() -> None:
 
                     try:
                         _process_inbox(client, user, state, api_key, system_prompt, stats)
+                        _process_followups(client, user, api_key)
                     except KeyboardInterrupt:
                         raise
                     except Exception as exc:  # pragma: no cover - depende de SDK/insta
@@ -2439,12 +4102,14 @@ def menu_autoresponder():
         elif choice == "3":
             _activate_bot()
         elif choice == "4":
-            _gohighlevel_menu()
+            _followup_menu()
         elif choice == "5":
-            _google_calendar_menu()
+            _gohighlevel_menu()
         elif choice == "6":
-            _manual_stop()
+            _google_calendar_menu()
         elif choice == "7":
+            _manual_stop()
+        elif choice == "8":
             break
         else:
             warn("Opción inválida.")
