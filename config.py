@@ -78,6 +78,12 @@ class Settings:
     proxy_default_user: str = ""
     proxy_default_pass: str = ""
     proxy_sticky_minutes: int = 10
+    low_profile_age_days: int = 14
+    low_profile_profile_edit_threshold: int = 3
+    low_profile_activity_window_hours: int = 48
+    low_profile_activity_threshold: int = 30
+    low_profile_daily_cap: int = 15
+    low_profile_delay_factor: int = 150
 
 
 def _validated_ranges(values: Dict[str, str]) -> Tuple[int, int, int, int]:
@@ -131,6 +137,35 @@ def load_settings() -> Settings:
 
     defaults = Settings()
     client_distribution = _client_distribution_flag(env_values, defaults.client_distribution)
+    low_profile_age_days = max(1, _coerce_int(env_values.get("LOW_PROFILE_AGE_DAYS"), defaults.low_profile_age_days))
+    low_profile_profile_edit_threshold = max(
+        1,
+        _coerce_int(
+            env_values.get("LOW_PROFILE_PROFILE_EDIT_THRESHOLD"),
+            defaults.low_profile_profile_edit_threshold,
+        ),
+    )
+    low_profile_activity_window_hours = max(
+        1,
+        _coerce_int(
+            env_values.get("LOW_PROFILE_ACTIVITY_WINDOW_HOURS"),
+            defaults.low_profile_activity_window_hours,
+        ),
+    )
+    low_profile_activity_threshold = max(
+        0,
+        _coerce_int(
+            env_values.get("LOW_PROFILE_ACTIVITY_THRESHOLD"),
+            defaults.low_profile_activity_threshold,
+        ),
+    )
+    low_profile_daily_cap = max(
+        1, _coerce_int(env_values.get("LOW_PROFILE_DAILY_CAP"), defaults.low_profile_daily_cap)
+    )
+    low_profile_delay_factor = max(
+        100,
+        _coerce_int(env_values.get("LOW_PROFILE_DELAY_FACTOR"), defaults.low_profile_delay_factor),
+    )
 
     return Settings(
         max_per_account=max_per_account,
@@ -154,6 +189,12 @@ def load_settings() -> Settings:
                 env_values.get("PROXY_STICKY_MINUTES"), defaults.proxy_sticky_minutes
             ),
         ),
+        low_profile_age_days=low_profile_age_days,
+        low_profile_profile_edit_threshold=low_profile_profile_edit_threshold,
+        low_profile_activity_window_hours=low_profile_activity_window_hours,
+        low_profile_activity_threshold=low_profile_activity_threshold,
+        low_profile_daily_cap=low_profile_daily_cap,
+        low_profile_delay_factor=low_profile_delay_factor,
     )
 
 

@@ -9,11 +9,12 @@ import json
 import random
 import re
 import time
-from datetime import datetime, timedelta
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import logging
 from urllib.parse import urlparse
@@ -128,6 +129,11 @@ _HEALTH_REFRESH_EXECUTOR = ThreadPoolExecutor(
 )
 
 
+_SENT_LOG = BASE / "storage" / "sent_log.jsonl"
+_ACTIVITY_CACHE_TTL = timedelta(minutes=5)
+_ACTIVITY_CACHE: Optional[Tuple[int, datetime, Dict[str, int]]] = None
+
+
 _CSV_HEADERS = [
     "username",
     "password",
@@ -182,6 +188,199 @@ def _persist_health_cache() -> None:
 _load_health_cache_from_disk()
 
 
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _isoformat_utc(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _parse_datetime(value: object) -> Optional[datetime]:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _settings_value(name: str, default: int) -> int:
+    try:
+        value = getattr(SETTINGS, name)
+    except AttributeError:
+        return default
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _ensure_timestamp(record: Dict, key: str) -> Tuple[Optional[datetime], bool]:
+    original = record.get(key)
+    parsed = _parse_datetime(original)
+    if parsed is None:
+        record.pop(key, None)
+        return None, bool(original)
+    formatted = _isoformat_utc(parsed)
+    if formatted != original:
+        record[key] = formatted
+        return parsed, True
+    return parsed, False
+
+
+def _ensure_first_seen(record: Dict) -> bool:
+    first_seen, changed = _ensure_timestamp(record, "first_seen")
+    if first_seen is not None:
+        return changed
+    now_iso = _isoformat_utc(_now_utc())
+    record["first_seen"] = now_iso
+    return True
+
+
+def _normalize_profile_edit_metadata(record: Dict) -> None:
+    try:
+        count = int(record.get("profile_edit_count", 0))
+    except Exception:
+        count = 0
+    record["profile_edit_count"] = max(0, count)
+
+    types_raw = record.get("profile_edit_types")
+    if isinstance(types_raw, list):
+        normalized = sorted({str(item).strip() for item in types_raw if str(item).strip()})
+    else:
+        normalized = []
+    record["profile_edit_types"] = normalized
+
+    _ensure_timestamp(record, "last_profile_edit")
+
+
+def _recent_activity_counts() -> Dict[str, int]:
+    global _ACTIVITY_CACHE
+    window_hours = max(1, _settings_value("low_profile_activity_window_hours", 48))
+    now = _now_utc()
+    if _ACTIVITY_CACHE is not None:
+        cached_window, timestamp, cached_counts = _ACTIVITY_CACHE
+        if cached_window == window_hours and now - timestamp < _ACTIVITY_CACHE_TTL:
+            return dict(cached_counts)
+
+    counts: Dict[str, int] = defaultdict(int)
+    cutoff = now - timedelta(hours=window_hours)
+    if _SENT_LOG.exists():
+        try:
+            with _SENT_LOG.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+                    ts_raw = entry.get("ts")
+                    if ts_raw is None:
+                        continue
+                    try:
+                        ts = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc)
+                    except Exception:
+                        continue
+                    if ts < cutoff:
+                        continue
+                    username = str(entry.get("account") or "").strip().lstrip("@").lower()
+                    if not username:
+                        continue
+                    counts[username] += 1
+        except Exception:
+            counts = defaultdict(int)
+
+    frozen = dict(counts)
+    _ACTIVITY_CACHE = (window_hours, now, frozen)
+    return frozen
+
+
+def _auto_low_profile(record: Dict) -> Tuple[bool, str, int]:
+    username = (record.get("username") or "").strip().lstrip("@").lower()
+    if not username:
+        return False, "", 0
+
+    _ensure_first_seen(record)
+    first_seen = _parse_datetime(record.get("first_seen"))
+    age_days = 0.0
+    if first_seen is not None:
+        age_days = (_now_utc() - first_seen).total_seconds() / 86400
+
+    recent_activity_map = _recent_activity_counts()
+    recent_activity = int(recent_activity_map.get(username, 0))
+    record["recent_activity_count"] = recent_activity
+
+    age_limit = max(1, _settings_value("low_profile_age_days", 14))
+    edits_threshold = max(1, _settings_value("low_profile_profile_edit_threshold", 3))
+    activity_threshold = max(0, _settings_value("low_profile_activity_threshold", 30))
+
+    is_new = age_days < age_limit
+    edit_count = int(record.get("profile_edit_count", 0) or 0)
+    has_many_edits = edit_count >= edits_threshold
+    has_high_activity = activity_threshold > 0 and recent_activity >= activity_threshold
+
+    reasons: list[str] = []
+    if is_new:
+        reasons.append(f"cuenta nueva ({int(age_days)}d)")
+    if has_many_edits:
+        reasons.append(f"{edit_count} cambios de perfil")
+    if has_high_activity:
+        window_hours = max(1, _settings_value("low_profile_activity_window_hours", 48))
+        reasons.append(f"{recent_activity} envíos/{window_hours}h")
+
+    should_flag = is_new and (has_many_edits or has_high_activity)
+    reason_text = "; ".join(reasons) if should_flag else ""
+    return should_flag, reason_text, recent_activity
+
+
+def _record_profile_edit(username: str, kind: str) -> None:
+    normalized = username.strip().lstrip("@").lower()
+    if not normalized:
+        return
+
+    items = _load()
+    updated = False
+    for idx, item in enumerate(items):
+        stored = (item.get("username") or "").strip().lstrip("@").lower()
+        if stored != normalized:
+            continue
+        record = dict(item)
+        try:
+            count = int(record.get("profile_edit_count", 0))
+        except Exception:
+            count = 0
+        record["profile_edit_count"] = max(0, count) + 1
+
+        types_raw = record.get("profile_edit_types")
+        types: list[str]
+        if isinstance(types_raw, list):
+            types = [str(entry).strip() for entry in types_raw if str(entry).strip()]
+        else:
+            types = []
+        kind_clean = kind.strip()
+        if kind_clean and kind_clean not in types:
+            types.append(kind_clean)
+        record["profile_edit_types"] = sorted(set(types))
+        record["last_profile_edit"] = _isoformat_utc(_now_utc())
+        items[idx] = record
+        updated = True
+        break
+
+    if updated:
+        _save(items)
+
 def _normalize_account(record: Dict) -> Dict:
     result = dict(record)
     result.setdefault("alias", "default")
@@ -197,6 +396,10 @@ def _normalize_account(record: Dict) -> Dict:
     except Exception:
         sticky_value = sticky_default
     result["proxy_sticky_minutes"] = max(1, sticky_value)
+
+    _normalize_profile_edit_metadata(result)
+    _ensure_first_seen(result)
+
     username = result.get("username")
     if username:
         key = _password_key(username)
@@ -207,6 +410,27 @@ def _normalize_account(record: Dict) -> Dict:
         result["has_totp"] = has_totp_secret(username)
     else:
         result.setdefault("has_totp", False)
+
+    manual_override = bool(result.get("low_profile_manual"))
+    auto_flag, auto_reason, recent_activity = _auto_low_profile(result)
+    result["recent_activity_count"] = recent_activity
+    result["low_profile_auto"] = auto_flag
+
+    if manual_override:
+        manual_value = bool(result.get("low_profile"))
+        result["low_profile"] = manual_value
+        existing_reason = str(result.get("low_profile_reason") or "")
+        if manual_value and not existing_reason:
+            result["low_profile_reason"] = "Marcado manualmente"
+        elif not manual_value:
+            result["low_profile_reason"] = existing_reason
+        result["low_profile_source"] = "manual" if manual_value else ""
+    else:
+        result["low_profile"] = auto_flag
+        result["low_profile_reason"] = auto_reason if auto_flag else ""
+        result["low_profile_source"] = "auto" if auto_flag else ""
+        result.setdefault("low_profile_manual", False)
+
     return result
 
 
@@ -225,6 +449,23 @@ def _prepare_for_save(record: Dict) -> Dict:
         stored.pop("proxy_pass", None)
         stored.pop("proxy_sticky_minutes", None)
     stored.pop("has_totp", None)
+    stored.pop("recent_activity_count", None)
+    stored.pop("low_profile_auto", None)
+    stored.pop("low_profile_source", None)
+
+    manual_override = bool(stored.get("low_profile_manual"))
+    if manual_override:
+        stored["low_profile"] = bool(stored.get("low_profile"))
+        reason = str(stored.get("low_profile_reason") or "")
+        if reason:
+            stored["low_profile_reason"] = reason
+        else:
+            stored.pop("low_profile_reason", None)
+    else:
+        stored.pop("low_profile", None)
+        stored.pop("low_profile_reason", None)
+        stored.pop("low_profile_manual", None)
+
     return stored
 
 
@@ -236,9 +477,30 @@ def _load() -> List[Dict]:
     except Exception:
         return []
     normalized: List[Dict] = []
+    changed = False
     for item in data:
-        if isinstance(item, dict):
-            normalized.append(_normalize_account(item))
+        if not isinstance(item, dict):
+            continue
+        normalized_item = _normalize_account(item)
+        normalized.append(normalized_item)
+        if item.get("first_seen") != normalized_item.get("first_seen"):
+            changed = True
+        if int(item.get("profile_edit_count", 0) or 0) != normalized_item.get(
+            "profile_edit_count", 0
+        ):
+            changed = True
+        original_types = item.get("profile_edit_types") if isinstance(item, dict) else []
+        if isinstance(original_types, list):
+            original_sorted = sorted({str(v).strip() for v in original_types if str(v).strip()})
+        else:
+            original_sorted = []
+        if original_sorted != normalized_item.get("profile_edit_types", []):
+            changed = True
+    if changed:
+        try:
+            _save(normalized)
+        except Exception:
+            pass
     return normalized
 
 
@@ -494,8 +756,11 @@ def _launch_hashtag_mode(alias: str) -> None:
     for idx, acct in enumerate(active_accounts, start=1):
         sess = "[sesión]" if has_session(acct["username"]) else "[sin sesión]"
         proxy_flag = _proxy_indicator(acct)
+        low_flag = _low_profile_indicator(acct)
         totp_flag = _totp_indicator(acct)
-        print(f" {idx}) @{acct['username']} {sess} {proxy_flag}{totp_flag}")
+        print(f" {idx}) @{acct['username']} {sess} {proxy_flag}{low_flag}{totp_flag}")
+        if low_flag and acct.get("low_profile_reason"):
+            print(f"    ↳ {acct['low_profile_reason']}")
     raw = ask("Selección: ").strip()
     if not raw:
         warn("Sin selección.")
@@ -759,6 +1024,10 @@ def prompt_login(username: str, *, interactive: bool = True) -> bool:
         ):
             continue
         return False
+
+
+def _low_profile_indicator(account: Dict) -> str:
+    return f" {em('🌱 bajo perfil')}" if account.get("low_profile") else ""
 
 
 def _proxy_indicator(account: Dict) -> str:
@@ -1169,8 +1438,11 @@ def _select_usernames_for_modifications(alias: str) -> List[str]:
         alias_map[username.lower()] = username
         sess = "[sesión]" if has_session(username) else "[sin sesión]"
         proxy_flag = _proxy_indicator(acct)
+        low_flag = _low_profile_indicator(acct)
         totp_flag = _totp_indicator(acct)
-        print(f" {idx}) @{username} {sess} {proxy_flag}{totp_flag}")
+        print(f" {idx}) @{username} {sess} {proxy_flag}{low_flag}{totp_flag}")
+        if low_flag and acct.get("low_profile_reason"):
+            print(f"    ↳ {acct['low_profile_reason']}")
 
     raw = ask("Selección: ").strip()
     if not raw:
@@ -1368,6 +1640,7 @@ def _apply_username_change(account: Dict, desired_username: str, delay: float) -
         if username.strip().lower() != normalized.lower():
             remove_session(username)
         mark_connected(normalized, True)
+        _record_profile_edit(normalized, "username")
         return normalized
     except Exception as exc:
         if should_retry_proxy(exc):
@@ -1430,6 +1703,7 @@ def _apply_full_name_change(account: Dict, full_name: str, delay: float) -> bool
         client.account_edit(full_name=full_name)
         ok(f"Nombre actualizado para @{username}.")
         mark_connected(username, True)
+        _record_profile_edit(username, "full_name")
         return True
     except Exception as exc:
         if should_retry_proxy(exc):
@@ -1489,6 +1763,7 @@ def _apply_bio_change(account: Dict, biography: str, delay: float) -> bool:
         action = "eliminada" if not biography else "actualizada"
         ok(f"Bio {action} para @{username}.")
         mark_connected(username, True)
+        _record_profile_edit(username, "bio")
         return True
     except Exception as exc:
         if should_retry_proxy(exc):
@@ -1545,6 +1820,7 @@ def _apply_profile_picture(account: Dict, image_path: Path, delay: float) -> boo
         client.account_change_picture(image_path)
         ok(f"Foto de perfil actualizada para @{username}.")
         mark_connected(username, True)
+        _record_profile_edit(username, "profile_picture")
         return True
     except Exception as exc:
         if should_retry_proxy(exc):
@@ -1569,6 +1845,7 @@ def _apply_profile_picture_removal(account: Dict, delay: float) -> bool:
         )
         ok(f"Foto de perfil eliminada para @{username}.")
         mark_connected(username, True)
+        _record_profile_edit(username, "profile_picture")
         return True
     except Exception as exc:
         if should_retry_proxy(exc):
@@ -2068,7 +2345,13 @@ def menu_accounts():
             elif mode == "2":
                 print("Seleccioná cuentas por número o username (coma separada):")
                 for idx, acct in enumerate(group, start=1):
-                    print(f" {idx}) @{acct['username']}")
+                    low_flag = _low_profile_indicator(acct)
+                    label = f" {idx}) @{acct['username']}"
+                    if low_flag:
+                        label += f" {low_flag}"
+                    print(label)
+                    if low_flag and acct.get("low_profile_reason"):
+                        print(f"    ↳ {acct['low_profile_reason']}")
                 raw = ask("Selección: ").strip()
                 if not raw:
                     warn("Sin selección.")
@@ -2170,8 +2453,11 @@ def menu_accounts():
             for idx, acct in enumerate(group, start=1):
                 sess = "[sesión]" if has_session(acct["username"]) else "[sin sesión]"
                 proxy_flag = _proxy_indicator(acct)
+                low_flag = _low_profile_indicator(acct)
                 totp_flag = _totp_indicator(acct)
-                print(f" {idx}) @{acct['username']} {sess} {proxy_flag}{totp_flag}")
+                print(f" {idx}) @{acct['username']} {sess} {proxy_flag}{low_flag}{totp_flag}")
+                if low_flag and acct.get("low_profile_reason"):
+                    print(f"    ↳ {acct['low_profile_reason']}")
             raw = ask("Selección: ").strip()
             if not raw:
                 warn("Sin selección.")
