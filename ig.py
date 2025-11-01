@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import queue
 import random
+import math
 import threading
 import time
 from collections import defaultdict, deque
@@ -365,6 +366,19 @@ def _build_accounts_for_alias(alias: str) -> list[Dict]:
     if not verified:
         warn("No hay cuentas con sesión válida para enviar mensajes.")
         press_enter()
+        return []
+
+    verified.sort(key=lambda acct: (acct.get("low_profile", False), acct.get("username", "")))
+    low_profile_accounts = [acct for acct in verified if acct.get("low_profile")]
+    if low_profile_accounts:
+        warn(
+            "Se detectaron cuentas en modo bajo perfil. Se aplicarán límites conservadores automáticamente."
+        )
+        for acct in low_profile_accounts:
+            reason = acct.get("low_profile_reason") or "motivo no especificado"
+            print(f" - @{acct['username']}: {reason}")
+        print()
+
     return verified
 
 
@@ -473,13 +487,39 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
     if not accounts:
         return
 
+    def _account_cap(record: Dict) -> int:
+        limit = per_acc
+        if record.get("low_profile"):
+            limit = min(limit, SETTINGS.low_profile_daily_cap or limit)
+        return max(1, limit)
+
+    def _account_delay_range(record: Dict) -> tuple[int, int]:
+        if not record.get("low_profile"):
+            return delay_min, delay_max
+        factor = max(100, getattr(SETTINGS, "low_profile_delay_factor", 150))
+        multiplier = max(1.0, factor / 100.0)
+        scaled_min = max(delay_min, int(math.ceil(delay_min * multiplier)))
+        scaled_max = max(scaled_min, int(math.ceil(delay_max * multiplier)))
+        return scaled_min, scaled_max
+
+    account_caps = {a["username"]: _account_cap(a) for a in accounts}
+    account_delays = {a["username"]: _account_delay_range(a) for a in accounts}
+
+    if any(a.get("low_profile") for a in accounts):
+        delay_multiplier = max(1.0, getattr(SETTINGS, "low_profile_delay_factor", 150) / 100.0)
+        logger.info(
+            "Modo bajo perfil aplicado: límite %d mensajes/cuenta y delay x%.2f.",
+            SETTINGS.low_profile_daily_cap,
+            delay_multiplier,
+        )
+
     users = deque([u for u in load_list(listname) if not already_contacted(u)])
     if not users:
         warn("No hay leads (o todos ya fueron contactados).")
         press_enter()
         return
 
-    remaining = {a["username"]: per_acc for a in accounts}
+    remaining = {a["username"]: account_caps[a["username"]] for a in accounts}
     success = defaultdict(int)
     failed = defaultdict(int)
     semaphore = threading.Semaphore(concurr)
@@ -562,10 +602,20 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
                     attention=attention_message,
                 )
             )
-            wait_time = jitter_delay(delay_min, delay_max)
-            logger.debug(
-                "Esperando %ss antes del próximo envío de @%s", wait_time, username
-            )
+            wait_min, wait_max = account_delays.get(username, (delay_min, delay_max))
+            wait_time = jitter_delay(wait_min, wait_max)
+            if account.get("low_profile"):
+                logger.debug(
+                    "Modo bajo perfil para @%s: espera %ss (rango %s-%ss)",
+                    username,
+                    wait_time,
+                    wait_min,
+                    wait_max,
+                )
+            else:
+                logger.debug(
+                    "Esperando %ss antes del próximo envío de @%s", wait_time, username
+                )
             if wait_time > 0:
                 sleep_with_stop(wait_time)
             account_lock.release()

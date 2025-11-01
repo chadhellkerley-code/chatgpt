@@ -175,7 +175,10 @@ def _select_accounts(alias: str) -> List[str]:
     for idx, acct in enumerate(active_accounts, start=1):
         sess = "[sesión]" if has_session(acct["username"]) else "[sin sesión]"
         proxy_flag = " [proxy]" if acct.get("proxy_url") else ""
-        print(f" {idx}) @{acct['username']} {sess}{proxy_flag}")
+        low_flag = " [bajo perfil]" if acct.get("low_profile") else ""
+        print(f" {idx}) @{acct['username']} {sess}{proxy_flag}{low_flag}")
+        if low_flag and acct.get("low_profile_reason"):
+            print(f"    ↳ {acct['low_profile_reason']}")
 
     raw = ask("Selección: ").strip() or "*"
     if raw == "*":
