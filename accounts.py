@@ -6,6 +6,7 @@ import csv
 import getpass
 import io
 import json
+import random
 import re
 import time
 from datetime import datetime, timedelta
@@ -43,6 +44,10 @@ DATA.mkdir(exist_ok=True)
 FILE = DATA / "accounts.json"
 _PASSWORD_FILE = DATA / "passwords.json"
 
+_LOGIN_FAILURE_BACKOFF = timedelta(minutes=5)
+_LOGIN_FAILURES: Dict[str, datetime] = {}
+_LOGIN_FAILURE_LOCK = Lock()
+
 
 def _password_key(username: str | None) -> str:
     if not username:
@@ -76,6 +81,37 @@ def _save_password_cache(cache: Dict[str, str]) -> None:
         )
     except Exception:
         pass
+
+
+def _record_login_failure(username: str) -> None:
+    key = _password_key(username)
+    if not key:
+        return
+    with _LOGIN_FAILURE_LOCK:
+        _LOGIN_FAILURES[key] = datetime.utcnow()
+
+
+def _clear_login_failure(username: str) -> None:
+    key = _password_key(username)
+    if not key:
+        return
+    with _LOGIN_FAILURE_LOCK:
+        _LOGIN_FAILURES.pop(key, None)
+
+
+def _login_backoff_remaining(username: str) -> float:
+    key = _password_key(username)
+    if not key:
+        return 0.0
+    with _LOGIN_FAILURE_LOCK:
+        timestamp = _LOGIN_FAILURES.get(key)
+        if not timestamp:
+            return 0.0
+        elapsed = datetime.utcnow() - timestamp
+        if elapsed >= _LOGIN_FAILURE_BACKOFF:
+            _LOGIN_FAILURES.pop(key, None)
+            return 0.0
+        return (_LOGIN_FAILURE_BACKOFF - elapsed).total_seconds()
 
 
 _PASSWORD_CACHE: Dict[str, str] = _load_password_cache()
@@ -512,10 +548,21 @@ def _launch_interactions(alias: str) -> None:
     interactions.run_from_menu(alias)
 
 
-def _login_and_save_session(account: Dict, password: str) -> bool:
+def _login_and_save_session(
+    account: Dict, password: str, *, respect_backoff: bool = True
+) -> bool:
     """Login con instagrapi y guarda sesión en storage/sessions."""
 
     username = account["username"]
+    if respect_backoff:
+        remaining = _login_backoff_remaining(username)
+        if remaining > 0:
+            logger.debug(
+                "Omitiendo login automático para @%s (reintentar en %.0fs)",
+                username,
+                remaining,
+            )
+            return False
     try:
         from instagrapi import Client
 
@@ -531,9 +578,12 @@ def _login_and_save_session(account: Dict, password: str) -> bool:
                 warn(
                     "No se pudo generar el código 2FA automático. Intentá reconfigurar el TOTP."
                 )
+        jitter = random.uniform(1.5, 3.5)
+        time.sleep(jitter)
         cl.login(username, password, verification_code=verification_code)
         save_from(cl, username)
         mark_connected(username, True)
+        _clear_login_failure(username)
         ok(f"Sesión guardada para {username}.")
         return True
     except Exception as exc:
@@ -543,6 +593,7 @@ def _login_and_save_session(account: Dict, password: str) -> bool:
         else:
             warn(f"No se pudo iniciar sesión para {username}: {exc}")
         mark_connected(username, False)
+        _record_login_failure(username)
         return False
 
 
@@ -690,7 +741,9 @@ def prompt_login(username: str, *, interactive: bool = True) -> bool:
             warn("Se canceló el inicio de sesión.")
             return False
 
-        success = _login_and_save_session(account, password)
+        success = _login_and_save_session(
+            account, password, respect_backoff=False
+        )
         if success:
             if password != original_stored:
                 _store_account_password(username, password)
