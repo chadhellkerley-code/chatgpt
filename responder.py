@@ -863,53 +863,19 @@ _NEGATIVE_KEYWORDS = (
     "no me interesa",
     "no gracias",
 )
-_INFO_KEYWORDS = (
-    "info",
-    "informacion",
-    "información",
-    "detalle",
-    "detalles",
-    "precio",
-    "costo",
-    "mas info",
-    "más info",
+_FOLLOWUP_STATE: Dict[str, dict] | None = None
+_DEFAULT_FOLLOWUP_PROMPT = (
+    "Diseñá un plan de seguimiento amable para leads de Instagram. "
+    "Enviá el primer recordatorio cuando hayan pasado al menos 6 horas sin respuesta. "
+    "Si después de 12 horas más no responden, enviá un segundo y último mensaje. "
+    "No envíes más de dos seguimientos y evitá sonar insistente."
 )
-_CALL_KEYWORDS = (
-    "agenda",
-    "agendar",
-    "llamar",
-    "llamada",
-    "cita",
-    "call",
-    "reunion",
-    "reunión",
-)
-_DEFAULT_LEAD_TAG = "Lead sin clasificar"
+_FOLLOWUP_MIN_INTERVAL = 300
+_FOLLOWUP_HISTORY_MAX_AGE = 14 * 24 * 3600
 
 
-def _format_handle(value: str | None) -> str:
-    if not value:
-        return "@-"
-    value = value.strip()
-    if value.startswith("@"):
-        return value
-    return f"@{value}"
-
-
-def _default_timezone_label() -> str:
-    try:
-        tz = datetime.now().astimezone().tzinfo
-        if tz is None:
-            return "UTC"
-        key = getattr(tz, "key", None)
-        if key:
-            return str(key)
-        zone = getattr(tz, "zone", None)
-        if zone:
-            return str(zone)
-    except Exception:
-        pass
-    return "UTC"
+def _normalize_username(value: str) -> str:
+    return value.strip().lstrip("@").lower()
 
 
 def _safe_timezone(label: str):
@@ -945,119 +911,216 @@ def _print_response_summary(
         print(style_text(extra, color=Fore.GREEN, bold=True))
 
 
-@contextmanager
-def _suppress_console_noise() -> None:
-    root = logging.getLogger()
-    stream_handlers: list[logging.Handler] = [
-        handler
-        for handler in root.handlers
-        if isinstance(handler, logging.StreamHandler)
-    ]
-    original_levels = [handler.level for handler in stream_handlers]
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
+def _followup_prune_history(history: Dict[str, dict]) -> Dict[str, dict]:
+    now = time.time()
+    cleaned: Dict[str, dict] = {}
+    for key, record in history.items():
+        if not isinstance(record, dict):
+            continue
+        last_ts = record.get("last_sent_ts") or record.get("last_eval_ts")
         try:
-            for handler in stream_handlers:
-                handler.setLevel(logging.CRITICAL + 1)
-            yield
-        finally:
-            for handler, level in zip(stream_handlers, original_levels):
-                handler.setLevel(level)
+            ts_value = float(last_ts)
+        except Exception:
+            ts_value = 0.0
+        if ts_value and now - ts_value > _FOLLOWUP_HISTORY_MAX_AGE:
+            continue
+        cleaned[key] = record
+    return cleaned
 
 
-def _normalize_text_for_match(value: str) -> str:
-    normalized = unicodedata.normalize("NFD", value.lower())
-    return "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+def _get_followup_entry(alias: str) -> Dict[str, object]:
+    state = _read_followup_state()
+    key = _normalize_alias_key(alias)
+    aliases: Dict[str, dict] = state.get("aliases", {})
+    entry = aliases.get(key)
+    if not isinstance(entry, dict):
+        return {}
+    entry.setdefault("alias", alias.strip() or alias)
+    entry.setdefault("enabled", False)
+    entry.setdefault("accounts", [])
+    entry.setdefault("prompt", _DEFAULT_FOLLOWUP_PROMPT)
+    entry.setdefault("history", {})
+    history = entry.get("history")
+    if isinstance(history, dict):
+        entry["history"] = _followup_prune_history(history)
+    return entry
 
 
-def _contains_token(text: str, token: str) -> bool:
-    token = token.strip()
-    if not token:
-        return False
-    if " " in token:
-        return token in text
-    return (
-        text == token
-        or text.startswith(token + " ")
-        or text.endswith(" " + token)
-        or f" {token} " in text
-    )
+def _set_followup_entry(alias: str, updates: Dict[str, object]) -> None:
+    alias = alias.strip()
+    if not alias:
+        warn("Alias inválido.")
+        return
+    state = _read_followup_state()
+    aliases: Dict[str, dict] = state.setdefault("aliases", {})
+    key = _normalize_alias_key(alias)
+    entry = aliases.get(key, {})
+    entry.setdefault("alias", alias)
+    entry.setdefault("prompt", _DEFAULT_FOLLOWUP_PROMPT)
+    normalized_updates: Dict[str, object] = {}
+    for key_name, value in updates.items():
+        if key_name == "accounts":
+            normalized: List[str] = []
+            if isinstance(value, (list, tuple, set)):
+                seen: set[str] = set()
+                for raw in value:
+                    if not isinstance(raw, str):
+                        continue
+                    norm = _normalize_username(raw)
+                    if norm and norm not in seen:
+                        seen.add(norm)
+                        normalized.append(norm)
+            elif isinstance(value, str):
+                norm = _normalize_username(value)
+                if norm:
+                    normalized = [norm]
+            normalized_updates[key_name] = normalized
+        elif key_name == "enabled":
+            normalized_updates[key_name] = bool(value)
+        elif key_name == "prompt":
+            normalized_updates[key_name] = str(value or "")
+        elif key_name == "history":
+            if isinstance(value, dict):
+                normalized_updates[key_name] = _followup_prune_history(value)
+        else:
+            normalized_updates[key_name] = value
+    entry.update(normalized_updates)
+    aliases[key] = entry
+    _write_followup_state(state)
 
 
-def _classify_response(message: str) -> str | None:
-    norm = _normalize_text_for_match(message)
-    if not norm:
-        return None
-    for keyword in _POSITIVE_KEYWORDS:
-        if _contains_token(norm, keyword):
-            return "Interesado"
-    for keyword in _NEGATIVE_KEYWORDS:
-        if _contains_token(norm, keyword):
-            return "No interesado"
-    return None
+def _followup_status_lines() -> List[str]:
+    state = _read_followup_state()
+    aliases: Dict[str, dict] = state.get("aliases", {})
+    if not aliases:
+        return ["(sin configuraciones)"]
+    rows: List[str] = []
+    for key in sorted(aliases.keys()):
+        entry = aliases[key]
+        if not isinstance(entry, dict):
+            continue
+        alias_label = str(entry.get("alias") or key)
+        enabled = bool(entry.get("enabled"))
+        accounts = entry.get("accounts") or []
+        if accounts:
+            preview_accounts = [f"@{acc}" for acc in accounts[:3]]
+            if len(accounts) > 3:
+                preview_accounts.append(f"+{len(accounts) - 3}")
+            accounts_label = ", ".join(preview_accounts)
+        else:
+            accounts_label = "todas las cuentas del alias"
+        prompt_preview = _preview_prompt(str(entry.get("prompt") or ""))
+        status_label = "Activo" if enabled else "Inactivo"
+        rows.append(
+            f" - {alias_label}: {status_label} • Cuentas: {accounts_label} • Prompt: {prompt_preview}"
+        )
+    return rows
 
 
-def _resolve_username(client, thread, target_user_id: int) -> str:
-    try:
-        for participant in getattr(thread, "users", []) or []:
-            pk = getattr(participant, "pk", None) or getattr(participant, "id", None)
-            if pk == target_user_id:
-                username = getattr(participant, "username", None)
-                if username:
-                    return username
-    except Exception:
-        pass
-    try:
-        info = client.user_info(target_user_id)
-        username = getattr(info, "username", None)
-        if username:
-            return username
-    except Exception:
-        pass
-    return str(target_user_id)
+def _followup_summary_line() -> str:
+    state = _read_followup_state()
+    aliases: Dict[str, dict] = state.get("aliases", {})
+    active = [
+        str(entry.get("alias") or key)
+        for key, entry in aliases.items()
+        if isinstance(entry, dict) and entry.get("enabled")
+    ]
+    if not active:
+        return "Seguimiento: (sin configurar)"
+    return f"Seguimiento: activo para {', '.join(sorted(active))}"
 
 
-@dataclass
-class BotStats:
-    alias: str
-    responded: int = 0
-    errors: int = 0
-    responses: int = 0
-    accounts: set[str] = field(default_factory=set)
-
-    def _bump_responses(self, account: str) -> int:
-        self.responses += 1
-        self.accounts.add(account)
-        return self.responses
-
-    def record_success(self, account: str) -> int:
-        index = self._bump_responses(account)
-        self.responded += 1
-        return index
-
-    def record_response_error(self, account: str) -> int:
-        index = self._bump_responses(account)
-        self.errors += 1
-        return index
-
-    def record_error(self, account: str) -> None:
-        self.errors += 1
-        self.accounts.add(account)
+def _followup_accounts_for_alias(alias: str) -> List[str]:
+    targets = _choose_targets(alias)
+    normalized = {_normalize_username(user) for user in targets}
+    return sorted(account for account in normalized if account)
 
 
-def _client_for(username: str):
-    from instagrapi import Client
+def _followup_enabled_entry_for(username: str) -> tuple[Optional[str], Dict[str, object]]:
+    alias_candidates: List[str] = []
+    if ACTIVE_ALIAS:
+        alias_candidates.append(ACTIVE_ALIAS)
+    account_data = get_account(username) or {}
+    account_alias = str(account_data.get("alias") or "").strip()
+    if account_alias:
+        alias_candidates.append(account_alias)
+    alias_candidates.append(username)
+    alias_candidates.append("ALL")
 
-    account = get_account(username)
-    cl = Client()
-    binding = None
-    try:
-        binding = apply_proxy_to_client(cl, username, account, reason="autoresponder")
-    except Exception as exc:
-        if account and account.get("proxy_url"):
-            record_proxy_failure(username, exc)
-            raise RuntimeError(f"El proxy de @{username} no respondió: {exc}") from exc
-        logger.warning("Proxy no disponible para @%s: %s", username, exc, exc_info=False)
+    seen: set[str] = set()
+    for alias in alias_candidates:
+        norm = _normalize_alias_key(alias)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        entry = _get_followup_entry(alias)
+        if not entry or not entry.get("enabled"):
+            continue
+        accounts = entry.get("accounts") or []
+        if accounts:
+            norm_user = _normalize_username(username)
+            if norm_user not in accounts:
+                continue
+        return alias, entry
+    return None, {}
+
+
+def _followup_configure_accounts() -> None:
+    banner()
+    print(style_text("Seguimiento automático • Cuentas", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.BLUE))
+    for line in _followup_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _prompt_alias_selection()
+    if not alias:
+        return
+    available = _followup_accounts_for_alias(alias)
+    if not available:
+        warn("No se encontraron cuentas activas para ese alias.")
+        press_enter()
+        return
+    entry = _get_followup_entry(alias)
+    stored_accounts = set(entry.get("accounts") or [])
+    use_all = entry.get("enabled") and not stored_accounts
+    print("Seleccioná las cuentas que usarán seguimiento automático:")
+    for idx, account in enumerate(available, start=1):
+        selected = use_all or account in stored_accounts
+        marker = "[x]" if selected else "[ ]"
+        print(f" {idx:>2}) {marker} @{account}")
+    print("  0) Todas las cuentas del alias")
+    choice = ask(
+        "Números separados por coma (vacío cancela, 0 = todas): "
+    ).strip()
+    if not choice:
+        warn("No se realizaron cambios.")
+        press_enter()
+        return
+    if choice.lower() in {"0", "todas", "all"}:
+        _set_followup_entry(alias, {"accounts": [], "enabled": True})
+        ok("Seguimiento habilitado para todas las cuentas del alias.")
+        press_enter()
+        return
+    tokens = re.split(r"[\s,;]+", choice)
+    indices: List[int] = []
+    for token in tokens:
+        if not token:
+            continue
+        if not token.isdigit():
+            continue
+        idx = int(token)
+        if 1 <= idx <= len(available):
+            if idx not in indices:
+                indices.append(idx)
+    if not indices:
+        warn("No se seleccionaron cuentas válidas.")
+        press_enter()
+        return
+    selected_accounts = [available[i - 1] for i in indices]
+    _set_followup_entry(alias, {"accounts": selected_accounts, "enabled": True})
+    ok(f"Seguimiento habilitado para {len(selected_accounts)} cuentas.")
+    press_enter()
+
 
     try:
         load_into(cl, username)
@@ -1079,77 +1142,226 @@ def _client_for(username: str):
     return cl
 
 
-def _ensure_session(username: str) -> bool:
-    try:
-        _client_for(username)
-        return True
-    except Exception:
-        return False
+def _followup_disable() -> None:
+    banner()
+    print(style_text("Seguimiento automático • Desactivar", color=Fore.CYAN, bold=True))
+    print(full_line(color=Fore.BLUE))
+    for line in _followup_status_lines():
+        print(line)
+    print(full_line(color=Fore.BLUE))
+    alias = _prompt_alias_selection()
+    if not alias:
+        return
+    entry = _get_followup_entry(alias)
+    if not entry or not entry.get("enabled"):
+        warn("El seguimiento ya está inactivo para ese alias.")
+        press_enter()
+        return
+    _set_followup_entry(alias, {"enabled": False, "history": {}})
+    ok("Seguimiento desactivado para ese alias.")
+    press_enter()
 
 
-def _gen_response(api_key: str, system_prompt: str, convo_text: str) -> str:
-    try:
+def _followup_menu() -> None:
+    while True:
+        banner()
+        print(style_text("Seguimiento automático", color=Fore.CYAN, bold=True))
+        print(full_line(color=Fore.BLUE))
+        for line in _followup_status_lines():
+            print(line)
+        print(full_line(color=Fore.BLUE))
+        print("1) Configurar cuentas con seguimiento")
+        print("2) Configurar prompt de seguimiento")
+        print("3) Desactivar seguimiento para un alias")
+        print("4) Volver")
+        choice = ask("Opción: ").strip()
+        if choice == "1":
+            _followup_configure_accounts()
+        elif choice == "2":
+            _followup_configure_prompt()
+        elif choice == "3":
+            _followup_disable()
+        elif choice == "4":
+            break
+        else:
+            warn("Opción inválida.")
+            press_enter()
+
+
+def _followup_decision(
+    api_key: str,
+    prompt_text: str,
+    conversation: str,
+    metadata: Dict[str, object],
+) -> Optional[tuple[str, int]]:
+    prompt_text = prompt_text.strip()
+    if not prompt_text or not api_key:
+        return None
+    try:  # pragma: no cover - depende de dependencia externa
         from openai import OpenAI
-
+    except Exception as exc:
+        logger.warning(
+            "No se pudo importar OpenAI para seguimiento: %s", exc, exc_info=False
+        )
+        return None
+    try:  # pragma: no cover - depende de credenciales externas
         client = OpenAI(api_key=api_key)
-        msg = client.responses.create(
+    except Exception as exc:
+        logger.warning(
+            "No se pudo inicializar OpenAI para seguimiento: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+
+    system_prompt = (
+        "Sos un asistente que decide si enviar un mensaje de seguimiento en Instagram. "
+        "Debés seguir estrictamente las reglas provistas y responder SOLO con un objeto "
+        "JSON con las claves 'enviar' (booleano), 'mensaje' (texto) y 'etapa' (número entero). "
+        "Si no corresponde enviar, devolvé enviar=false, mensaje=\"\" y usá la etapa actual."
+    )
+    context_lines = ["Prompt de seguimiento personalizado:", prompt_text, "", "Contexto:"]
+    for key, value in metadata.items():
+        context_lines.append(f"- {key}: {value}")
+    context_lines.append("")
+    context_lines.append("Conversación completa (orden cronológico):")
+    context_lines.append(conversation)
+    user_content = "\n".join(context_lines)
+
+    try:  # pragma: no cover - depende de red externa
+        response = client.responses.create(
             model="gpt-4o-mini",
             input=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": convo_text},
+                {"role": "user", "content": user_content},
             ],
-            temperature=0.6,
-            max_output_tokens=180,
+            temperature=0.2,
+            max_output_tokens=240,
         )
-        return (msg.output_text or "").strip() or "Gracias por tu mensaje 🙌 ¿Cómo te puedo ayudar?"
-    except Exception as e:  # pragma: no cover - depende de red externa
-        logger.warning("Fallo al generar respuesta con OpenAI: %s", e, exc_info=False)
-        return "Gracias por tu mensaje 🙌 ¿Cómo te puedo ayudar?"
+        raw_text = (response.output_text or "").strip()
+    except Exception as exc:
+        logger.warning(
+            "No se pudo evaluar el seguimiento con OpenAI: %s", exc, exc_info=False
+        )
+        return None
+    if not raw_text:
+        return None
+    data: Optional[dict] = None
+    try:
+        data = json.loads(raw_text)
+    except Exception:
+        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+            except Exception:
+                data = None
+    if not isinstance(data, dict):
+        return None
+    enviar = data.get("enviar")
+    if isinstance(enviar, str):
+        enviar = enviar.strip().lower() in {"true", "1", "si", "sí", "yes"}
+    if not enviar:
+        return None
+    message = str(data.get("mensaje") or "").strip()
+    if not message:
+        return None
+    etapa_value = data.get("etapa")
+    try:
+        etapa_int = int(etapa_value)
+    except Exception:
+        etapa_int = int(metadata.get("seguimientos_previos", 0)) + 1
+    etapa_int = max(1, etapa_int)
+    return message, etapa_int
 
 
-def _choose_targets(alias: str) -> list[str]:
-    accounts_data = list_all()
-    alias_key = alias.lstrip("@")
-    alias_lower = alias_key.lower()
+def _process_followups(client, user: str, api_key: str) -> None:
+    alias, entry = _followup_enabled_entry_for(user)
+    if not alias or not entry or not entry.get("enabled"):
+        return
+    prompt_text = str(entry.get("prompt") or _DEFAULT_FOLLOWUP_PROMPT)
+    if not prompt_text.strip():
+        return
+    history_source = entry.get("history")
+    history: Dict[str, dict] = dict(history_source) if isinstance(history_source, dict) else {}
+    try:
+        threads = client.direct_threads(amount=15)
+    except Exception as exc:  # pragma: no cover - depende de SDK externo
+        logger.debug(
+            "No se pudieron obtener hilos para seguimiento de @%s: %s",
+            user,
+            exc,
+            exc_info=False,
+        )
+        return
+    now_ts = time.time()
+    account_norm = _normalize_username(user)
+    updated = False
+    for thread in threads:
+        if STOP_EVENT.is_set():
+            break
+        thread_id = getattr(thread, "id", None)
+        if not thread_id:
+            continue
+        unread_count = getattr(thread, "unread_count", None)
+        try:
+            unread_int = int(unread_count)
+        except Exception:
+            unread_int = 0
+        if unread_int > 0:
+            continue
+        participants = getattr(thread, "users", None)
+        recipient_id: Optional[int] = None
+        recipient_username = ""
+        if isinstance(participants, list):
+            for participant in participants:
+                pk = getattr(participant, "pk", None)
+                if pk and pk != client.user_id:
+                    recipient_id = pk
+                    recipient_username = getattr(participant, "username", str(pk))
+                    break
+        if not recipient_id:
+            continue
+        try:
+            messages = client.direct_messages(thread_id, amount=20)
+        except Exception as exc:  # pragma: no cover - depende de SDK externo
+            logger.debug(
+                "No se pudieron obtener mensajes del hilo %s para seguimiento: %s",
+                thread_id,
+                exc,
+                exc_info=False,
+            )
+            continue
+        if not messages:
+            continue
+        last_message = messages[0]
+        if last_message.user_id != client.user_id:
+            continue
 
-    if alias.upper() == "ALL":
-        candidates = [a["username"] for a in accounts_data if a.get("active")]
-    else:
-        alias_matches = [
-            a for a in accounts_data if a.get("alias", "").lower() == alias_lower and a.get("active")
+        def _msg_ts(msg: object) -> Optional[float]:
+            ts_obj = getattr(msg, "timestamp", None)
+            if isinstance(ts_obj, datetime):
+                return ts_obj.timestamp()
+            try:
+                return float(ts_obj)
+            except Exception:
+                return None
+
+        last_outbound_ts = _msg_ts(last_message)
+        if last_outbound_ts and now_ts - last_outbound_ts < 60:
+            continue
+
+        inbound_messages = [
+            msg
+            for msg in messages
+            if msg.user_id != client.user_id and isinstance(getattr(msg, "text", None), str)
         ]
-        if alias_matches:
-            candidates = [a["username"] for a in alias_matches]
-        else:
-            username_matches = [
-                a for a in accounts_data if a.get("username", "").lower() == alias_lower and a.get("active")
-            ]
-            if username_matches:
-                candidates = [username_matches[0]["username"]]
-            else:
-                candidates = [alias_key]
-
-    seen = set()
-    deduped: list[str] = []
-    for user in candidates:
-        norm = user.lstrip("@")
-        if norm not in seen:
-            seen.add(norm)
-            deduped.append(norm)
-    return deduped
-
-
-def _filter_valid_sessions(targets: list[str]) -> list[str]:
-    verified: list[str] = []
-    needing_login: list[tuple[str, str]] = []
-    for user in targets:
-        if not has_session(user):
-            needing_login.append((user, "sin sesión guardada"))
+        if not inbound_messages:
             continue
-        if not _ensure_session(user):
-            needing_login.append((user, "sesión expirada"))
+        last_inbound = inbound_messages[0]
+        last_inbound_ts = _msg_ts(last_inbound)
+        if last_inbound_ts and now_ts - last_inbound_ts < 60:
             continue
-        verified.append(user)
 
     if needing_login:
         remaining: list[tuple[str, str]] = []
@@ -1177,37 +1389,158 @@ def _filter_valid_sessions(targets: list[str]) -> list[str]:
                 warn("Se omitieron las cuentas sin sesión válida.")
     return verified
 
+        followups_sent = int(record.get("count", 0) or 0)
+        last_followup_ts = record.get("last_sent_ts")
+        try:
+            last_followup_float = float(last_followup_ts)
+        except Exception:
+            last_followup_float = 0.0
 
-def _mask_key(value: str) -> str:
-    value = value.strip()
-    if not value:
-        return ""
-    if len(value) <= 6:
-        return value[:2] + "…"
-    return f"{value[:4]}…{value[-2:]}"
+        conversation_lines: List[str] = []
+        for msg in reversed(messages[:40]):
+            text = getattr(msg, "text", "") or ""
+            prefix = "YO" if msg.user_id == client.user_id else "ELLOS"
+            conversation_lines.append(f"{prefix}: {text}")
+        conversation_text = "\n".join(conversation_lines[-40:])
+
+        metadata = {
+            "alias": alias,
+            "cuenta_origen": f"@{user}",
+            "lead": recipient_username or str(recipient_id),
+            "seguimientos_previos": followups_sent,
+            "segundos_desde_ultimo_seguimiento": int(now_ts - last_followup_float)
+            if last_followup_float
+            else "nunca",
+            "segundos_desde_ultima_respuesta": int(now_ts - last_inbound_ts)
+            if last_inbound_ts
+            else "desconocido",
+            "segundos_desde_ultimo_mensaje_enviado": int(now_ts - last_outbound_ts)
+            if last_outbound_ts
+            else "desconocido",
+        }
+        decision = _followup_decision(api_key, prompt_text, conversation_text, metadata)
+        record["last_eval_ts"] = now_ts
+        if not decision:
+            history[history_key] = record
+            updated = True
+            continue
+        message_text, stage = decision
+        try:
+            dm = client.direct_send(message_text, [recipient_id])
+            message_id = getattr(dm, "id", "")
+        except Exception as exc:  # pragma: no cover - depende de SDK externo
+            logger.warning(
+                "No se pudo enviar seguimiento automático a %s desde @%s: %s",
+                recipient_username or recipient_id,
+                user,
+                exc,
+                exc_info=False,
+            )
+            record["last_error"] = str(exc)
+            history[history_key] = record
+            updated = True
+            continue
+        record["count"] = stage
+        record["last_sent_ts"] = now_ts
+        record["last_message_id"] = message_id or ""
+        record.pop("last_error", None)
+        history[history_key] = record
+        updated = True
+        print(
+            style_text(
+                f"[Seguimiento] @{user} → @{recipient_username}: mensaje etapa {stage}",
+                color=Fore.MAGENTA,
+            )
+        )
+    if updated:
+        _set_followup_entry(alias, {"history": history})
+
+_POSITIVE_KEYWORDS = (
+    "si",
+    "quiero saber mas",
+    "me interesa",
+    "interesado",
+)
+_NEGATIVE_KEYWORDS = (
+    "no",
+    "ya tengo",
+    "no me interesa",
+    "no gracias",
+)
+_INFO_KEYWORDS = (
+    "info",
+    "informacion",
+    "información",
+    "detalle",
+    "detalles",
+    "precio",
+    "costo",
+    "mas info",
+    "más info",
+)
+_FOLLOWUP_STATE: Dict[str, dict] | None = None
+_DEFAULT_FOLLOWUP_PROMPT = (
+    "Diseñá un plan de seguimiento amable para leads de Instagram. "
+    "Enviá el primer recordatorio cuando hayan pasado al menos 6 horas sin respuesta. "
+    "Si después de 12 horas más no responden, enviá un segundo y último mensaje. "
+    "No envíes más de dos seguimientos y evitá sonar insistente."
+)
+_FOLLOWUP_MIN_INTERVAL = 300
+_FOLLOWUP_HISTORY_MAX_AGE = 14 * 24 * 3600
 
 
-def _system_prompt_file(alias: str | None = None) -> Path:
-    alias_key = (alias or _PROMPT_DEFAULT_ALIAS).strip() or _PROMPT_DEFAULT_ALIAS
-    safe_alias = re.sub(r"[^a-z0-9_.-]", "_", alias_key.lower())
-    return _PROMPT_STORAGE_DIR / safe_alias / "system_prompt.txt"
+def _normalize_username(value: str) -> str:
+    return value.strip().lstrip("@").lower()
 
 
-def _normalize_system_prompt_text(value: str) -> str:
-    if not value:
-        return ""
-    return value.replace("\r\n", "\n").replace("\r", "\n")
+def _safe_timezone(label: str):
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(label)
+        except Exception:
+            try:
+                return ZoneInfo(_default_timezone_label())
+            except Exception:
+                try:
+                    return ZoneInfo("UTC")
+                except Exception:
+                    pass
+    if dateutil_tz is not None:  # pragma: no cover - depende de dateutil
+        for candidate in (label, _default_timezone_label(), "UTC"):
+            tzinfo = dateutil_tz.gettz(candidate)
+            if tzinfo is not None:
+                return tzinfo
+    return timezone.utc
 
 
-def _read_system_prompt_from_file(alias: str | None = None) -> str | None:
-    path = _system_prompt_file(alias)
-    if not path.exists():
-        return None
-    try:
-        return _normalize_system_prompt_text(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        logger.warning("No se pudo leer %s: %s", path, exc, exc_info=False)
-        return None
+def _print_response_summary(
+    index: int, sender: str, recipient: str, success: bool, extra: Optional[str] = None
+) -> None:
+    icon = "✔️" if success else "❌"
+    status = "OK" if success else "ERROR"
+    print(
+        f"[{icon}] Respuesta {index} | Emisor: {_format_handle(sender)} | "
+        f"Receptor: {_format_handle(recipient)} | Estado: {status}"
+    )
+    if extra:
+        print(style_text(extra, color=Fore.GREEN, bold=True))
+
+
+def _followup_prune_history(history: Dict[str, dict]) -> Dict[str, dict]:
+    now = time.time()
+    cleaned: Dict[str, dict] = {}
+    for key, record in history.items():
+        if not isinstance(record, dict):
+            continue
+        last_ts = record.get("last_sent_ts") or record.get("last_eval_ts")
+        try:
+            ts_value = float(last_ts)
+        except Exception:
+            ts_value = 0.0
+        if ts_value and now - ts_value > _FOLLOWUP_HISTORY_MAX_AGE:
+            continue
+        cleaned[key] = record
+    return cleaned
 
 
 def _persist_system_prompt(prompt: str, alias: str | None = None) -> str:
@@ -1386,12 +1719,12 @@ def _get_google_calendar_entry(alias: str) -> Dict[str, object]:
     return {}
 
 
-def _set_google_calendar_entry(alias: str, updates: Dict[str, object]) -> None:
+def _set_followup_entry(alias: str, updates: Dict[str, object]) -> None:
     alias = alias.strip()
     if not alias:
         warn("Alias inválido.")
         return
-    state = _read_google_calendar_state()
+    state = _read_followup_state()
     aliases: Dict[str, dict] = state.setdefault("aliases", {})
     key = _normalize_alias_key(alias)
     entry = aliases.get(key, {})
@@ -1425,51 +1758,48 @@ def _set_google_calendar_entry(alias: str, updates: Dict[str, object]) -> None:
             normalized_updates[key_name] = value
     entry.update(normalized_updates)
     aliases[key] = entry
-    _write_google_calendar_state(state)
+    _write_followup_state(state)
 
 
-def _mask_google_calendar_status(entry: Dict[str, object]) -> str:
-    connected = bool(entry.get("connected"))
-    enabled = bool(entry.get("enabled"))
-    status = "🟢 Activo" if connected and enabled else "🟡 Conectado" if connected else "⚪ Inactivo"
-    summary = entry.get("event_name") or "(sin nombre)"
-    tz_label = entry.get("timezone") or "UTC"
-    return f"{status} • Evento: {summary} • TZ: {tz_label}"
-
-
-def _google_calendar_status_lines() -> List[str]:
-    state = _read_google_calendar_state()
+def _followup_status_lines() -> List[str]:
+    state = _read_followup_state()
     aliases: Dict[str, dict] = state.get("aliases", {})
     if not aliases:
         return ["(sin configuraciones)"]
     rows: List[str] = []
     for key in sorted(aliases.keys()):
         entry = aliases[key]
-        label = str(entry.get("alias") or key)
-        rows.append(f" - {label}: {_mask_google_calendar_status(entry)}")
+        if not isinstance(entry, dict):
+            continue
+        alias_label = str(entry.get("alias") or key)
+        enabled = bool(entry.get("enabled"))
+        accounts = entry.get("accounts") or []
+        if accounts:
+            preview_accounts = [f"@{acc}" for acc in accounts[:3]]
+            if len(accounts) > 3:
+                preview_accounts.append(f"+{len(accounts) - 3}")
+            accounts_label = ", ".join(preview_accounts)
+        else:
+            accounts_label = "todas las cuentas del alias"
+        prompt_preview = _preview_prompt(str(entry.get("prompt") or ""))
+        status_label = "Activo" if enabled else "Inactivo"
+        rows.append(
+            f" - {alias_label}: {status_label} • Cuentas: {accounts_label} • Prompt: {prompt_preview}"
+        )
     return rows
 
 
-def _google_calendar_summary_line() -> str:
-    state = _read_google_calendar_state()
+def _followup_summary_line() -> str:
+    state = _read_followup_state()
     aliases: Dict[str, dict] = state.get("aliases", {})
-    enabled_aliases = [
-        entry
-        for entry in aliases.values()
-        if isinstance(entry, dict) and entry.get("connected") and entry.get("enabled")
+    active = [
+        str(entry.get("alias") or key)
+        for key, entry in aliases.items()
+        if isinstance(entry, dict) and entry.get("enabled")
     ]
-    if not enabled_aliases:
-        configured_aliases = [
-            entry
-            for entry in aliases.values()
-            if isinstance(entry, dict) and entry.get("connected")
-        ]
-        if configured_aliases:
-            labels = sorted(str(entry.get("alias") or "?") for entry in configured_aliases)
-            return f"Google Calendar: conectado para {', '.join(labels)} (inactivo)"
-        return "Google Calendar: (sin configurar)"
-    labels = sorted(str(entry.get("alias") or "?") for entry in enabled_aliases)
-    return f"Google Calendar: activo para {', '.join(labels)}"
+    if not active:
+        return "Seguimiento: (sin configurar)"
+    return f"Seguimiento: activo para {', '.join(sorted(active))}"
 
 
 def _google_calendar_candidate_keys(lead: str, phone: str) -> list[str]:
@@ -1614,6 +1944,803 @@ def _google_calendar_store_tokens(
 def _google_calendar_refresh_access_token(
     alias: str, entry: Dict[str, object]
 ) -> Optional[str]:
+    if requests is None and (Credentials is None or build is None):
+        return None
+    refresh_token = entry.get("refresh_token")
+    client_id = entry.get("client_id")
+    client_secret = entry.get("client_secret")
+    if not refresh_token or not client_id:
+        return None
+    data = {
+        "client_id": client_id,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }
+    if client_secret:
+        data["client_secret"] = client_secret
+    try:
+        response = requests.post(_GOOGLE_TOKEN_URL, data=data, timeout=15)
+    except RequestException as exc:  # pragma: no cover - depende de red externa
+        logger.warning("No se pudo refrescar el token de Google Calendar: %s", exc, exc_info=False)
+        return None
+    if response.status_code != 200:
+        logger.warning(
+            "Respuesta inesperada al refrescar token de Google Calendar: %s", response.text
+        )
+        return None
+    token_data = response.json()
+    entry = _google_calendar_store_tokens(alias, entry, token_data)
+    return entry.get("access_token")
+
+
+def _google_calendar_update_tokens_from_credentials(
+    alias: str, entry: Dict[str, object], creds: object
+) -> None:
+    token = getattr(creds, "token", None)
+    if not token:
+        return
+    refresh_token = getattr(creds, "refresh_token", None) or entry.get("refresh_token")
+    expiry = getattr(creds, "expiry", None)
+    expires_in = 3600
+    if expiry is not None:
+        try:
+            expiry_dt = expiry
+            if isinstance(expiry_dt, str):
+                parsed = _safe_parse_datetime(expiry_dt)
+                if parsed is not None:
+                    expiry_dt = parsed
+            if isinstance(expiry_dt, datetime):
+                if expiry_dt.tzinfo is None:
+                    expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+                delta = expiry_dt - datetime.now(timezone.utc)
+                expires_in = max(60, int(delta.total_seconds()))
+        except Exception:
+            expires_in = 3600
+    token_payload = {
+        "access_token": token,
+        "refresh_token": refresh_token,
+        "token_type": "Bearer",
+        "expires_in": expires_in,
+    }
+    _google_calendar_store_tokens(alias, entry, token_payload)
+
+
+def _google_calendar_credentials_from_entry(
+    alias: str, entry: Dict[str, object]
+) -> Optional[object]:
+    if Credentials is None:
+        return None
+    access_token = entry.get("access_token")
+    refresh_token = entry.get("refresh_token")
+    client_id = entry.get("client_id")
+    if not access_token or not refresh_token or not client_id:
+        return None
+    try:
+        creds = Credentials(
+            token=str(access_token),
+            refresh_token=str(refresh_token),
+            token_uri=_GOOGLE_TOKEN_URL,
+            client_id=str(client_id),
+            client_secret=str(entry.get("client_secret") or "") or None,
+            scopes=[_GOOGLE_SCOPE],
+        )
+    except Exception as exc:  # pragma: no cover - depende de librerías externas
+        logger.warning(
+            "No se pudieron preparar credenciales de Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    if not getattr(creds, "valid", False) and getattr(creds, "refresh_token", None):
+        if GoogleAuthRequest is None:
+            return creds
+        try:
+            creds.refresh(GoogleAuthRequest())  # type: ignore[misc]
+            _google_calendar_update_tokens_from_credentials(alias, entry, creds)
+        except Exception as exc:  # pragma: no cover - depende de red/creds
+            logger.warning(
+                "No se pudo refrescar credenciales de Google Calendar via google-auth: %s",
+                exc,
+                exc_info=False,
+            )
+            return None
+    return creds
+
+
+def _google_calendar_create_event_via_service(
+    alias: str,
+    entry: Dict[str, object],
+    payload: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    if build is None or Credentials is None:
+        return None
+    creds = _google_calendar_credentials_from_entry(alias, entry)
+    if not creds:
+        return None
+    try:
+        service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "No se pudo inicializar el cliente de Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    kwargs: Dict[str, object] = {}
+    if "conferenceData" in payload:
+        kwargs["conferenceDataVersion"] = 1
+    try:
+        event = (
+            service.events()  # type: ignore[call-arg]
+            .insert(calendarId="primary", body=payload, **kwargs)
+            .execute()
+        )
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "Error al crear evento de Google Calendar mediante googleapiclient: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    _google_calendar_update_tokens_from_credentials(alias, entry, creds)
+    if isinstance(event, dict):
+        return event
+    return None
+
+
+def _google_calendar_create_event_via_requests(
+    alias: str,
+    entry: Dict[str, object],
+    payload: Dict[str, object],
+    params: Dict[str, object],
+    access_token: Optional[str],
+) -> Optional[Dict[str, object]]:
+    if requests is None and (Credentials is None or build is None):
+        return None
+    token_value = access_token or entry.get("access_token")
+    if not token_value:
+        return None
+    headers = {
+        "Authorization": f"Bearer {token_value}",
+        "Content-Type": "application/json",
+    }
+    url = f"{_GOOGLE_CALENDAR_BASE}/calendars/primary/events"
+    try:
+        response = requests.post(  # type: ignore[call-arg]
+            url,
+            headers=headers,
+            json=payload,
+            params=params or None,
+            timeout=20,
+        )
+    except RequestException as exc:  # pragma: no cover - depende de red externa
+        logger.warning("No se pudo crear el evento en Google Calendar: %s", exc, exc_info=False)
+        return None
+    if response.status_code == 401:
+        new_token = _google_calendar_refresh_access_token(alias, entry)
+        if not new_token:
+            return None
+        headers["Authorization"] = f"Bearer {new_token}"
+        try:
+            response = requests.post(  # type: ignore[call-arg]
+                url,
+                headers=headers,
+                json=payload,
+                params=params or None,
+                timeout=20,
+            )
+        except RequestException as exc:  # pragma: no cover - depende de red externa
+            logger.warning(
+                "No se pudo crear el evento en Google Calendar tras refrescar token: %s",
+                exc,
+                exc_info=False,
+            )
+            return None
+    if response.status_code not in {200, 201}:
+        logger.warning(
+            "Respuesta inesperada al crear evento de Google Calendar (%s): %s",
+            response.status_code,
+            response.text,
+        )
+        return None
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _google_calendar_fetch_event_via_service(
+    alias: str,
+    entry: Dict[str, object],
+    event_id: str,
+) -> Optional[Dict[str, object]]:
+    if build is None or Credentials is None:
+        return None
+    creds = _google_calendar_credentials_from_entry(alias, entry)
+    if not creds:
+        return None
+    try:
+        service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "No se pudo inicializar el cliente de Google Calendar para leer evento: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    try:
+        event = (
+            service.events()  # type: ignore[call-arg]
+            .get(calendarId="primary", eventId=event_id)
+            .execute()
+        )
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "Error al obtener evento de Google Calendar mediante googleapiclient: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    _google_calendar_update_tokens_from_credentials(alias, entry, creds)
+    if isinstance(event, dict):
+        return event
+    return None
+
+
+def _google_calendar_fetch_event_via_requests(
+    alias: str,
+    entry: Dict[str, object],
+    event_id: str,
+    access_token: Optional[str],
+) -> Optional[Dict[str, object]]:
+    if requests is None and (Credentials is None or build is None):
+        return None
+    token_value = access_token or entry.get("access_token")
+    if not token_value:
+        return None
+    headers = {
+        "Authorization": f"Bearer {token_value}",
+        "Content-Type": "application/json",
+    }
+    params = {"fields": "id,htmlLink,hangoutLink,conferenceData,start"}
+    url = f"{_GOOGLE_CALENDAR_BASE}/calendars/primary/events/{event_id}"
+    try:
+        response = requests.get(  # type: ignore[call-arg]
+            url,
+            headers=headers,
+            params=params,
+            timeout=20,
+        )
+    except RequestException as exc:  # pragma: no cover - depende de red externa
+        logger.warning(
+            "No se pudo leer el evento en Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    if response.status_code == 401:
+        new_token = _google_calendar_refresh_access_token(alias, entry)
+        if not new_token:
+            return None
+        headers["Authorization"] = f"Bearer {new_token}"
+        try:
+            response = requests.get(  # type: ignore[call-arg]
+                url,
+                headers=headers,
+                params=params,
+                timeout=20,
+            )
+        except RequestException as exc:  # pragma: no cover - depende de red externa
+            logger.warning(
+                "No se pudo leer el evento en Google Calendar tras refrescar token: %s",
+                exc,
+                exc_info=False,
+            )
+            return None
+    if response.status_code != 200:
+        logger.warning(
+            "Respuesta inesperada al obtener evento de Google Calendar (%s): %s",
+            response.status_code,
+            response.text,
+        )
+        return None
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _google_calendar_fetch_event(
+    alias: str,
+    entry: Dict[str, object],
+    event_id: str,
+    access_token: Optional[str],
+) -> Optional[Dict[str, object]]:
+    event = _google_calendar_fetch_event_via_service(alias, entry, event_id)
+    if event:
+        return event
+    return _google_calendar_fetch_event_via_requests(alias, entry, event_id, access_token)
+
+
+def _google_calendar_create_event(
+    alias: str,
+    entry: Dict[str, object],
+    payload: Dict[str, object],
+    params: Dict[str, object],
+    access_token: Optional[str],
+) -> Optional[Dict[str, object]]:
+    event = _google_calendar_create_event_via_service(alias, entry, payload)
+    if event:
+        return event
+    return _google_calendar_create_event_via_requests(alias, entry, payload, params, access_token)
+
+
+def _google_calendar_update_event_via_service(
+    alias: str,
+    entry: Dict[str, object],
+    event_id: str,
+    payload: Dict[str, object],
+    params: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    if build is None or Credentials is None:
+        return None
+    refresh_token = entry.get("refresh_token")
+    client_id = entry.get("client_id")
+    client_secret = entry.get("client_secret")
+    if not refresh_token or not client_id:
+        return None
+    data = {
+        "client_id": client_id,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }
+    if client_secret:
+        data["client_secret"] = client_secret
+    try:
+        response = requests.post(_GOOGLE_TOKEN_URL, data=data, timeout=15)
+    except RequestException as exc:  # pragma: no cover - depende de red externa
+        logger.warning("No se pudo refrescar el token de Google Calendar: %s", exc, exc_info=False)
+        return None
+    if response.status_code != 200:
+        logger.warning(
+            "Respuesta inesperada al refrescar token de Google Calendar: %s", response.text
+        )
+        return None
+    token_data = response.json()
+    entry = _google_calendar_store_tokens(alias, entry, token_data)
+    return entry.get("access_token")
+
+
+def _google_calendar_update_tokens_from_credentials(
+    alias: str, entry: Dict[str, object], creds: object
+) -> None:
+    token = getattr(creds, "token", None)
+    if not token:
+        return
+    refresh_token = getattr(creds, "refresh_token", None) or entry.get("refresh_token")
+    expiry = getattr(creds, "expiry", None)
+    expires_in = 3600
+    if expiry is not None:
+        try:
+            expiry_dt = expiry
+            if isinstance(expiry_dt, str):
+                parsed = _safe_parse_datetime(expiry_dt)
+                if parsed is not None:
+                    expiry_dt = parsed
+            if isinstance(expiry_dt, datetime):
+                if expiry_dt.tzinfo is None:
+                    expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+                delta = expiry_dt - datetime.now(timezone.utc)
+                expires_in = max(60, int(delta.total_seconds()))
+        except Exception:
+            expires_in = 3600
+    token_payload = {
+        "access_token": token,
+        "refresh_token": refresh_token,
+        "token_type": "Bearer",
+        "expires_in": expires_in,
+    }
+    _google_calendar_store_tokens(alias, entry, token_payload)
+
+
+def _google_calendar_credentials_from_entry(
+    alias: str, entry: Dict[str, object]
+) -> Optional[object]:
+    if Credentials is None:
+        return None
+    access_token = entry.get("access_token")
+    refresh_token = entry.get("refresh_token")
+    client_id = entry.get("client_id")
+    if not access_token or not refresh_token or not client_id:
+        return None
+    try:
+        creds = Credentials(
+            token=str(access_token),
+            refresh_token=str(refresh_token),
+            token_uri=_GOOGLE_TOKEN_URL,
+            client_id=str(client_id),
+            client_secret=str(entry.get("client_secret") or "") or None,
+            scopes=[_GOOGLE_SCOPE],
+        )
+    except Exception as exc:  # pragma: no cover - depende de librerías externas
+        logger.warning(
+            "No se pudieron preparar credenciales de Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    if not getattr(creds, "valid", False) and getattr(creds, "refresh_token", None):
+        if GoogleAuthRequest is None:
+            return creds
+        try:
+            creds.refresh(GoogleAuthRequest())  # type: ignore[misc]
+            _google_calendar_update_tokens_from_credentials(alias, entry, creds)
+        except Exception as exc:  # pragma: no cover - depende de red/creds
+            logger.warning(
+                "No se pudo refrescar credenciales de Google Calendar via google-auth: %s",
+                exc,
+                exc_info=False,
+            )
+            return None
+    return creds
+
+
+def _google_calendar_create_event_via_service(
+    alias: str,
+    entry: Dict[str, object],
+    payload: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    if build is None or Credentials is None:
+        return None
+    creds = _google_calendar_credentials_from_entry(alias, entry)
+    if not creds:
+        return None
+    try:
+        service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "No se pudo inicializar el cliente de Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    kwargs: Dict[str, object] = {}
+    if "conferenceData" in payload:
+        kwargs["conferenceDataVersion"] = 1
+    try:
+        event = (
+            service.events()  # type: ignore[call-arg]
+            .insert(calendarId="primary", body=payload, **kwargs)
+            .execute()
+        )
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "Error al crear evento de Google Calendar mediante googleapiclient: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    _google_calendar_update_tokens_from_credentials(alias, entry, creds)
+    if isinstance(event, dict):
+        return event
+    return None
+
+
+def _google_calendar_create_event_via_requests(
+    alias: str,
+    entry: Dict[str, object],
+    payload: Dict[str, object],
+    params: Dict[str, object],
+    access_token: Optional[str],
+) -> Optional[Dict[str, object]]:
+    if requests is None and (Credentials is None or build is None):
+        return None
+    refresh_token = entry.get("refresh_token")
+    client_id = entry.get("client_id")
+    client_secret = entry.get("client_secret")
+    if not refresh_token or not client_id:
+        return None
+    data = {
+        "client_id": client_id,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }
+    if client_secret:
+        data["client_secret"] = client_secret
+    try:
+        response = requests.post(_GOOGLE_TOKEN_URL, data=data, timeout=15)
+    except RequestException as exc:  # pragma: no cover - depende de red externa
+        logger.warning("No se pudo refrescar el token de Google Calendar: %s", exc, exc_info=False)
+        return None
+    if response.status_code != 200:
+        logger.warning(
+            "Respuesta inesperada al refrescar token de Google Calendar: %s", response.text
+        )
+        return None
+    token_data = response.json()
+    entry = _google_calendar_store_tokens(alias, entry, token_data)
+    return entry.get("access_token")
+
+
+def _google_calendar_update_tokens_from_credentials(
+    alias: str, entry: Dict[str, object], creds: object
+) -> None:
+    token = getattr(creds, "token", None)
+    if not token:
+        return
+    refresh_token = getattr(creds, "refresh_token", None) or entry.get("refresh_token")
+    expiry = getattr(creds, "expiry", None)
+    expires_in = 3600
+    if expiry is not None:
+        try:
+            expiry_dt = expiry
+            if isinstance(expiry_dt, str):
+                parsed = _safe_parse_datetime(expiry_dt)
+                if parsed is not None:
+                    expiry_dt = parsed
+            if isinstance(expiry_dt, datetime):
+                if expiry_dt.tzinfo is None:
+                    expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+                delta = expiry_dt - datetime.now(timezone.utc)
+                expires_in = max(60, int(delta.total_seconds()))
+        except Exception:
+            expires_in = 3600
+    token_payload = {
+        "access_token": token,
+        "refresh_token": refresh_token,
+        "token_type": "Bearer",
+        "expires_in": expires_in,
+    }
+    _google_calendar_store_tokens(alias, entry, token_payload)
+
+
+def _google_calendar_credentials_from_entry(
+    alias: str, entry: Dict[str, object]
+) -> Optional[object]:
+    if Credentials is None:
+        return None
+    access_token = entry.get("access_token")
+    refresh_token = entry.get("refresh_token")
+    client_id = entry.get("client_id")
+    if not access_token or not refresh_token or not client_id:
+        return None
+    try:
+        creds = Credentials(
+            token=str(access_token),
+            refresh_token=str(refresh_token),
+            token_uri=_GOOGLE_TOKEN_URL,
+            client_id=str(client_id),
+            client_secret=str(entry.get("client_secret") or "") or None,
+            scopes=[_GOOGLE_SCOPE],
+        )
+    except Exception as exc:  # pragma: no cover - depende de librerías externas
+        logger.warning(
+            "No se pudieron preparar credenciales de Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    if not getattr(creds, "valid", False) and getattr(creds, "refresh_token", None):
+        if GoogleAuthRequest is None:
+            return creds
+        try:
+            creds.refresh(GoogleAuthRequest())  # type: ignore[misc]
+            _google_calendar_update_tokens_from_credentials(alias, entry, creds)
+        except Exception as exc:  # pragma: no cover - depende de red/creds
+            logger.warning(
+                "No se pudo refrescar credenciales de Google Calendar via google-auth: %s",
+                exc,
+                exc_info=False,
+            )
+            return None
+    return creds
+
+
+def _google_calendar_create_event_via_service(
+    alias: str,
+    entry: Dict[str, object],
+    payload: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    if build is None or Credentials is None:
+        return None
+    creds = _google_calendar_credentials_from_entry(alias, entry)
+    if not creds:
+        return None
+    try:
+        service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "No se pudo inicializar el cliente de Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    kwargs: Dict[str, object] = {}
+    if "conferenceData" in payload:
+        kwargs["conferenceDataVersion"] = 1
+    try:
+        event = (
+            service.events()  # type: ignore[call-arg]
+            .insert(calendarId="primary", body=payload, **kwargs)
+            .execute()
+        )
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "Error al crear evento de Google Calendar mediante googleapiclient: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    _google_calendar_update_tokens_from_credentials(alias, entry, creds)
+    if isinstance(event, dict):
+        return event
+    return None
+
+
+def _google_calendar_create_event_via_requests(
+    alias: str,
+    entry: Dict[str, object],
+    payload: Dict[str, object],
+    params: Dict[str, object],
+    access_token: Optional[str],
+) -> Optional[Dict[str, object]]:
+    if requests is None and (Credentials is None or build is None):
+        return None
+    refresh_token = entry.get("refresh_token")
+    client_id = entry.get("client_id")
+    client_secret = entry.get("client_secret")
+    if not refresh_token or not client_id:
+        return None
+    data = {
+        "client_id": client_id,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }
+    if client_secret:
+        data["client_secret"] = client_secret
+    try:
+        response = requests.post(_GOOGLE_TOKEN_URL, data=data, timeout=15)
+    except RequestException as exc:  # pragma: no cover - depende de red externa
+        logger.warning("No se pudo refrescar el token de Google Calendar: %s", exc, exc_info=False)
+        return None
+    if response.status_code != 200:
+        logger.warning(
+            "Respuesta inesperada al refrescar token de Google Calendar: %s", response.text
+        )
+        return None
+    token_data = response.json()
+    entry = _google_calendar_store_tokens(alias, entry, token_data)
+    return entry.get("access_token")
+
+
+def _google_calendar_update_tokens_from_credentials(
+    alias: str, entry: Dict[str, object], creds: object
+) -> None:
+    token = getattr(creds, "token", None)
+    if not token:
+        return
+    refresh_token = getattr(creds, "refresh_token", None) or entry.get("refresh_token")
+    expiry = getattr(creds, "expiry", None)
+    expires_in = 3600
+    if expiry is not None:
+        try:
+            expiry_dt = expiry
+            if isinstance(expiry_dt, str):
+                parsed = _safe_parse_datetime(expiry_dt)
+                if parsed is not None:
+                    expiry_dt = parsed
+            if isinstance(expiry_dt, datetime):
+                if expiry_dt.tzinfo is None:
+                    expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+                delta = expiry_dt - datetime.now(timezone.utc)
+                expires_in = max(60, int(delta.total_seconds()))
+        except Exception:
+            expires_in = 3600
+    token_payload = {
+        "access_token": token,
+        "refresh_token": refresh_token,
+        "token_type": "Bearer",
+        "expires_in": expires_in,
+    }
+    _google_calendar_store_tokens(alias, entry, token_payload)
+
+
+def _google_calendar_credentials_from_entry(
+    alias: str, entry: Dict[str, object]
+) -> Optional[object]:
+    if Credentials is None:
+        return None
+    access_token = entry.get("access_token")
+    refresh_token = entry.get("refresh_token")
+    client_id = entry.get("client_id")
+    if not access_token or not refresh_token or not client_id:
+        return None
+    try:
+        creds = Credentials(
+            token=str(access_token),
+            refresh_token=str(refresh_token),
+            token_uri=_GOOGLE_TOKEN_URL,
+            client_id=str(client_id),
+            client_secret=str(entry.get("client_secret") or "") or None,
+            scopes=[_GOOGLE_SCOPE],
+        )
+    except Exception as exc:  # pragma: no cover - depende de librerías externas
+        logger.warning(
+            "No se pudieron preparar credenciales de Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    if not getattr(creds, "valid", False) and getattr(creds, "refresh_token", None):
+        if GoogleAuthRequest is None:
+            return creds
+        try:
+            creds.refresh(GoogleAuthRequest())  # type: ignore[misc]
+            _google_calendar_update_tokens_from_credentials(alias, entry, creds)
+        except Exception as exc:  # pragma: no cover - depende de red/creds
+            logger.warning(
+                "No se pudo refrescar credenciales de Google Calendar via google-auth: %s",
+                exc,
+                exc_info=False,
+            )
+            return None
+    return creds
+
+
+def _google_calendar_create_event_via_service(
+    alias: str,
+    entry: Dict[str, object],
+    payload: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    if build is None or Credentials is None:
+        return None
+    creds = _google_calendar_credentials_from_entry(alias, entry)
+    if not creds:
+        return None
+    try:
+        service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "No se pudo inicializar el cliente de Google Calendar: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    kwargs: Dict[str, object] = {}
+    if "conferenceData" in payload:
+        kwargs["conferenceDataVersion"] = 1
+    try:
+        event = (
+            service.events()  # type: ignore[call-arg]
+            .insert(calendarId="primary", body=payload, **kwargs)
+            .execute()
+        )
+    except Exception as exc:  # pragma: no cover - depende de librería externa
+        logger.warning(
+            "Error al crear evento de Google Calendar mediante googleapiclient: %s",
+            exc,
+            exc_info=False,
+        )
+        return None
+    _google_calendar_update_tokens_from_credentials(alias, entry, creds)
+    if isinstance(event, dict):
+        return event
+    return None
+
+
+def _google_calendar_create_event_via_requests(
+    alias: str,
+    entry: Dict[str, object],
+    payload: Dict[str, object],
+    params: Dict[str, object],
+    access_token: Optional[str],
+) -> Optional[Dict[str, object]]:
     if requests is None and (Credentials is None or build is None):
         return None
     refresh_token = entry.get("refresh_token")
@@ -3106,6 +4233,8 @@ def _google_calendar_menu() -> None:
             _google_calendar_load_credentials_json()
         elif choice == "8":
             break
+        elif choice == "7":
+            _google_calendar_load_credentials_json()
         else:
             warn("Opción inválida.")
             press_enter()
