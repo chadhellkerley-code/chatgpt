@@ -63,6 +63,10 @@ class SendEvent:
     success: bool
     detail: str
     attention: str | None = None
+    reason_code: str | None = None
+    reason_label: str | None = None
+    suggestion: str | None = None
+    scope: str | None = None
 
 
 _LIVE_COUNTS = {"base_ok": 0, "base_fail": 0, "run_ok": 0, "run_fail": 0}
@@ -227,6 +231,140 @@ def _diagnose_exception(exc: Exception) -> str | None:
     return None
 
 
+_ERROR_SIGNATURES = [
+    {
+        "keywords": ("login_required",),
+        "code": "login_required",
+        "detail": "Sesión vencida (Instagram pidió login)",
+        "attention": "Instagram solicitó un nuevo login.",
+        "label": "Login requerido",
+        "suggestion": "Reiniciá la sesión desde la opción 1 antes de continuar.",
+        "scope": "account",
+    },
+    {
+        "keywords": ("challenge_required",),
+        "code": "challenge_required",
+        "detail": "Instagram pidió resolver un challenge",
+        "attention": "Se requiere resolver un challenge en la app.",
+        "label": "Challenge requerido",
+        "suggestion": "Ingresá a la app oficial y resolvé el challenge pendiente.",
+        "scope": "account",
+    },
+    {
+        "keywords": (
+            "feedback_required",
+            "please wait a few minutes",
+            "try again later",
+            "we restrict certain activity",
+        ),
+        "code": "temporary_block",
+        "detail": "Instagram bloqueó temporalmente las acciones de esta cuenta",
+        "attention": "Instagram bloqueó temporalmente acciones de esta cuenta.",
+        "label": "Bloqueo temporal",
+        "suggestion": "Pausá la campaña unos minutos y revisá el calentamiento de la cuenta.",
+        "scope": "account",
+    },
+    {
+        "keywords": ("rate_limit", "too many requests", "throttled", "429"),
+        "code": "rate_limit",
+        "detail": "Se alcanzó un límite de envíos (rate limit)",
+        "attention": "Se alcanzó un rate limit. Conviene pausar unos minutos.",
+        "label": "Rate limit",
+        "suggestion": "Aumentá los delays o reducí la concurrencia para esta campaña.",
+        "scope": "account",
+    },
+    {
+        "keywords": ("checkpoint",),
+        "code": "checkpoint",
+        "detail": "Instagram requiere un checkpoint de seguridad",
+        "attention": "Instagram requiere verificación adicional (checkpoint).",
+        "label": "Checkpoint requerido",
+        "suggestion": "Ingresá a la app oficial o al sitio para completar el checkpoint.",
+        "scope": "account",
+    },
+    {
+        "keywords": ("consent_required",),
+        "code": "consent_required",
+        "detail": "La sesión necesita aprobar el acceso desde la app oficial",
+        "attention": "La sesión requiere aprobación en la app oficial.",
+        "label": "Consentimiento pendiente",
+        "suggestion": "Aceptá el inicio de sesión desde la app oficial y reintentá.",
+        "scope": "account",
+    },
+    {
+        "keywords": (
+            "privacy",
+            "private account",
+            "not authorized to view",
+            "user can't receive your message",
+            "recipient can't receive your message",
+            "recipients have opted out",
+        ),
+        "code": "recipient_restricted",
+        "detail": "El destinatario tiene restricciones de privacidad para recibir mensajes",
+        "label": "Privacidad del destinatario",
+        "suggestion": "Saltá este lead: la cuenta objetivo no acepta mensajes.",
+        "scope": "recipient",
+    },
+    {
+        "keywords": (
+            "inactive user",
+            "user not found",
+            "username does not exist",
+            "unknown user",
+        ),
+        "code": "user_not_found",
+        "detail": "El usuario objetivo no existe o no está disponible",
+        "label": "Usuario no disponible",
+        "suggestion": "Verificá el usuario en la lista de leads.",
+        "scope": "recipient",
+    },
+    {
+        "keywords": ("spam", "suspicious activity"),
+        "code": "spam_block",
+        "detail": "Instagram detectó actividad sospechosa y bloqueó el envío",
+        "attention": "Instagram marcó la acción como sospechosa.",
+        "label": "Actividad sospechosa",
+        "suggestion": "Reducí el ritmo de envíos y revisá el warm-up de la cuenta.",
+        "scope": "account",
+    },
+    {
+        "keywords": (
+            "socket",
+            "timed out",
+            "connection aborted",
+            "connection reset",
+            "connection error",
+            "temporarily unavailable",
+        ),
+        "code": "network",
+        "detail": "Error de red al contactar Instagram",
+        "attention": "Se detectó un error de red. Revisá la conexión o el proxy.",
+        "label": "Error de red",
+        "suggestion": "Verificá la conexión o cambiá de proxy antes de reanudar.",
+        "scope": "network",
+    },
+]
+
+
+def _classify_exception(exc: Exception) -> tuple[str, str | None, str | None, str | None, str | None, str | None]:
+    text = str(exc).strip()
+    lowered = text.lower()
+    name = exc.__class__.__name__.lower()
+    for signature in _ERROR_SIGNATURES:
+        if any(key in lowered or key in name for key in signature["keywords"]):
+            detail = signature["detail"]
+            if text and text.lower() not in detail.lower():
+                detail = f"{detail} ({text})"
+            attention = signature.get("attention") or _diagnose_exception(exc)
+            label = signature.get("label")
+            suggestion = signature.get("suggestion")
+            scope = signature.get("scope")
+            return detail, attention, signature.get("code"), label, suggestion, scope
+    fallback_detail = text or "envío falló"
+    return fallback_detail, _diagnose_exception(exc), None, text or "Error desconocido", None, None
+
+
 def _render_progress(
     alias: str,
     leads_left: int,
@@ -270,6 +408,7 @@ def _handle_event(
     live_table: LiveTable,
     remaining: Dict[str, int],
     bump: Callable[[str, int], None],
+    error_tracker: Dict[str, Dict[str, object]],
 ) -> Optional[str]:
     username = event.username
     if event.success:
@@ -296,6 +435,47 @@ def _handle_event(
             f"❌ @{username} → @{event.lead} ({detail})", color=Fore.RED, bold=True
         )
         print(summary)
+        reason_key = (event.reason_code or "").strip().lower()
+        if not reason_key:
+            reason_key = (event.reason_label or detail).strip().lower()
+        label = event.reason_label or detail or "Error desconocido"
+        tracker = None
+        if reason_key:
+            tracker = error_tracker.setdefault(
+                reason_key,
+                {
+                    "count": 0,
+                    "alerted": False,
+                    "label": label,
+                    "suggestion": event.suggestion,
+                },
+            )
+            tracker["count"] = int(tracker.get("count", 0)) + 1
+            if event.reason_label and tracker.get("label") != event.reason_label:
+                tracker["label"] = event.reason_label
+            if event.suggestion and not tracker.get("suggestion"):
+                tracker["suggestion"] = event.suggestion
+            if not tracker.get("alerted") and tracker["count"] >= 3:
+                print(full_line(char="!", color=Fore.YELLOW, bold=True))
+                print(
+                    style_text(
+                        f"Patrón detectado: {tracker['count']} errores con motivo '{tracker['label']}'.",
+                        color=Fore.YELLOW,
+                        bold=True,
+                    )
+                )
+                suggestion = tracker.get("suggestion")
+                if suggestion:
+                    print(style_text(f"Sugerencia: {suggestion}", color=Fore.YELLOW))
+                else:
+                    print(
+                        style_text(
+                            "Sugerencia: pausá la campaña o ajustá delays/concurrencia antes de continuar.",
+                            color=Fore.YELLOW,
+                        )
+                    )
+                print(full_line(char="!", color=Fore.YELLOW, bold=True))
+                tracker["alerted"] = True
     if event.attention:
         print(full_line(char="=", color=Fore.RED, bold=True))
         print(highlight(f"Atención en @{username}", color=Fore.RED))
@@ -526,6 +706,7 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
     account_locks = {a["username"]: threading.Lock() for a in accounts}
     result_queue: queue.Queue[SendEvent] = queue.Queue()
     live_table = LiveTable(max_entries=concurr)
+    error_tracker: Dict[str, Dict[str, object]] = {}
 
     listener = start_q_listener("Presioná Q para detener la campaña.", logger)
     threads: list[threading.Thread] = []
@@ -540,86 +721,184 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
         delay_max,
     )
 
-    def _worker(account: Dict, lead: str, message: str, account_lock: threading.Lock) -> None:
+    def _attempt_send(account: Dict, lead: str, message: str) -> tuple[SendEvent, int]:
         username = account["username"]
         attention_message: str | None = None
         detail = ""
         success_flag = False
+        reason_code: str | None = None
+        reason_label: str | None = None
+        suggestion: str | None = None
+        scope: str | None = None
         max_retries = 3
         retries = 0
-        try:
-            if STOP_EVENT.is_set():
-                return
-            while not STOP_EVENT.is_set():
-                try:
-                    cl = _client_for(username)
-                    success_flag = _send_dm(cl, lead, message)
-                    if not success_flag:
-                        detail = "envío falló"
-                    break
-                except Exception as exc:  # pragma: no cover - external SDK
-                    if should_retry_proxy(exc):
-                        retries += 1
-                        record_proxy_failure(username, exc)
-                        wait_retry = min(30, 5 * retries)
-                        logger.warning(
-                            "Proxy error con @%s → @%s (intento %d/%d): %s",
-                            username,
-                            lead,
-                            retries,
-                            max_retries,
-                            exc,
-                            exc_info=False,
-                        )
-                        if retries >= max_retries:
-                            detail = "proxy sin respuesta"
-                            attention_message = (
-                                "El proxy configurado para @"
-                                f"{username} falló repetidamente. Revisá la opción 1 para actualizarlo o quitarlo."
-                            )
-                            break
-                        sleep_with_stop(wait_retry)
-                        continue
-                    detail = str(exc)
-                    attention_message = _diagnose_exception(exc)
+        while not STOP_EVENT.is_set():
+            try:
+                cl = _client_for(username)
+                success_flag = _send_dm(cl, lead, message)
+                if not success_flag:
+                    detail = "Instagram no confirmó el envío"
+                    reason_code = reason_code or "send_failed"
+                    reason_label = reason_label or "Envío no confirmado"
+                    suggestion = suggestion or "Revisá si la cuenta puede enviar mensajes manualmente."
+                    scope = scope or "account"
+                break
+            except Exception as exc:  # pragma: no cover - external SDK
+                if should_retry_proxy(exc):
+                    retries += 1
+                    record_proxy_failure(username, exc)
+                    wait_retry = min(30, 5 * retries)
                     logger.warning(
-                        "Fallo inesperado con @%s → @%s: %s",
+                        "Proxy error con @%s → @%s (intento %d/%d): %s",
                         username,
                         lead,
+                        retries,
+                        max_retries,
                         exc,
                         exc_info=False,
                     )
-                    break
-            if not success_flag and not detail:
-                detail = "envío falló"
-        finally:
-            result_queue.put(
-                SendEvent(
-                    username=username,
-                    lead=lead,
-                    success=success_flag,
-                    detail=detail,
-                    attention=attention_message,
-                )
-            )
-            wait_min, wait_max = account_delays.get(username, (delay_min, delay_max))
-            wait_time = jitter_delay(wait_min, wait_max)
-            if account.get("low_profile"):
-                logger.debug(
-                    "Modo bajo perfil para @%s: espera %ss (rango %s-%ss)",
+                    if retries >= max_retries:
+                        detail = "proxy sin respuesta"
+                        attention_message = (
+                            "El proxy configurado para @"
+                            f"{username} falló repetidamente. Revisá la opción 1 para actualizarlo o quitarlo."
+                        )
+                        reason_code = "proxy_unavailable"
+                        reason_label = "Proxy sin respuesta"
+                        suggestion = (
+                            "Actualizá o quitá el proxy configurado antes de continuar con esta cuenta."
+                        )
+                        scope = "account"
+                        break
+                    sleep_with_stop(wait_retry)
+                    continue
+                detail, diag_attention, code, label, suggestion_hint, scope_hint = _classify_exception(exc)
+                if code and not reason_code:
+                    reason_code = code
+                if label and not reason_label:
+                    reason_label = label
+                if suggestion_hint and not suggestion:
+                    suggestion = suggestion_hint
+                if diag_attention:
+                    attention_message = diag_attention
+                scope = scope_hint or scope
+                logger.warning(
+                    "Fallo inesperado con @%s → @%s: %s",
                     username,
-                    wait_time,
-                    wait_min,
-                    wait_max,
+                    lead,
+                    exc,
+                    exc_info=False,
                 )
-            else:
-                logger.debug(
-                    "Esperando %ss antes del próximo envío de @%s", wait_time, username
-                )
+                break
+
+        if STOP_EVENT.is_set() and not success_flag and not detail:
+            detail = "envío cancelado"
+        if not success_flag and not detail:
+            detail = "envío falló"
+        if reason_label is None and reason_code:
+            reason_label = reason_code.replace("_", " ").capitalize()
+        event = SendEvent(
+            username=username,
+            lead=lead,
+            success=success_flag,
+            detail=detail,
+            attention=attention_message,
+            reason_code=reason_code,
+            reason_label=reason_label,
+            suggestion=suggestion,
+            scope=scope,
+        )
+        wait_min, wait_max = account_delays.get(username, (delay_min, delay_max))
+        wait_time = jitter_delay(wait_min, wait_max)
+        if account.get("low_profile"):
+            logger.debug(
+                "Modo bajo perfil para @%s: espera %ss (rango %s-%ss)",
+                username,
+                wait_time,
+                wait_min,
+                wait_max,
+            )
+        else:
+            logger.debug(
+                "Esperando %ss antes del próximo envío de @%s",
+                wait_time,
+                username,
+            )
+        return event, wait_time
+
+    def _worker(account: Dict, lead: str, message: str, account_lock: threading.Lock) -> None:
+        wait_time = 0
+        try:
+            if STOP_EVENT.is_set():
+                return
+            event, wait_time = _attempt_send(account, lead, message)
+            result_queue.put(event)
+        finally:
             if wait_time > 0:
                 sleep_with_stop(wait_time)
             account_lock.release()
             semaphore.release()
+
+    if not STOP_EVENT.is_set():
+        print(
+            style_text(
+                "Ejecutando prueba previa de envío por cuenta...",
+                color=Fore.CYAN,
+                bold=True,
+            )
+        )
+        tested_accounts = 0
+        for account in accounts:
+            if STOP_EVENT.is_set():
+                break
+            username = account["username"]
+            if remaining[username] <= 0:
+                continue
+            if not users:
+                warn("No quedan leads suficientes para completar la prueba previa.")
+                break
+            lead = users.popleft()
+            message = random.choice(templates)
+            remaining[username] -= 1
+            live_table.begin(username, lead)
+            event, wait_time = _attempt_send(account, lead, message)
+            if wait_time > 0:
+                sleep_with_stop(wait_time)
+            action = _handle_event(
+                event,
+                success,
+                failed,
+                live_table,
+                remaining,
+                bump,
+                error_tracker,
+            )
+            _render_progress(
+                alias,
+                len(users),
+                success,
+                failed,
+                live_table,
+                send_state,
+            )
+            tested_accounts += 1
+            if not event.success:
+                if event.scope == "account":
+                    remaining[username] = 0
+                    warn(
+                        f"@{username} se omitirá tras fallar la prueba previa ({event.detail})."
+                    )
+                    logger.warning(
+                        "Cuenta omitida tras prueba previa: @%s (%s)",
+                        username,
+                        event.detail,
+                    )
+                else:
+                    remaining[username] += 1
+            if action == "stop" or STOP_EVENT.is_set():
+                break
+        if tested_accounts:
+            logger.info("Prueba previa completada para %d cuentas.", tested_accounts)
 
     try:
         last_render = 0.0
@@ -637,6 +916,7 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
                         live_table,
                         remaining,
                         bump,
+                        error_tracker,
                     )
                     need_render = True
                     if action == "stop":
@@ -703,6 +983,7 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
                     live_table,
                     remaining,
                     bump,
+                    error_tracker,
                 )
                 _render_progress(
                     alias,
