@@ -146,6 +146,31 @@ class ScrapedUser:
     is_private: bool
 
 
+class DelayController:
+    def __init__(self, delay: float) -> None:
+        self._delay = max(0.0, float(delay))
+        self._last_recorded: Optional[float] = None
+
+    def pause(self) -> None:
+        if self._delay <= 0:
+            self._last_recorded = time.monotonic()
+            return
+        now = time.monotonic()
+        if self._last_recorded is None:
+            self._last_recorded = now
+            return
+        jitter = min(2.0, self._delay * 0.3 + 0.5)
+        lower = max(0.5, self._delay - jitter)
+        upper = self._delay + jitter
+        target = random.uniform(lower, upper)
+        elapsed = now - self._last_recorded
+        remaining = max(0.0, target - elapsed)
+        if remaining > 0:
+            time.sleep(remaining)
+            now = time.monotonic()
+        self._last_recorded = now
+
+
 def _scrape_menu() -> None:
     while True:
         banner()
@@ -610,26 +635,24 @@ def _scrape_hashtag(
     seen: set[int] = set()
     cache: Dict[int, object] = {}
     collected: List[ScrapedUser] = []
+    delay = DelayController(filters.delay)
     try:
         for media in medias:
-            user = getattr(media, "user", None)
-            if not user:
-                continue
-            user_id = _extract_user_id(user)
+            user_id, candidate = _resolve_media_user(media)
             if not user_id or user_id in seen:
                 continue
             seen.add(user_id)
             if progress.should_stop():
                 break
-            info = _fetch_user_info(client, user_id, cache, progress, user)
+            info = _fetch_user_info(client, user_id, cache, progress, candidate)
             if not info or not getattr(info, "username", None):
                 continue
             if _passes_filters(info, filters):
                 collected.append(_build_scraped_user(info))
                 progress.update(info.username)
-                _apply_delay(filters.delay)
                 if len(collected) >= filters.max_results:
                     break
+                delay.pause()
     except KeyboardInterrupt:
         progress.stop("ctrl_c")
     return _dedupe_scraped(collected)
@@ -691,6 +714,7 @@ def _scrape_from_profiles(
     collected: List[ScrapedUser] = []
     seen: set[int] = set()
     cache: Dict[int, object] = {}
+    delay = DelayController(filters.delay)
     try:
         for base in base_profiles:
             if len(collected) >= filters.max_results:
@@ -748,8 +772,10 @@ def _scrape_from_profiles(
                 if _passes_filters(info, filters):
                     collected.append(_build_scraped_user(info))
                     progress.update(info.username)
-                    _apply_delay(filters.delay)
-            if progress.should_stop():
+                    if len(collected) >= filters.max_results:
+                        break
+                    delay.pause()
+            if progress.should_stop() or len(collected) >= filters.max_results:
                 break
     except KeyboardInterrupt:
         progress.stop("ctrl_c")
@@ -853,26 +879,26 @@ def _handle_scrape_results(users: List[ScrapedUser]) -> None:
         warn("No se encontraron usuarios que cumplan los filtros.")
         press_enter()
         return
-    users = _maybe_apply_advanced_filter(users)
-    if not users:
-        warn("Lista descartada tras aplicar filtros avanzados.")
-        press_enter()
-        return
-    usernames = [u.username.lstrip("@") for u in users]
-    print("\nUsuarios encontrados:")
-    for idx, user in enumerate(users[:20], start=1):
-        resume = (user.biography or user.full_name or "").strip()
-        extra = f" — {resume[:70]}" if resume else ""
-        print(f" {idx:02d}. @{user.username}{extra}")
-    if len(users) > 20:
-        print(f" ... (+{len(users) - 20} más)")
-
+    current = users
     while True:
+        if not current:
+            warn("No quedan usuarios en la lista actual.")
+            break
+        print("\nUsuarios encontrados:")
+        for idx, user in enumerate(current[:20], start=1):
+            resume = (user.biography or user.full_name or "").strip()
+            extra = f" — {resume[:70]}" if resume else ""
+            print(f" {idx:02d}. @{user.username}{extra}")
+        if len(current) > 20:
+            print(f" ... (+{len(current) - 20} más)")
+
         print("\n¿Qué deseás hacer con la lista?")
         print("1) Agregar a una lista existente")
         print("2) Crear una lista nueva")
-        print("3) Cancelar")
-        choice = ask("Opción: ").strip() or "3"
+        print("3) Aplicar limpieza avanzada")
+        print("4) Cancelar y descartar")
+        choice = ask("Opción: ").strip() or "4"
+        usernames = [u.username.lstrip("@") for u in current]
         if choice == "1":
             files = list_files()
             if not files:
@@ -898,6 +924,11 @@ def _handle_scrape_results(users: List[ScrapedUser]) -> None:
             ok(f"Lista {name} creada con {len(usernames)} usuarios.")
             break
         elif choice == "3":
+            filtered = _apply_advanced_filter(current)
+            if filtered is current:
+                continue
+            current = _dedupe_scraped(filtered)
+        elif choice == "4":
             warn("Lista descartada.")
             break
         else:
@@ -930,18 +961,51 @@ def _dedupe_scraped(users: Iterable[ScrapedUser]) -> List[ScrapedUser]:
     return ordered
 
 
-def _maybe_apply_advanced_filter(users: List[ScrapedUser]) -> List[ScrapedUser]:
-    choice = ask("¿Deseás limpiar la lista con filtros avanzados? (s/N): ").strip().lower()
-    if choice != "s":
+def _resolve_media_user(media) -> Tuple[Optional[int], Optional[object]]:
+    if media is None:
+        return None, None
+    user = getattr(media, "user", None)
+    user_id = _extract_user_id(user) if user is not None else None
+    if user_id:
+        return user_id, user
+    owner = getattr(media, "owner", None)
+    owner_id = _extract_user_id(owner) if owner is not None else None
+    if owner_id:
+        return owner_id, owner
+    user_id_attr = getattr(media, "user_id", None)
+    if user_id_attr is not None:
+        try:
+            return int(user_id_attr), None
+        except Exception:
+            pass
+    if isinstance(media, dict):
+        for key in ("user", "owner"):
+            candidate = media.get(key)
+            if candidate:
+                candidate_id = _extract_user_id(candidate)
+                if candidate_id:
+                    return candidate_id, candidate
+        user_id_attr = media.get("user_id")
+        if user_id_attr is not None:
+            try:
+                return int(user_id_attr), None
+            except Exception:
+                pass
+    return None, None
+
+
+def _apply_advanced_filter(users: List[ScrapedUser]) -> List[ScrapedUser]:
+    if not users:
+        warn("No hay usuarios para filtrar.")
         return users
     print(
-        "\nIngresá palabras o frases clave a buscar en la bio o nombre. "
+        "\nIngresá palabras o frases clave a buscar en la bio, nombre o usuario. "
         "Separalas con comas o saltos de línea."
     )
     print("Podés anteponer '-' para excluir términos específicos.")
     raw = ask_multiline("Condiciones: ").strip()
     if not raw:
-        warn("No se ingresaron filtros. Se mantiene la lista original.")
+        warn("No se ingresaron filtros. Se mantiene la lista actual.")
         return users
     tokens = [chunk.strip() for chunk in raw.replace("\n", ",").split(",")]
     includes = [t.lstrip("+").lower() for t in tokens if t and not t.startswith("-")]
@@ -949,7 +1013,7 @@ def _maybe_apply_advanced_filter(users: List[ScrapedUser]) -> List[ScrapedUser]:
     includes = [t for t in includes if t]
     excludes = [t for t in excludes if t]
     if not includes and not excludes:
-        warn("No se ingresaron filtros válidos. Se mantiene la lista original.")
+        warn("No se ingresaron filtros válidos. Se mantiene la lista actual.")
         return users
     mode = (
         ask(
@@ -983,10 +1047,21 @@ def _maybe_apply_advanced_filter(users: List[ScrapedUser]) -> List[ScrapedUser]:
         filtered.append(user)
     if not filtered:
         warn(
-            "Ningún perfil coincidió con los filtros avanzados. Se mantiene la lista original."
+            "Ningún perfil coincidió con los filtros avanzados. Se mantiene la lista actual."
         )
         return users
     print(f"\nPerfiles tras el filtrado avanzado: {len(filtered)} (de {len(users)}).")
+    preview = filtered[:10]
+    if preview:
+        print("Ejemplos filtrados:")
+        for idx, user in enumerate(preview, start=1):
+            snippet = (user.biography or user.full_name or "").strip()
+            extra = f" — {snippet[:60]}" if snippet else ""
+            print(f" {idx:02d}. @{user.username}{extra}")
+    confirm = ask("¿Aplicar este filtrado a la lista actual? (s/N): ").strip().lower()
+    if confirm != "s":
+        warn("Se mantiene la lista sin cambios.")
+        return users
     return filtered
 
 
@@ -1011,16 +1086,6 @@ def _format_user(user_info, position: int, limit: int) -> str:
         f" {position:02d}/{limit:02d} → @{username} | "
         f"seguidores: {follower_count:,} | posteos: {media_count} | {privacy}"
     )
-
-
-def _apply_delay(delay: float) -> None:
-    base = max(0.0, delay)
-    if base <= 0:
-        return
-    jitter = min(2.0, base * 0.3 + 0.5)
-    lower = max(0.5, base - jitter)
-    upper = base + jitter
-    time.sleep(random.uniform(lower, upper))
 
 
 def _build_scraped_user(info) -> ScrapedUser:
