@@ -621,7 +621,7 @@ def _scrape_hashtag(
             seen.add(user_id)
             if progress.should_stop():
                 break
-            info = _fetch_user_info(client, user_id, cache, progress)
+            info = _fetch_user_info(client, user_id, cache, progress, user)
             if not info or not getattr(info, "username", None):
                 continue
             if _passes_filters(info, filters):
@@ -742,7 +742,7 @@ def _scrape_from_profiles(
                 seen.add(user_id)
                 if progress.should_stop():
                     break
-                info = _fetch_user_info(client, user_id, cache, progress)
+                info = _fetch_user_info(client, user_id, cache, progress, cand)
                 if not info or not getattr(info, "username", None):
                     continue
                 if _passes_filters(info, filters):
@@ -761,19 +761,67 @@ def _fetch_user_info(
     user_id: int,
     cache: Dict[int, object],
     progress: Optional["ScrapeProgress"] = None,
+    candidate: Optional[object] = None,
 ):
+    from instagrapi.exceptions import LoginRequired
+
     if user_id in cache:
         return cache[user_id]
-    try:
-        info = client.user_info(user_id)
-    except Exception as exc:
-        if progress:
-            progress.record_issue(f"No se pudo obtener info del usuario {user_id}: {exc}")
-        else:
-            warn(f"No se pudo obtener info del usuario {user_id}: {exc}")
-        return None
-    cache[user_id] = info
-    return info
+
+    username_hint = None
+    if candidate is not None:
+        username_hint = getattr(candidate, "username", None) or ""
+        if not username_hint and isinstance(candidate, dict):
+            username_hint = candidate.get("username")
+        if username_hint:
+            username_hint = str(username_hint).strip().lstrip("@")
+
+    attempts = []
+
+    def _add_attempt(label: str, func) -> None:
+        if not callable(func):
+            return
+        attempts.append((label, func))
+
+    _add_attempt("user_info", lambda: client.user_info(user_id))
+    if hasattr(client, "user_info_gql"):
+        _add_attempt("user_info_gql", lambda: client.user_info_gql(str(user_id)))
+    if username_hint:
+        by_username = getattr(client, "user_info_by_username", None)
+        if callable(by_username):
+            _add_attempt("user_info_by_username", lambda: by_username(username_hint))
+        by_username_v1 = getattr(client, "user_info_by_username_v1", None)
+        if callable(by_username_v1):
+            _add_attempt("user_info_by_username_v1", lambda: by_username_v1(username_hint))
+
+    errors: List[str] = []
+    for label, func in attempts:
+        try:
+            info = func()
+        except LoginRequired:
+            raise
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+            continue
+        if info:
+            cache[user_id] = info
+            return info
+
+    if progress and errors:
+        progress.record_issue(
+            "No se pudo obtener info del usuario "
+            f"{user_id}: "
+            + "; ".join(errors[:2])
+            + ("; ..." if len(errors) > 2 else "")
+        )
+    elif errors:
+        warn(
+            "No se pudo obtener info del usuario "
+            f"{user_id}: "
+            + "; ".join(errors[:2])
+            + ("; ..." if len(errors) > 2 else "")
+        )
+    return None
 
 
 def _passes_filters(user_info, filters: ScrapeFilters) -> bool:
