@@ -107,18 +107,30 @@ def enable_quiet_mode() -> None:
     """Silencia warnings y logs ruidosos de dependencias externas."""
 
     warnings.filterwarnings("ignore")
+    logging.captureWarnings(True)
 
     noisy_loggers = (
         "urllib3",
         "requests",
+        "requests.packages.urllib3",
         "httpx",
         "moviepy",
         "PIL.Image",
         "charset_normalizer",
+        "instagrapi",
+        "public_request",
+        "private_request",
     )
 
     for name in noisy_loggers:
-        logging.getLogger(name).setLevel(logging.ERROR)
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.ERROR)
+        logger.propagate = False
 
-    logging.getLogger().setLevel(logging.ERROR)
+    logging.getLogger("py.warnings").setLevel(logging.ERROR)
+
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if isinstance(handler, logging.StreamHandler):
+            handler.setLevel(logging.ERROR)
 

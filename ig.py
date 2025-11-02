@@ -49,9 +49,15 @@ from runtime import (
     start_q_listener,
 )
 from session_store import has_session, load_into
-from storage import already_contacted, log_sent, sent_totals
+from storage import (
+    already_contacted,
+    log_sent,
+    mark_account_paused,
+    paused_accounts_today,
+    sent_totals,
+)
 from ui import Fore, LiveTable, banner, full_line, highlight, style_text
-from utils import ask, ask_int, press_enter, warn
+from utils import ask, ask_int, enable_quiet_mode, press_enter, warn
 
 logger = logging.getLogger(__name__)
 
@@ -409,9 +415,12 @@ def _handle_event(
     remaining: Dict[str, int],
     bump: Callable[[str, int], None],
     error_tracker: Dict[str, Dict[str, object]],
+    account_error_streaks: Dict[str, int],
+    paused_accounts: set[str],
 ) -> Optional[str]:
     username = event.username
     if event.success:
+        account_error_streaks.pop(username, None)
         success[username] += 1
         detail = ""
         live_table.complete(username, True, detail)
@@ -435,6 +444,35 @@ def _handle_event(
             f"❌ @{username} → @{event.lead} ({detail})", color=Fore.RED, bold=True
         )
         print(summary)
+        streak = int(account_error_streaks.get(username, 0)) + 1
+        account_error_streaks[username] = streak
+        normalized_username = username.lower()
+        if streak >= 2 and normalized_username not in paused_accounts:
+            print(full_line(char="!", color=Fore.YELLOW, bold=True))
+            print(highlight(f"Protección activada para @{username}", color=Fore.YELLOW))
+            print(
+                style_text(
+                    "Se registraron 2 errores consecutivos. Se recomienda pausar esta cuenta por hoy.",
+                    color=Fore.YELLOW,
+                    bold=True,
+                )
+            )
+            choice = ask("¿Continuar con esta cuenta igualmente? (s/N): ").strip().lower()
+            if choice == "s":
+                warn(f"Se continuará con @{username} bajo tu responsabilidad.")
+                account_error_streaks[username] = 0
+            else:
+                paused_accounts.add(normalized_username)
+                remaining[username] = 0
+                mark_account_paused(username)
+                account_error_streaks[username] = 0
+                warn(f"@{username} quedará pausada por el resto del día.")
+                logger.warning(
+                    "Cuenta pausada por protección diaria: @%s (errores consecutivos=%d)",
+                    username,
+                    streak,
+                )
+            print(full_line(char="!", color=Fore.YELLOW, bold=True))
         reason_key = (event.reason_code or "").strip().lower()
         if not reason_key:
             reason_key = (event.reason_label or detail).strip().lower()
@@ -500,6 +538,22 @@ def _build_accounts_for_alias(alias: str) -> list[Dict]:
         warn("No hay cuentas activas en ese alias.")
         press_enter()
         return []
+
+    paused_lookup = {acct.lower() for acct in paused_accounts_today()}
+    if paused_lookup:
+        paused_in_alias = [acct for acct in all_acc if acct.get("username", "").lower() in paused_lookup]
+        if paused_in_alias:
+            warn(
+                "Las siguientes cuentas están pausadas por protección diaria y se omitirán automáticamente:",
+            )
+            for acct in paused_in_alias:
+                print(f" - @{acct['username']}")
+            print()
+        all_acc = [acct for acct in all_acc if acct.get("username", "").lower() not in paused_lookup]
+        if not all_acc:
+            warn("Todas las cuentas del alias están pausadas por hoy. Reintentá mañana.")
+            press_enter()
+            return []
 
     verified: list[Dict] = []
     needing_login: list[tuple[Dict, str]] = []
@@ -630,6 +684,7 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
         log_dir=SETTINGS.log_dir,
         log_file=SETTINGS.log_file,
     )
+    enable_quiet_mode()
     reset_stop_event()
     banner()
     _reset_live_counters()
@@ -707,6 +762,8 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
     result_queue: queue.Queue[SendEvent] = queue.Queue()
     live_table = LiveTable(max_entries=concurr)
     error_tracker: Dict[str, Dict[str, object]] = {}
+    account_error_streaks: Dict[str, int] = defaultdict(int)
+    paused_runtime: set[str] = {name.lower() for name in paused_accounts_today()}
 
     listener = start_q_listener("Presioná Q para detener la campaña.", logger)
     threads: list[threading.Thread] = []
@@ -872,6 +929,8 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
                 remaining,
                 bump,
                 error_tracker,
+                account_error_streaks,
+                paused_runtime,
             )
             _render_progress(
                 alias,
@@ -917,6 +976,8 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
                         remaining,
                         bump,
                         error_tracker,
+                        account_error_streaks,
+                        paused_runtime,
                     )
                     need_render = True
                     if action == "stop":
@@ -984,6 +1045,8 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
                     remaining,
                     bump,
                     error_tracker,
+                    account_error_streaks,
+                    paused_runtime,
                 )
                 _render_progress(
                     alias,
