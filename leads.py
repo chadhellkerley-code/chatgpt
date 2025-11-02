@@ -392,6 +392,7 @@ def _run_scrape(worker, client, username: str) -> List[str]:
     working_client = client
     while True:
         progress = ScrapeProgress()
+        results: List[str] = []
         try:
             with progress:
                 results = worker(working_client, progress)
@@ -408,6 +409,10 @@ def _run_scrape(worker, client, username: str) -> List[str]:
                 warn(str(exc))
                 return []
             continue
+        except KeyboardInterrupt:
+            progress.stop("ctrl_c")
+            progress.record_issue("Scraping interrumpido manualmente con Ctrl+C.")
+            results = []
         progress.summarize()
         return results
 
@@ -433,6 +438,7 @@ class ScrapeProgress:
         self._is_tty = sys.stdout.isatty()
         self._monitor = _KeyPressMonitor()
         self.stopped = False
+        self.stop_reason: Optional[str] = None
         self._active = False
 
     def __enter__(self) -> "ScrapeProgress":
@@ -454,8 +460,13 @@ class ScrapeProgress:
         if self.stopped:
             return True
         if self._monitor.poll():
-            self.stopped = True
+            self.stop("q")
         return self.stopped
+
+    def stop(self, reason: str = "manual") -> None:
+        self.stopped = True
+        if not self.stop_reason:
+            self.stop_reason = reason
 
     def record_issue(self, message: str) -> None:
         message = (message or "").strip()
@@ -469,7 +480,12 @@ class ScrapeProgress:
             self._clear_screen()
         print(f"Scrapeados: {self.count}")
         if self.stopped:
-            print("Proceso detenido manualmente (Q).")
+            if self.stop_reason == "q":
+                print("Proceso detenido manualmente (Q).")
+            elif self.stop_reason == "ctrl_c":
+                print("Proceso interrumpido con Ctrl+C.")
+            else:
+                print("Proceso detenido manualmente.")
         else:
             print("Proceso de scraping finalizado.")
         if self._issues:
@@ -593,27 +609,31 @@ def _scrape_hashtag(
     seen: set[int] = set()
     cache: Dict[int, object] = {}
     collected: List[str] = []
-    for media in medias:
-        user = getattr(media, "user", None)
-        if not user:
-            continue
-        user_id = _extract_user_id(user)
-        if not user_id or user_id in seen:
-            continue
-        seen.add(user_id)
-        if progress.should_stop():
-            break
-        info = _fetch_user_info(client, user_id, cache, filters.delay, progress)
-        if not info:
-            continue
-        username = getattr(info, "username", None)
-        if not username:
-            continue
-        if _passes_filters(info, filters):
-            collected.append(username)
-            progress.update(username)
-            if len(collected) >= filters.max_results:
+    try:
+        for media in medias:
+            user = getattr(media, "user", None)
+            if not user:
+                continue
+            user_id = _extract_user_id(user)
+            if not user_id or user_id in seen:
+                continue
+            seen.add(user_id)
+            if progress.should_stop():
                 break
+            info = _fetch_user_info(client, user_id, cache, progress)
+            if not info:
+                continue
+            username = getattr(info, "username", None)
+            if not username:
+                continue
+            if _passes_filters(info, filters):
+                collected.append(username)
+                progress.update(username)
+                _apply_delay(filters.delay)
+                if len(collected) >= filters.max_results:
+                    break
+    except KeyboardInterrupt:
+        progress.stop("ctrl_c")
     return _dedupe_preserve_order(collected)
 
 
@@ -630,66 +650,68 @@ def _scrape_from_profiles(
     collected: List[str] = []
     seen: set[int] = set()
     cache: Dict[int, object] = {}
-    for base in base_profiles:
-        if len(collected) >= filters.max_results:
-            break
-        try:
-            base_id = client.user_id_from_username(base)
-        except LoginRequired:
-            mark_connected(username, False)
-            raise
-        except Exception as exc:
-            progress.record_issue(f"No se pudo resolver @{base}: {exc}")
-            _apply_delay(filters.delay)
-            continue
-        fetch_amount = min(max(filters.max_results * 4, filters.max_results + 20), 1200)
-        try:
-            if mode == "followers":
-                candidates = client.user_followers(base_id, amount=fetch_amount)
-            else:
-                candidates = client.user_following(base_id, amount=fetch_amount)
-        except LoginRequired:
-            mark_connected(username, False)
-            raise
-        except Exception as exc:
-            progress.record_issue(f"Error obteniendo datos de @{base}: {exc}")
-            _apply_delay(filters.delay)
-            continue
-        items: Iterable[Tuple[int, object]]
-        if isinstance(candidates, dict):
-            items = candidates.items()
-        else:
-            temp_list: List[Tuple[int, object]] = []
-            for cand in candidates or []:
-                cand_id = getattr(cand, "pk", None)
-                if cand_id is None:
-                    continue
-                try:
-                    cand_id_int = int(cand_id)
-                except Exception:
-                    continue
-                temp_list.append((cand_id_int, cand))
-            items = temp_list
-        for cand_id, cand in items:
+    try:
+        for base in base_profiles:
             if len(collected) >= filters.max_results:
                 break
             try:
-                user_id = int(cand_id)
-            except Exception:
+                base_id = client.user_id_from_username(base)
+            except LoginRequired:
+                mark_connected(username, False)
+                raise
+            except Exception as exc:
+                progress.record_issue(f"No se pudo resolver @{base}: {exc}")
                 continue
-            if user_id in seen:
+            fetch_amount = min(max(filters.max_results * 4, filters.max_results + 20), 1200)
+            try:
+                if mode == "followers":
+                    candidates = client.user_followers(base_id, amount=fetch_amount)
+                else:
+                    candidates = client.user_following(base_id, amount=fetch_amount)
+            except LoginRequired:
+                mark_connected(username, False)
+                raise
+            except Exception as exc:
+                progress.record_issue(f"Error obteniendo datos de @{base}: {exc}")
                 continue
-            seen.add(user_id)
+            items: Iterable[Tuple[int, object]]
+            if isinstance(candidates, dict):
+                items = candidates.items()
+            else:
+                temp_list: List[Tuple[int, object]] = []
+                for cand in candidates or []:
+                    cand_id = getattr(cand, "pk", None)
+                    if cand_id is None:
+                        continue
+                    try:
+                        cand_id_int = int(cand_id)
+                    except Exception:
+                        continue
+                    temp_list.append((cand_id_int, cand))
+                items = temp_list
+            for cand_id, cand in items:
+                if len(collected) >= filters.max_results:
+                    break
+                try:
+                    user_id = int(cand_id)
+                except Exception:
+                    continue
+                if user_id in seen:
+                    continue
+                seen.add(user_id)
+                if progress.should_stop():
+                    break
+                info = _fetch_user_info(client, user_id, cache, progress)
+                if not info or not getattr(info, "username", None):
+                    continue
+                if _passes_filters(info, filters):
+                    collected.append(info.username)
+                    progress.update(info.username)
+                    _apply_delay(filters.delay)
             if progress.should_stop():
                 break
-            info = _fetch_user_info(client, user_id, cache, filters.delay, progress)
-            if not info or not getattr(info, "username", None):
-                continue
-            if _passes_filters(info, filters):
-                collected.append(info.username)
-                progress.update(info.username)
-        if progress.should_stop():
-            break
+    except KeyboardInterrupt:
+        progress.stop("ctrl_c")
     return _dedupe_preserve_order(collected)
 
 
@@ -697,11 +719,9 @@ def _fetch_user_info(
     client,
     user_id: int,
     cache: Dict[int, object],
-    delay: float,
     progress: Optional["ScrapeProgress"] = None,
 ):
     if user_id in cache:
-        _apply_delay(delay)
         return cache[user_id]
     try:
         info = client.user_info(user_id)
@@ -710,10 +730,8 @@ def _fetch_user_info(
             progress.record_issue(f"No se pudo obtener info del usuario {user_id}: {exc}")
         else:
             warn(f"No se pudo obtener info del usuario {user_id}: {exc}")
-        _apply_delay(delay)
         return None
     cache[user_id] = info
-    _apply_delay(delay)
     return info
 
 
