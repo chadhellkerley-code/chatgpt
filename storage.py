@@ -43,6 +43,22 @@ EXPORTS.mkdir(exist_ok=True)
 TZ_LABEL = "America/Argentina/Cordoba"
 
 
+def _normalize_paused_accounts(value) -> list[str]:
+    """Normaliza el formato persistido de cuentas pausadas."""
+
+    normalized: list[str] = []
+    if isinstance(value, list):
+        for entry in value:
+            candidate = ""
+            if isinstance(entry, str):
+                candidate = entry.strip()
+            elif isinstance(entry, dict):
+                candidate = str(entry.get("username") or entry.get("account") or "").strip()
+            if candidate:
+                normalized.append(candidate)
+    return normalized
+
+
 def _load_timezone(label: str):
     """Obtiene una zona horaria válida sin importar la disponibilidad de zoneinfo."""
 
@@ -88,6 +104,7 @@ def _load_state() -> dict:
     data.setdefault("daily_sent", 0)
     data.setdefault("daily_errors", 0)
     data.setdefault("last_reset_display", None)
+    data["paused_accounts"] = _normalize_paused_accounts(data.get("paused_accounts"))
     return data
 
 
@@ -309,7 +326,10 @@ def _ensure_state_today(state: dict) -> dict:
         state["daily_sent"] = sent_today
         state["daily_errors"] = errors_today
         state["last_reset_display"] = _start_of_day(_now_local()).strftime("%Y-%m-%d %H:%M")
+        state["paused_accounts"] = []
         _save_state(state)
+    else:
+        state.setdefault("paused_accounts", [])
     return state
 
 
@@ -321,6 +341,35 @@ def _increment_daily(okflag: bool) -> None:
         state["daily_errors"] = int(state.get("daily_errors", 0)) + 1
     state.setdefault("last_reset_display", _start_of_day(_now_local()).strftime("%Y-%m-%d %H:%M"))
     _save_state(state)
+
+
+def paused_accounts_today() -> list[str]:
+    """Devuelve las cuentas pausadas por protección diaria en la fecha actual."""
+
+    state = _ensure_state_today(_load_state())
+    paused = state.get("paused_accounts", [])
+    if not isinstance(paused, list):
+        paused = []
+        state["paused_accounts"] = paused
+        _save_state(state)
+    return list(paused)
+
+
+def mark_account_paused(username: str) -> None:
+    """Marca una cuenta como pausada por el resto del día actual."""
+
+    username = (username or "").strip()
+    if not username:
+        return
+    state = _ensure_state_today(_load_state())
+    paused = state.get("paused_accounts", [])
+    if not isinstance(paused, list):
+        paused = []
+    normalized = username.lower()
+    if all(str(entry).strip().lower() != normalized for entry in paused):
+        paused.append(username)
+        state["paused_accounts"] = paused
+        _save_state(state)
 
 
 def log_sent(account: str, username: str, okflag: bool, detail: str = ""):
