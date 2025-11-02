@@ -136,6 +136,16 @@ class ScrapeFilters:
     delay: float
 
 
+@dataclass
+class ScrapedUser:
+    username: str
+    biography: str
+    full_name: str
+    follower_count: int
+    media_count: int
+    is_private: bool
+
+
 def _scrape_menu() -> None:
     while True:
         banner()
@@ -386,13 +396,13 @@ def _prompt_filters() -> Optional[ScrapeFilters]:
     )
 
 
-def _run_scrape(worker, client, username: str) -> List[str]:
+def _run_scrape(worker, client, username: str) -> List[ScrapedUser]:
     from instagrapi.exceptions import LoginRequired
 
     working_client = client
     while True:
         progress = ScrapeProgress()
-        results: List[str] = []
+        results: List[ScrapedUser] = []
         try:
             with progress:
                 results = worker(working_client, progress)
@@ -478,7 +488,7 @@ class ScrapeProgress:
     def summarize(self) -> None:
         if self._is_tty:
             self._clear_screen()
-        print(f"Scrapeados: {self.count}")
+        print(f"Total encontrados: {self.count}")
         if self.stopped:
             if self.stop_reason == "q":
                 print("Proceso detenido manualmente (Q).")
@@ -503,18 +513,18 @@ class ScrapeProgress:
             self._clear_screen()
             header = [
                 "Scraping en curso... Presioná Q para detener.",
-                f"Scrapeados: {self.count}",
+                f"Total encontrados: {self.count}",
                 "",
             ]
             print("\n".join(header))
             for name in self._recent:
-                print(f" @{name}")
+                print(f"Perfil encontrado: @{name}")
             sys.stdout.flush()
         else:
             if self._recent:
-                print(f"Scrapeados: {self.count} → @{self._recent[-1]}")
+                print(f"Total encontrados: {self.count} → @{self._recent[-1]}")
             else:
-                print(f"Scrapeados: {self.count}")
+                print(f"Total encontrados: {self.count}")
 
     def _clear_screen(self) -> None:
         if not self._is_tty:
@@ -591,24 +601,15 @@ def _scrape_hashtag(
     hashtag: str,
     filters: ScrapeFilters,
     progress: "ScrapeProgress",
-) -> List[str]:
-    from instagrapi.exceptions import LoginRequired
-
-    amount = min(max(filters.max_results * 6, filters.max_results + 50), 3000)
-    try:
-        medias = client.hashtag_medias_recent(hashtag, amount=amount)
-    except LoginRequired:
-        mark_connected(username, False)
-        raise
-    except Exception as exc:
-        progress.record_issue(f"No se pudo obtener el hashtag #{hashtag}: {exc}")
-        return []
+) -> List[ScrapedUser]:
+    amount = min(max(filters.max_results * 12, filters.max_results + 80), 6000)
+    medias = _collect_hashtag_medias(client, username, hashtag, amount, progress)
     if not medias:
         warn(f"No se encontraron publicaciones recientes con #{hashtag}.")
         return []
     seen: set[int] = set()
     cache: Dict[int, object] = {}
-    collected: List[str] = []
+    collected: List[ScrapedUser] = []
     try:
         for media in medias:
             user = getattr(media, "user", None)
@@ -621,20 +622,60 @@ def _scrape_hashtag(
             if progress.should_stop():
                 break
             info = _fetch_user_info(client, user_id, cache, progress)
-            if not info:
-                continue
-            username = getattr(info, "username", None)
-            if not username:
+            if not info or not getattr(info, "username", None):
                 continue
             if _passes_filters(info, filters):
-                collected.append(username)
-                progress.update(username)
+                collected.append(_build_scraped_user(info))
+                progress.update(info.username)
                 _apply_delay(filters.delay)
                 if len(collected) >= filters.max_results:
                     break
     except KeyboardInterrupt:
         progress.stop("ctrl_c")
-    return _dedupe_preserve_order(collected)
+    return _dedupe_scraped(collected)
+
+
+def _collect_hashtag_medias(client, username: str, hashtag: str, amount: int, progress: "ScrapeProgress"):
+    from instagrapi.exceptions import LoginRequired
+
+    medias: List[object] = []
+    seen_media: set[int] = set()
+    fetchers = [
+        ("recientes", getattr(client, "hashtag_medias_recent", None)),
+        ("populares", getattr(client, "hashtag_medias_top", None)),
+        ("v1", getattr(client, "hashtag_medias_v1", None)),
+    ]
+    for label, func in fetchers:
+        if progress.should_stop():
+            break
+        if not callable(func):
+            continue
+        remaining = max(amount - len(medias), 0)
+        if remaining <= 0:
+            break
+        try:
+            chunk = func(hashtag, amount=remaining)
+        except LoginRequired:
+            mark_connected(username, False)
+            raise
+        except Exception as exc:
+            progress.record_issue(f"No se pudo obtener datos ({label}) de #{hashtag}: {exc}")
+            continue
+        for media in chunk or []:
+            key = getattr(media, "pk", None) or getattr(media, "id", None)
+            if key is None:
+                continue
+            try:
+                key_int = int(key)
+            except Exception:
+                continue
+            if key_int in seen_media:
+                continue
+            seen_media.add(key_int)
+            medias.append(media)
+            if len(medias) >= amount:
+                break
+    return medias
 
 
 def _scrape_from_profiles(
@@ -644,10 +685,10 @@ def _scrape_from_profiles(
     mode: str,
     filters: ScrapeFilters,
     progress: "ScrapeProgress",
-) -> List[str]:
+) -> List[ScrapedUser]:
     from instagrapi.exceptions import LoginRequired
 
-    collected: List[str] = []
+    collected: List[ScrapedUser] = []
     seen: set[int] = set()
     cache: Dict[int, object] = {}
     try:
@@ -705,14 +746,14 @@ def _scrape_from_profiles(
                 if not info or not getattr(info, "username", None):
                     continue
                 if _passes_filters(info, filters):
-                    collected.append(info.username)
+                    collected.append(_build_scraped_user(info))
                     progress.update(info.username)
                     _apply_delay(filters.delay)
             if progress.should_stop():
                 break
     except KeyboardInterrupt:
         progress.stop("ctrl_c")
-    return _dedupe_preserve_order(collected)
+    return _dedupe_scraped(collected)
 
 
 def _fetch_user_info(
@@ -757,17 +798,26 @@ def _passes_filters(user_info, filters: ScrapeFilters) -> bool:
     return True
 
 
-def _handle_scrape_results(usernames: List[str]) -> None:
-    usernames = _dedupe_preserve_order([u.lstrip("@") for u in usernames if u])
-    if not usernames:
+def _handle_scrape_results(users: List[ScrapedUser]) -> None:
+    users = [u for u in users if u and getattr(u, "username", None)]
+    users = _dedupe_scraped(users)
+    if not users:
         warn("No se encontraron usuarios que cumplan los filtros.")
         press_enter()
         return
+    users = _maybe_apply_advanced_filter(users)
+    if not users:
+        warn("Lista descartada tras aplicar filtros avanzados.")
+        press_enter()
+        return
+    usernames = [u.username.lstrip("@") for u in users]
     print("\nUsuarios encontrados:")
-    for idx, username in enumerate(usernames[:20], start=1):
-        print(f" {idx:02d}. @{username}")
-    if len(usernames) > 20:
-        print(f" ... (+{len(usernames) - 20} más)")
+    for idx, user in enumerate(users[:20], start=1):
+        resume = (user.biography or user.full_name or "").strip()
+        extra = f" — {resume[:70]}" if resume else ""
+        print(f" {idx:02d}. @{user.username}{extra}")
+    if len(users) > 20:
+        print(f" ... (+{len(users) - 20} más)")
 
     while True:
         print("\n¿Qué deseás hacer con la lista?")
@@ -819,6 +869,79 @@ def _dedupe_preserve_order(usernames: Iterable[str]) -> List[str]:
     return ordered
 
 
+def _dedupe_scraped(users: Iterable[ScrapedUser]) -> List[ScrapedUser]:
+    seen: set[str] = set()
+    ordered: List[ScrapedUser] = []
+    for user in users:
+        username = getattr(user, "username", "")
+        key = username.strip().lstrip("@").lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(user)
+    return ordered
+
+
+def _maybe_apply_advanced_filter(users: List[ScrapedUser]) -> List[ScrapedUser]:
+    choice = ask("¿Deseás limpiar la lista con filtros avanzados? (s/N): ").strip().lower()
+    if choice != "s":
+        return users
+    print(
+        "\nIngresá palabras o frases clave a buscar en la bio o nombre. "
+        "Separalas con comas o saltos de línea."
+    )
+    print("Podés anteponer '-' para excluir términos específicos.")
+    raw = ask_multiline("Condiciones: ").strip()
+    if not raw:
+        warn("No se ingresaron filtros. Se mantiene la lista original.")
+        return users
+    tokens = [chunk.strip() for chunk in raw.replace("\n", ",").split(",")]
+    includes = [t.lstrip("+").lower() for t in tokens if t and not t.startswith("-")]
+    excludes = [t[1:].lower() for t in tokens if t.startswith("-") and len(t) > 1]
+    includes = [t for t in includes if t]
+    excludes = [t for t in excludes if t]
+    if not includes and not excludes:
+        warn("No se ingresaron filtros válidos. Se mantiene la lista original.")
+        return users
+    mode = (
+        ask(
+            "¿Las palabras obligatorias deben aparecer todas (T) o al menos una (A)? (A/T): "
+        )
+        .strip()
+        .lower()
+    )
+    require_all = mode == "t"
+    filtered: List[ScrapedUser] = []
+    for user in users:
+        haystack = " ".join(
+            filter(
+                None,
+                [
+                    getattr(user, "username", "") or "",
+                    getattr(user, "full_name", "") or "",
+                    getattr(user, "biography", "") or "",
+                ],
+            )
+        ).lower()
+        if includes:
+            if require_all:
+                if not all(term in haystack for term in includes):
+                    continue
+            else:
+                if not any(term in haystack for term in includes):
+                    continue
+        if excludes and any(term in haystack for term in excludes):
+            continue
+        filtered.append(user)
+    if not filtered:
+        warn(
+            "Ningún perfil coincidió con los filtros avanzados. Se mantiene la lista original."
+        )
+        return users
+    print(f"\nPerfiles tras el filtrado avanzado: {len(filtered)} (de {len(users)}).")
+    return filtered
+
+
 def _extract_user_id(user) -> Optional[int]:
     for attr in ("pk", "id"):
         value = getattr(user, attr, None)
@@ -850,3 +973,20 @@ def _apply_delay(delay: float) -> None:
     lower = max(0.5, base - jitter)
     upper = base + jitter
     time.sleep(random.uniform(lower, upper))
+
+
+def _build_scraped_user(info) -> ScrapedUser:
+    biography = (getattr(info, "biography", "") or "").strip()
+    full_name = (getattr(info, "full_name", "") or "").strip()
+    follower_count = int(getattr(info, "follower_count", 0) or 0)
+    media_count = int(getattr(info, "media_count", 0) or 0)
+    is_private = bool(getattr(info, "is_private", False))
+    username = getattr(info, "username", "").strip()
+    return ScrapedUser(
+        username=username.lstrip("@"),
+        biography=biography,
+        full_name=full_name,
+        follower_count=follower_count,
+        media_count=media_count,
+        is_private=is_private,
+    )
