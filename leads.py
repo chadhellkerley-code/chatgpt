@@ -4,13 +4,15 @@ import csv
 import logging
 import os
 import random
+import re
 import shutil
 import sys
 import time
+import unicodedata
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from accounts import (
     auto_login_with_saved_password,
@@ -144,6 +146,53 @@ class ScrapedUser:
     follower_count: int
     media_count: int
     is_private: bool
+
+
+@dataclass
+class PromptCriteria:
+    include_groups: List[Set[str]]
+    optional_terms: Set[str]
+    exclude_terms: Set[str]
+    min_followers: Optional[int] = None
+    max_followers: Optional[int] = None
+    min_posts: Optional[int] = None
+    max_posts: Optional[int] = None
+
+    def has_conditions(self) -> bool:
+        return bool(
+            self.include_groups
+            or self.optional_terms
+            or self.exclude_terms
+            or self.min_followers
+            or self.max_followers
+            or self.min_posts
+            or self.max_posts
+        )
+
+
+class DelayController:
+    def __init__(self, delay: float) -> None:
+        self._delay = max(0.0, float(delay))
+        self._last_recorded: Optional[float] = None
+
+    def pause(self) -> None:
+        if self._delay <= 0:
+            self._last_recorded = time.monotonic()
+            return
+        now = time.monotonic()
+        if self._last_recorded is None:
+            self._last_recorded = now
+            return
+        jitter = min(2.0, self._delay * 0.3 + 0.5)
+        lower = max(0.5, self._delay - jitter)
+        upper = self._delay + jitter
+        target = random.uniform(lower, upper)
+        elapsed = now - self._last_recorded
+        remaining = max(0.0, target - elapsed)
+        if remaining > 0:
+            time.sleep(remaining)
+            now = time.monotonic()
+        self._last_recorded = now
 
 
 def _scrape_menu() -> None:
@@ -610,26 +659,24 @@ def _scrape_hashtag(
     seen: set[int] = set()
     cache: Dict[int, object] = {}
     collected: List[ScrapedUser] = []
+    delay = DelayController(filters.delay)
     try:
         for media in medias:
-            user = getattr(media, "user", None)
-            if not user:
-                continue
-            user_id = _extract_user_id(user)
+            user_id, candidate = _resolve_media_user(media)
             if not user_id or user_id in seen:
                 continue
             seen.add(user_id)
             if progress.should_stop():
                 break
-            info = _fetch_user_info(client, user_id, cache, progress, user)
+            info = _fetch_user_info(client, user_id, cache, progress, candidate)
             if not info or not getattr(info, "username", None):
                 continue
             if _passes_filters(info, filters):
                 collected.append(_build_scraped_user(info))
                 progress.update(info.username)
-                _apply_delay(filters.delay)
                 if len(collected) >= filters.max_results:
                     break
+                delay.pause()
     except KeyboardInterrupt:
         progress.stop("ctrl_c")
     return _dedupe_scraped(collected)
@@ -691,6 +738,7 @@ def _scrape_from_profiles(
     collected: List[ScrapedUser] = []
     seen: set[int] = set()
     cache: Dict[int, object] = {}
+    delay = DelayController(filters.delay)
     try:
         for base in base_profiles:
             if len(collected) >= filters.max_results:
@@ -748,8 +796,10 @@ def _scrape_from_profiles(
                 if _passes_filters(info, filters):
                     collected.append(_build_scraped_user(info))
                     progress.update(info.username)
-                    _apply_delay(filters.delay)
-            if progress.should_stop():
+                    if len(collected) >= filters.max_results:
+                        break
+                    delay.pause()
+            if progress.should_stop() or len(collected) >= filters.max_results:
                 break
     except KeyboardInterrupt:
         progress.stop("ctrl_c")
@@ -853,26 +903,26 @@ def _handle_scrape_results(users: List[ScrapedUser]) -> None:
         warn("No se encontraron usuarios que cumplan los filtros.")
         press_enter()
         return
-    users = _maybe_apply_advanced_filter(users)
-    if not users:
-        warn("Lista descartada tras aplicar filtros avanzados.")
-        press_enter()
-        return
-    usernames = [u.username.lstrip("@") for u in users]
-    print("\nUsuarios encontrados:")
-    for idx, user in enumerate(users[:20], start=1):
-        resume = (user.biography or user.full_name or "").strip()
-        extra = f" — {resume[:70]}" if resume else ""
-        print(f" {idx:02d}. @{user.username}{extra}")
-    if len(users) > 20:
-        print(f" ... (+{len(users) - 20} más)")
-
+    current = users
     while True:
+        if not current:
+            warn("No quedan usuarios en la lista actual.")
+            break
+        print("\nUsuarios encontrados:")
+        for idx, user in enumerate(current[:20], start=1):
+            resume = (user.biography or user.full_name or "").strip()
+            extra = f" — {resume[:70]}" if resume else ""
+            print(f" {idx:02d}. @{user.username}{extra}")
+        if len(current) > 20:
+            print(f" ... (+{len(current) - 20} más)")
+
         print("\n¿Qué deseás hacer con la lista?")
         print("1) Agregar a una lista existente")
         print("2) Crear una lista nueva")
-        print("3) Cancelar")
-        choice = ask("Opción: ").strip() or "3"
+        print("3) Aplicar limpieza avanzada")
+        print("4) Cancelar y descartar")
+        choice = ask("Opción: ").strip() or "4"
+        usernames = [u.username.lstrip("@") for u in current]
         if choice == "1":
             files = list_files()
             if not files:
@@ -898,11 +948,35 @@ def _handle_scrape_results(users: List[ScrapedUser]) -> None:
             ok(f"Lista {name} creada con {len(usernames)} usuarios.")
             break
         elif choice == "3":
+            filtered = _advanced_cleanup_menu(current)
+            if filtered is current:
+                continue
+            current = _dedupe_scraped(filtered)
+        elif choice == "4":
             warn("Lista descartada.")
             break
         else:
             warn("Opción inválida.")
     press_enter()
+
+
+def _advanced_cleanup_menu(users: List[ScrapedUser]) -> List[ScrapedUser]:
+    if not users:
+        warn("No hay usuarios para filtrar.")
+        return users
+    while True:
+        print("\nOpciones de limpieza avanzada:")
+        print("1) Filtrar por palabras clave manuales")
+        print("2) Filtrar usando un prompt en lenguaje natural")
+        print("3) Volver sin cambios")
+        choice = ask("Opción: ").strip() or "3"
+        if choice == "1":
+            return _apply_advanced_filter(users)
+        if choice == "2":
+            return _apply_prompt_filter(users)
+        if choice == "3":
+            return users
+        warn("Opción inválida.")
 
 
 def _dedupe_preserve_order(usernames: Iterable[str]) -> List[str]:
@@ -930,18 +1004,112 @@ def _dedupe_scraped(users: Iterable[ScrapedUser]) -> List[ScrapedUser]:
     return ordered
 
 
-def _maybe_apply_advanced_filter(users: List[ScrapedUser]) -> List[ScrapedUser]:
-    choice = ask("¿Deseás limpiar la lista con filtros avanzados? (s/N): ").strip().lower()
-    if choice != "s":
+def _resolve_media_user(media) -> Tuple[Optional[int], Optional[object]]:
+    if media is None:
+        return None, None
+    user = getattr(media, "user", None)
+    user_id = _extract_user_id(user) if user is not None else None
+    if user_id:
+        return user_id, user
+    owner = getattr(media, "owner", None)
+    owner_id = _extract_user_id(owner) if owner is not None else None
+    if owner_id:
+        return owner_id, owner
+    user_id_attr = getattr(media, "user_id", None)
+    if user_id_attr is not None:
+        try:
+            return int(user_id_attr), None
+        except Exception:
+            pass
+    if isinstance(media, dict):
+        for key in ("user", "owner"):
+            candidate = media.get(key)
+            if candidate:
+                candidate_id = _extract_user_id(candidate)
+                if candidate_id:
+                    return candidate_id, candidate
+        user_id_attr = media.get("user_id")
+        if user_id_attr is not None:
+            try:
+                return int(user_id_attr), None
+            except Exception:
+                pass
+    return None, None
+
+
+def _apply_prompt_filter(users: List[ScrapedUser]) -> List[ScrapedUser]:
+    if not users:
+        warn("No hay usuarios para filtrar.")
         return users
     print(
-        "\nIngresá palabras o frases clave a buscar en la bio o nombre. "
+        "\nEscribí un prompt describiendo los perfiles que buscás. "
+        "El sistema analizará bios, nombres y usuarios para encontrar coincidencias."
+    )
+    prompt_text = ask_multiline("Prompt: ").strip()
+    if not prompt_text:
+        warn("No se ingresó un prompt. Se mantiene la lista actual.")
+        return users
+    criteria = _interpret_prompt(prompt_text)
+    if not criteria.has_conditions():
+        warn(
+            "No se identificaron condiciones claras en el prompt. "
+            "Probá con una descripción más específica."
+        )
+        return users
+    matched: List[ScrapedUser] = []
+    for user in users:
+        if _matches_prompt(user, criteria):
+            matched.append(user)
+    if not matched:
+        warn("Ningún perfil coincide con el prompt. Se mantiene la lista actual.")
+        return users
+    print("\nCriterios interpretados:")
+    if criteria.min_followers:
+        print(f" - Seguidores mínimos: {criteria.min_followers}")
+    if criteria.max_followers:
+        print(f" - Seguidores máximos: {criteria.max_followers}")
+    if criteria.min_posts:
+        print(f" - Posteos mínimos: {criteria.min_posts}")
+    if criteria.max_posts:
+        print(f" - Posteos máximos: {criteria.max_posts}")
+    if criteria.include_groups:
+        for idx, group in enumerate(criteria.include_groups, start=1):
+            readable = ", ".join(sorted(group))
+            print(f" - Condición {idx}: {readable}")
+    if criteria.exclude_terms:
+        print(f" - Excluir si contiene: {', '.join(sorted(criteria.exclude_terms))}")
+    print(
+        f"\nPerfiles coincidentes con el prompt: {len(matched)} "
+        f"(de {len(users)})."
+    )
+    preview = matched[:10]
+    if preview:
+        print("Ejemplos:")
+        for idx, user in enumerate(preview, start=1):
+            snippet = (user.biography or user.full_name or "").strip()
+            extra = f" — {snippet[:60]}" if snippet else ""
+            print(f" {idx:02d}. @{user.username}{extra}")
+    confirm = ask(
+        "¿Reemplazar la lista actual con los perfiles encontrados por el prompt? (s/N): "
+    ).strip().lower()
+    if confirm != "s":
+        warn("Se mantiene la lista sin cambios.")
+        return users
+    return matched
+
+
+def _apply_advanced_filter(users: List[ScrapedUser]) -> List[ScrapedUser]:
+    if not users:
+        warn("No hay usuarios para filtrar.")
+        return users
+    print(
+        "\nIngresá palabras o frases clave a buscar en la bio, nombre o usuario. "
         "Separalas con comas o saltos de línea."
     )
     print("Podés anteponer '-' para excluir términos específicos.")
     raw = ask_multiline("Condiciones: ").strip()
     if not raw:
-        warn("No se ingresaron filtros. Se mantiene la lista original.")
+        warn("No se ingresaron filtros. Se mantiene la lista actual.")
         return users
     tokens = [chunk.strip() for chunk in raw.replace("\n", ",").split(",")]
     includes = [t.lstrip("+").lower() for t in tokens if t and not t.startswith("-")]
@@ -949,7 +1117,7 @@ def _maybe_apply_advanced_filter(users: List[ScrapedUser]) -> List[ScrapedUser]:
     includes = [t for t in includes if t]
     excludes = [t for t in excludes if t]
     if not includes and not excludes:
-        warn("No se ingresaron filtros válidos. Se mantiene la lista original.")
+        warn("No se ingresaron filtros válidos. Se mantiene la lista actual.")
         return users
     mode = (
         ask(
@@ -983,11 +1151,466 @@ def _maybe_apply_advanced_filter(users: List[ScrapedUser]) -> List[ScrapedUser]:
         filtered.append(user)
     if not filtered:
         warn(
-            "Ningún perfil coincidió con los filtros avanzados. Se mantiene la lista original."
+            "Ningún perfil coincidió con los filtros avanzados. Se mantiene la lista actual."
         )
         return users
     print(f"\nPerfiles tras el filtrado avanzado: {len(filtered)} (de {len(users)}).")
+    preview = filtered[:10]
+    if preview:
+        print("Ejemplos filtrados:")
+        for idx, user in enumerate(preview, start=1):
+            snippet = (user.biography or user.full_name or "").strip()
+            extra = f" — {snippet[:60]}" if snippet else ""
+            print(f" {idx:02d}. @{user.username}{extra}")
+    confirm = ask("¿Aplicar este filtrado a la lista actual? (s/N): ").strip().lower()
+    if confirm != "s":
+        warn("Se mantiene la lista sin cambios.")
+        return users
     return filtered
+
+
+_PROMPT_STOPWORDS = {
+    "a",
+    "acerca",
+    "ademas",
+    "al",
+    "algo",
+    "algun",
+    "alguna",
+    "algunas",
+    "algunos",
+    "ante",
+    "antes",
+    "aqui",
+    "asi",
+    "aunque",
+    "busco",
+    "buscar",
+    "cada",
+    "casi",
+    "como",
+    "con",
+    "contra",
+    "cual",
+    "cuales",
+    "cualquier",
+    "cuenta",
+    "cuyo",
+    "cuya",
+    "cuyos",
+    "cuyas",
+    "de",
+    "del",
+    "desde",
+    "donde",
+    "durante",
+    "el",
+    "ella",
+    "ellas",
+    "ellos",
+    "en",
+    "entre",
+    "es",
+    "esa",
+    "esas",
+    "ese",
+    "eso",
+    "esta",
+    "estan",
+    "estas",
+    "este",
+    "esto",
+    "estos",
+    "etc",
+    "gente",
+    "habla",
+    "hablan",
+    "hablar",
+    "hablen",
+    "hacia",
+    "hacen",
+    "hacer",
+    "hasta",
+    "incluye",
+    "incluyen",
+    "incluir",
+    "la",
+    "las",
+    "le",
+    "les",
+    "lo",
+    "los",
+    "mas",
+    "menos",
+    "mientras",
+    "misma",
+    "mismas",
+    "mismo",
+    "mismos",
+    "necesito",
+    "necesitamos",
+    "ningun",
+    "ninguna",
+    "no",
+    "nos",
+    "nuestro",
+    "nuestra",
+    "nuestras",
+    "nuestros",
+    "o",
+    "otra",
+    "otras",
+    "otro",
+    "otros",
+    "para",
+    "perfiles",
+    "perfil",
+    "personas",
+    "pero",
+    "por",
+    "porque",
+    "preferible",
+    "preferiblemente",
+    "preferentemente",
+    "prefiero",
+    "que",
+    "quien",
+    "quienes",
+    "quiero",
+    "quiere",
+    "queremos",
+    "relacion",
+    "relaciona",
+    "relacionado",
+    "relacionada",
+    "relacionados",
+    "relacionadas",
+    "requiere",
+    "requieren",
+    "requiro",
+    "residan",
+    "residen",
+    "sea",
+    "sean",
+    "segun",
+    "si",
+    "sin",
+    "sobre",
+    "solamente",
+    "solo",
+    "somos",
+    "son",
+    "seguidor",
+    "seguidores",
+    "followers",
+    "fans",
+    "su",
+    "sus",
+    "tal",
+    "tambien",
+    "tan",
+    "tanto",
+    "tengan",
+    "tener",
+    "tengo",
+    "tema",
+    "temas",
+    "tipo",
+    "tipos",
+    "toda",
+    "todas",
+    "todo",
+    "todos",
+    "post",
+    "posts",
+    "posteos",
+    "publicaciones",
+    "publicacion",
+    "contenido",
+    "contenidos",
+    "trabajan",
+    "trabajen",
+    "ubicada",
+    "ubicadas",
+    "ubicado",
+    "ubicados",
+    "ubicacion",
+    "un",
+    "una",
+    "unas",
+    "uno",
+    "unos",
+    "usuarios",
+    "usuario",
+    "usar",
+    "varias",
+    "varios",
+    "vive",
+    "viven",
+    "vivir",
+    "vivan",
+    "y",
+    "ya",
+}
+
+_PROMPT_NEGATIONS = {
+    "sin",
+    "no",
+    "excepto",
+    "excepta",
+    "exceptos",
+    "exceptas",
+    "excluir",
+    "excluye",
+    "excluyen",
+    "evitar",
+    "evita",
+    "eviten",
+    "salvo",
+    "salvos",
+    "salvas",
+    "menos",
+}
+
+_PROMPT_FOLLOWER_KEYWORDS = (
+    "seguidor",
+    "seguidores",
+    "followers",
+    "fans",
+)
+
+_PROMPT_POST_KEYWORDS = (
+    "post",
+    "posts",
+    "posteos",
+    "publicaciones",
+    "publicacion",
+    "contenido",
+    "contenidos",
+)
+
+
+def _normalize_text(value: str) -> str:
+    if not value:
+        return ""
+    normalized = unicodedata.normalize("NFKD", str(value))
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = normalized.lower()
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+_RAW_PROMPT_SYNONYMS = {
+    "argentina": {"argentina", "argentino", "argentina", "buenos aires", "cordoba"},
+    "bolivia": {"bolivia", "boliviano", "boliviana", "la paz", "santa cruz"},
+    "chile": {"chile", "chileno", "chilena", "santiago", "valparaiso"},
+    "colombia": {"colombia", "colombiano", "colombiana", "bogota", "medellin"},
+    "costarica": {"costa rica", "costarricense", "tico", "tica"},
+    "ecuador": {"ecuador", "ecuatoriano", "ecuatoriana", "quito", "guayaquil"},
+    "espana": {"espana", "spain", "madrid", "barcelona", "sevilla", "valencia", "espanol", "espanola"},
+    "europa": {"europa", "europe", "europeo", "europea", "union europea"},
+    "latinoamerica": {"latinoamerica", "latam", "latino", "latina"},
+    "mexico": {"mexico", "mx", "cdmx", "ciudad de mexico", "mexicana", "mexicano", "monterrey", "guadalajara"},
+    "peru": {"peru", "peruano", "peruana", "lima"},
+    "uruguay": {"uruguay", "uruguayo", "uruguaya", "montevideo"},
+    "venezuela": {"venezuela", "venezolano", "venezolana", "caracas"},
+    "espanol": {"espanol", "castellano", "spanish", "hablo espanol", "idioma espanol"},
+    "ingles": {"ingles", "english", "bilingue", "bilingual"},
+    "portugues": {"portugues", "portuguese", "brasil", "brasileno", "brasilena", "brasilero", "brasilera"},
+    "mujer": {"mujer", "mujeres", "female", "femenino", "femenina", "women", "woman", "chica", "damas", "girls"},
+    "hombre": {"hombre", "hombres", "male", "masculino", "masculina", "men", "man"},
+    "coaching": {"coaching", "coach", "coaches", "mentora", "mentor", "mentoring", "mentoria", "mentorias"},
+    "negocios": {"negocio", "negocios", "business", "empresa", "empresas", "empresaria", "empresario", "emprendimiento", "emprendedor", "emprendedora", "startup", "startups"},
+    "liderazgo": {"liderazgo", "lider", "lideres", "leader", "leadership", "liderar"},
+    "marketing": {"marketing", "marketer", "mercadotecnia", "growth", "digital marketing", "publicidad", "ads"},
+    "ventas": {"ventas", "sales", "vendedor", "vendedora", "seller", "comercial", "comerciales"},
+    "finanzas": {"finanzas", "finance", "financiero", "financiera", "financial"},
+    "tecnologia": {"tecnologia", "technology", "tech", "tecnologico", "tecnologica", "software", "it"},
+    "emprendedor": {"emprendedor", "emprendedora", "emprendedores", "emprendedoras", "founder", "founders", "cofounder", "cofounders", "cofundador", "cofundadora"},
+    "wellness": {"wellness", "bienestar", "health", "healthy"},
+    "inversion": {"inversion", "inversiones", "investor", "investors", "angel", "venture", "capital"},
+    "freelance": {"freelance", "freelancer", "independiente", "autonomo", "autonoma"},
+}
+
+
+def _build_prompt_synonyms() -> Dict[str, Set[str]]:
+    mapping: Dict[str, Set[str]] = {}
+    for key, raw_terms in _RAW_PROMPT_SYNONYMS.items():
+        normalized_key = _normalize_text(key)
+        bucket: Set[str] = set()
+        for term in raw_terms:
+            normalized_term = _normalize_text(term)
+            if normalized_term and normalized_term not in _PROMPT_STOPWORDS:
+                bucket.add(normalized_term)
+        if normalized_key and normalized_key not in _PROMPT_STOPWORDS:
+            bucket.add(normalized_key)
+        if bucket:
+            mapping[normalized_key] = bucket
+    return mapping
+
+
+_PROMPT_SYNONYMS = _build_prompt_synonyms()
+
+
+def _clean_int(raw: str) -> Optional[int]:
+    digits = re.sub(r"[^0-9]", "", raw or "")
+    if not digits:
+        return None
+    try:
+        return int(digits)
+    except Exception:
+        return None
+
+
+def _parse_numeric_bounds(text: str, keywords: Tuple[str, ...]) -> Tuple[Optional[int], Optional[int]]:
+    min_value: Optional[int] = None
+    max_value: Optional[int] = None
+    for keyword in keywords:
+        if not keyword:
+            continue
+        pattern_min = rf"(?:mas de|al menos|minimo(?: de)?|mayor a|superior a|mas que|>=|>\s*)(\d[\d\s\.,]*)\s*{keyword}"
+        for match in re.finditer(pattern_min, text):
+            value = _clean_int(match.group(1))
+            if value is not None:
+                min_value = value if min_value is None else max(min_value, value)
+        pattern_plus = rf"(\d[\d\s\.,]*)\s*(?:\+|o mas)\s*{keyword}"
+        for match in re.finditer(pattern_plus, text):
+            value = _clean_int(match.group(1))
+            if value is not None:
+                min_value = value if min_value is None else max(min_value, value)
+        pattern_max = rf"(?:menos de|no mas de|maximo(?: de)?|hasta|menor a|inferior a|<=|<\s*)(\d[\d\s\.,]*)\s*{keyword}"
+        for match in re.finditer(pattern_max, text):
+            value = _clean_int(match.group(1))
+            if value is not None:
+                max_value = value if max_value is None else min(max_value, value)
+    return min_value, max_value
+
+
+def _tokenize_prompt_segment(segment: str) -> List[str]:
+    normalized = _normalize_text(segment)
+    if not normalized:
+        return []
+    tokens = normalized.split(" ")
+    cleaned: List[str] = []
+    for token in tokens:
+        if not token or token in _PROMPT_STOPWORDS or token.isdigit():
+            continue
+        cleaned.append(token)
+    return cleaned
+
+
+def _expand_prompt_token(token: str) -> Set[str]:
+    normalized = _normalize_text(token)
+    if not normalized or normalized in _PROMPT_STOPWORDS:
+        return set()
+    expanded: Set[str] = {normalized}
+    if normalized.endswith("es") and len(normalized) > 4:
+        expanded.add(normalized[:-2])
+    if normalized.endswith("s") and len(normalized) > 3:
+        expanded.add(normalized[:-1])
+    synonyms = _PROMPT_SYNONYMS.get(normalized)
+    if synonyms:
+        expanded.update(synonyms)
+    for key, group in _PROMPT_SYNONYMS.items():
+        if normalized in group:
+            expanded.update(group)
+            expanded.add(key)
+    return {term for term in expanded if term and term not in _PROMPT_STOPWORDS}
+
+
+def _interpret_prompt(prompt: str) -> PromptCriteria:
+    normalized_prompt = _normalize_text(prompt)
+    criteria = PromptCriteria(include_groups=[], optional_terms=set(), exclude_terms=set())
+    if not normalized_prompt:
+        return criteria
+    criteria.min_followers, criteria.max_followers = _parse_numeric_bounds(
+        normalized_prompt, _PROMPT_FOLLOWER_KEYWORDS
+    )
+    criteria.min_posts, criteria.max_posts = _parse_numeric_bounds(
+        normalized_prompt, _PROMPT_POST_KEYWORDS
+    )
+    working = re.sub(r"[,]+", ".", normalized_prompt)
+    clauses = [clause.strip() for clause in re.split(r"[\.;\n]+", working) if clause.strip()]
+    if not clauses:
+        clauses = [working]
+    for clause in clauses:
+        negated = any(re.search(rf"\b{word}\b", clause) for word in _PROMPT_NEGATIONS)
+        cleaned_clause = clause
+        if negated:
+            for word in _PROMPT_NEGATIONS:
+                cleaned_clause = re.sub(rf"\b{word}\b", " ", cleaned_clause)
+        and_parts = re.split(r"\b(?:y|e|ademas|tambien|asi como|mas)\b", cleaned_clause)
+        for part in and_parts:
+            or_terms: Set[str] = set()
+            for segment in re.split(r"\b(?:o|u)\b", part):
+                tokens = _tokenize_prompt_segment(segment)
+                expanded: Set[str] = set()
+                for token in tokens:
+                    expanded.update(_expand_prompt_token(token))
+                if expanded:
+                    or_terms.update(expanded)
+            if not or_terms:
+                continue
+            if negated:
+                criteria.exclude_terms.update(or_terms)
+            else:
+                criteria.include_groups.append(or_terms)
+                criteria.optional_terms.update(or_terms)
+    quoted = re.findall(r'["“”\']([^"“”\']+)["“”\']', prompt)
+    for phrase in quoted:
+        normalized_phrase = _normalize_text(phrase)
+        if not normalized_phrase:
+            continue
+        expanded = _expand_prompt_token(normalized_phrase) or {normalized_phrase}
+        criteria.include_groups.append(expanded)
+        criteria.optional_terms.update(expanded)
+    criteria.exclude_terms = {
+        term for term in criteria.exclude_terms if term not in criteria.optional_terms
+    }
+    return criteria
+
+
+def _term_in_haystack(term: str, haystack: str) -> bool:
+    normalized_term = _normalize_text(term)
+    if not normalized_term:
+        return False
+    if " " in normalized_term:
+        return normalized_term in haystack
+    pattern = rf"\b{re.escape(normalized_term)}\b"
+    return bool(re.search(pattern, haystack))
+
+
+def _matches_prompt(user: ScrapedUser, criteria: PromptCriteria) -> bool:
+    haystack_parts = [
+        getattr(user, "username", "") or "",
+        getattr(user, "full_name", "") or "",
+        getattr(user, "biography", "") or "",
+    ]
+    combined = " ".join(part for part in haystack_parts if part).strip()
+    normalized_haystack = _normalize_text(combined)
+    padded = f" {normalized_haystack} " if normalized_haystack else ""
+    if criteria.exclude_terms and padded:
+        for term in criteria.exclude_terms:
+            if _term_in_haystack(term, padded):
+                return False
+    follower_count = int(getattr(user, "follower_count", 0) or 0)
+    if criteria.min_followers and follower_count < criteria.min_followers:
+        return False
+    if criteria.max_followers and follower_count > criteria.max_followers:
+        return False
+    media_count = int(getattr(user, "media_count", 0) or 0)
+    if criteria.min_posts and media_count < criteria.min_posts:
+        return False
+    if criteria.max_posts and media_count > criteria.max_posts:
+        return False
+    if criteria.include_groups:
+        for group in criteria.include_groups:
+            if not any(_term_in_haystack(term, padded) for term in group):
+                return False
+    elif criteria.optional_terms:
+        if not any(_term_in_haystack(term, padded) for term in criteria.optional_terms):
+            return False
+    return True
 
 
 def _extract_user_id(user) -> Optional[int]:
@@ -1011,16 +1634,6 @@ def _format_user(user_info, position: int, limit: int) -> str:
         f" {position:02d}/{limit:02d} → @{username} | "
         f"seguidores: {follower_count:,} | posteos: {media_count} | {privacy}"
     )
-
-
-def _apply_delay(delay: float) -> None:
-    base = max(0.0, delay)
-    if base <= 0:
-        return
-    jitter = min(2.0, base * 0.3 + 0.5)
-    lower = max(0.5, base - jitter)
-    upper = base + jitter
-    time.sleep(random.uniform(lower, upper))
 
 
 def _build_scraped_user(info) -> ScrapedUser:
