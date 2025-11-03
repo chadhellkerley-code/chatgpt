@@ -38,6 +38,9 @@ EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
 SESSIONS_DIR = BASE / "browser_sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
+MIN_PHONE_DIGITS = 8
+MAX_PHONE_DIGITS = 15
+
 
 def _now() -> datetime:
     return datetime.utcnow().replace(microsecond=0)
@@ -56,6 +59,133 @@ def _parse_iso(value: str | None) -> datetime | None:
     except Exception:
         return None
 
+
+def _ensure_validation_entry(value: Any, number: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        value = {}
+    raw = (value.get("raw") or number or "").strip()
+    normalized = value.get("normalized") or number or raw
+    digits = value.get("digits")
+    if digits is None:
+        digits = sum(1 for ch in normalized if ch.isdigit())
+    has_plus = bool(value.get("has_plus")) if "has_plus" in value else normalized.startswith("+")
+    status = value.get("status") or "unknown"
+    message = value.get("message", "")
+    checked_at = value.get("checked_at")
+    return {
+        "raw": raw,
+        "normalized": normalized,
+        "digits": int(digits) if isinstance(digits, int) else digits,
+        "has_plus": has_plus,
+        "status": status,
+        "message": message,
+        "checked_at": checked_at,
+    }
+
+
+def _validate_phone_number(raw: str) -> dict[str, Any]:
+    candidate = (raw or "").strip()
+    only_digits = "".join(ch for ch in candidate if ch.isdigit())
+    normalized_digits = only_digits
+    has_plus_hint = candidate.startswith("+")
+    if candidate.startswith("00") and len(only_digits) > 2:
+        normalized_digits = only_digits[2:]
+        has_plus_hint = True
+    normalized = f"+{normalized_digits}" if has_plus_hint else normalized_digits
+
+    status = "valid"
+    reasons: list[str] = []
+    digits_count = len(normalized_digits)
+    if not normalized_digits:
+        status = "invalid"
+        reasons.append("El número no contiene dígitos reconocibles.")
+    elif digits_count < MIN_PHONE_DIGITS:
+        status = "invalid"
+        reasons.append("El número es demasiado corto para el formato internacional de WhatsApp.")
+    elif digits_count > MAX_PHONE_DIGITS:
+        status = "invalid"
+        reasons.append("El número supera los 15 dígitos permitidos por WhatsApp.")
+    elif not has_plus_hint:
+        status = "warning"
+        reasons.append("Falta el prefijo internacional (+).")
+
+    message = " ".join(reasons) if reasons else "Formato internacional válido."
+    return {
+        "raw": candidate,
+        "normalized": normalized,
+        "digits": digits_count,
+        "has_plus": has_plus_hint,
+        "status": status,
+        "message": message,
+        "checked_at": _now_iso(),
+    }
+
+
+def _update_contact_validation(contact: dict[str, Any]) -> dict[str, Any]:
+    current = contact.get("validation") or {}
+    if not isinstance(current, dict):
+        current = {}
+    previous_status = current.get("status")
+    base_number = contact.get("number")
+    if not base_number:
+        base_number = current.get("raw", "")
+    new_validation = _validate_phone_number(base_number)
+    normalized_number = new_validation.get("normalized") or new_validation.get("raw", "")
+    if normalized_number:
+        contact["number"] = normalized_number
+    contact["validation"] = new_validation
+    if previous_status != new_validation["status"] or previous_status is None:
+        history = contact.setdefault("history", [])
+        history.append(
+            {
+                "type": "validation",
+                "status": new_validation["status"],
+                "checked_at": new_validation["checked_at"],
+                "message": new_validation["message"],
+            }
+        )
+    return new_validation
+
+
+def _ensure_delivery_log(entries: Any) -> list[dict[str, Any]]:
+    log: list[dict[str, Any]] = []
+    if not isinstance(entries, list):
+        return log
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        log.append(
+            {
+                "timestamp": entry.get("timestamp"),
+                "run_id": entry.get("run_id"),
+                "status": entry.get("status"),
+                "reason": entry.get("reason", ""),
+                "confirmation": entry.get("confirmation"),
+            }
+        )
+    return log
+
+
+def _append_delivery_log(
+    contact: dict[str, Any],
+    run: dict[str, Any],
+    *,
+    status: str,
+    reason: str = "",
+    confirmation: str | None = None,
+) -> None:
+    log = contact.setdefault("delivery_log", [])
+    log.append(
+        {
+            "timestamp": _now_iso(),
+            "run_id": run.get("id"),
+            "status": status,
+            "reason": reason,
+            "confirmation": confirmation,
+        }
+    )
+    if len(log) > 50:
+        del log[:-50]
 
 def _default_state() -> dict[str, Any]:
     return {
@@ -165,9 +295,11 @@ class WhatsAppDataStore:
         if not isinstance(raw, dict):
             raw = {}
         history = [entry for entry in raw.get("history", []) if isinstance(entry, dict)]
+        validation = _ensure_validation_entry(raw.get("validation"), raw.get("number", ""))
+        delivery_log = _ensure_delivery_log(raw.get("delivery_log"))
         return {
             "name": raw.get("name", ""),
-            "number": raw.get("number", ""),
+            "number": validation.get("normalized") or raw.get("number", ""),
             "status": raw.get("status", "sin mensaje"),
             "last_message_at": raw.get("last_message_at"),
             "last_response_at": raw.get("last_response_at"),
@@ -176,6 +308,8 @@ class WhatsAppDataStore:
             "access_sent_at": raw.get("access_sent_at"),
             "notes": raw.get("notes", ""),
             "history": history,
+            "validation": validation,
+            "delivery_log": delivery_log,
         }
 
     # ------------------------------------------------------------------
@@ -225,6 +359,9 @@ class WhatsAppDataStore:
                     "status": item.get("status", "pendiente"),
                     "delivered_at": item.get("delivered_at"),
                     "notes": item.get("notes", ""),
+                    "confirmation": item.get("confirmation", "no_enviado"),
+                    "validation_status": item.get("validation_status"),
+                    "error_code": item.get("error_code"),
                 }
             )
 
@@ -967,8 +1104,23 @@ def _manual_contacts_entry(store: WhatsAppDataStore) -> None:
         _info("No se agregaron contactos.", color=Fore.YELLOW)
         press_enter()
         return
-    _persist_contacts(store, alias, contacts)
-    ok(f"Se registraron {len(contacts)} contactos en la lista '{alias}'.")
+    summary = _persist_contacts(store, alias, contacts)
+    if summary["stored"]:
+        ok(
+            f"Se registraron {summary['stored']} contactos en la lista '{alias}'."
+        )
+    else:
+        _info("No se guardaron contactos. Revisá los números proporcionados.", color=Fore.YELLOW)
+    if summary["warnings"] and summary["stored"]:
+        _info(
+            "Algunos contactos quedaron marcados con advertencia por su formato.",
+            color=Fore.YELLOW,
+        )
+    if summary["skipped"]:
+        _info(
+            f"Se omitieron {summary['skipped']} contactos con números inválidos.",
+            color=Fore.YELLOW,
+        )
     press_enter()
 
 
@@ -1001,8 +1153,23 @@ def _csv_contacts_entry(store: WhatsAppDataStore) -> None:
         _info("No se encontraron contactos válidos en el CSV.", color=Fore.YELLOW)
         press_enter()
         return
-    _persist_contacts(store, alias, contacts)
-    ok(f"Importación completada. {len(contacts)} registros cargados en '{alias}'.")
+    summary = _persist_contacts(store, alias, contacts)
+    if summary["stored"]:
+        ok(
+            f"Importación completada. {summary['stored']} registros cargados en '{alias}'."
+        )
+    else:
+        _info("El archivo no aportó contactos válidos tras la validación.", color=Fore.YELLOW)
+    if summary["warnings"] and summary["stored"]:
+        _info(
+            "Algunos contactos quedaron marcados con advertencia por su formato.",
+            color=Fore.YELLOW,
+        )
+    if summary["skipped"]:
+        _info(
+            f"Se omitieron {summary['skipped']} contactos con números inválidos.",
+            color=Fore.YELLOW,
+        )
     press_enter()
 
 
@@ -1062,11 +1229,22 @@ def _delete_contact_list(store: WhatsAppDataStore) -> None:
     press_enter()
 
 
-def _persist_contacts(store: WhatsAppDataStore, alias: str, contacts: Iterable[dict[str, str]]) -> None:
-    items = [
-        {
-            "name": item.get("name", ""),
-            "number": item.get("number", ""),
+def _persist_contacts(
+    store: WhatsAppDataStore, alias: str, contacts: Iterable[dict[str, str]]
+) -> dict[str, int]:
+    prepared: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    invalid_entries: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    warning_entries: list[tuple[dict[str, Any], dict[str, Any]]] = []
+
+    for item in contacts:
+        number = item.get("number", "")
+        if not number:
+            continue
+        validation = _validate_phone_number(number)
+        normalized_number = validation.get("normalized") or validation.get("raw", "")
+        contact = {
+            "name": item.get("name", "") or normalized_number,
+            "number": normalized_number,
             "status": "sin mensaje",
             "last_message_at": None,
             "last_response_at": None,
@@ -1074,11 +1252,60 @@ def _persist_contacts(store: WhatsAppDataStore, alias: str, contacts: Iterable[d
             "last_payment_at": None,
             "access_sent_at": None,
             "notes": "",
-            "history": [],
+            "history": [
+                {
+                    "type": "validation",
+                    "status": validation["status"],
+                    "checked_at": validation["checked_at"],
+                    "message": validation["message"],
+                }
+            ],
+            "validation": validation,
+            "delivery_log": [],
         }
-        for item in contacts
-        if item.get("number")
-    ]
+        if validation["status"] == "invalid":
+            invalid_entries.append((contact, validation))
+        elif validation["status"] == "warning":
+            warning_entries.append((contact, validation))
+        prepared.append((contact, validation))
+
+    if not prepared:
+        return {"stored": 0, "invalid": 0, "warnings": 0, "skipped": 0}
+
+    stored_entries = list(prepared)
+    skipped_invalid = 0
+
+    if invalid_entries:
+        _info("Se detectaron números inválidos y podrían no existir en WhatsApp:", color=Fore.YELLOW)
+        for contact, validation in invalid_entries[:5]:
+            print(f" • {contact.get('name')} - {validation.get('raw')} ({validation.get('message')})")
+        if len(invalid_entries) > 5:
+            print(f"   ... y {len(invalid_entries) - 5} más")
+        choice = ask("¿Deseás conservarlos igualmente? (s/N): ").strip().lower()
+        if choice != "s":
+            to_remove = {id(entry[0]) for entry in invalid_entries}
+            stored_entries = [entry for entry in stored_entries if id(entry[0]) not in to_remove]
+            skipped_invalid = len(invalid_entries)
+            _info(
+                "Se omitieron los números inválidos para evitar errores futuros.",
+                color=Fore.YELLOW,
+            )
+
+    if not stored_entries:
+        return {
+            "stored": 0,
+            "invalid": len(invalid_entries),
+            "warnings": len(warning_entries),
+            "skipped": skipped_invalid,
+        }
+
+    if warning_entries:
+        _info(
+            "Algunos números no tienen formato internacional completo. Se marcarán con advertencia.",
+            color=Fore.YELLOW,
+        )
+
+    items = [entry[0] for entry in stored_entries]
     lists = store.state.setdefault("contact_lists", {})
     current = lists.get(alias)
     if current:
@@ -1095,6 +1322,12 @@ def _persist_contacts(store: WhatsAppDataStore, alias: str, contacts: Iterable[d
             "notes": "",
         }
     store.save()
+    return {
+        "stored": len(items),
+        "invalid": len(invalid_entries),
+        "warnings": len(warning_entries),
+        "skipped": skipped_invalid,
+    }
 
 
 # ----------------------------------------------------------------------
@@ -1168,6 +1401,79 @@ def _plan_message_run(store: WhatsAppDataStore) -> None:
         press_enter()
         return
 
+    store_dirty = False
+    invalid_targets: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    warning_targets: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for contact in list(targets):
+        previous_validation = contact.get("validation", {})
+        validation = _update_contact_validation(contact)
+        if validation != previous_validation:
+            store_dirty = True
+        if validation["status"] == "invalid":
+            invalid_targets.append((contact, validation))
+        elif validation["status"] == "warning":
+            warning_targets.append((contact, validation))
+
+    if invalid_targets:
+        _info(
+            "Hay contactos con números inválidos que WhatsApp rechazará.",
+            color=Fore.YELLOW,
+        )
+        for contact, validation in invalid_targets[:5]:
+            print(
+                f" • {contact.get('name')} ({validation.get('raw')}) → {validation.get('message')}"
+            )
+        if len(invalid_targets) > 5:
+            print(f"   ... y {len(invalid_targets) - 5} más")
+        choice = ask(
+            "¿Deseás programar igual para estos contactos inválidos? (s/N): "
+        ).strip().lower()
+        if choice != "s":
+            to_exclude = {id(entry[0]) for entry in invalid_targets}
+            targets = [contact for contact in targets if id(contact) not in to_exclude]
+            store_dirty = True
+            _info(
+                "Se excluyeron los contactos con números inválidos del envío.",
+                color=Fore.YELLOW,
+            )
+        else:
+            for contact, _ in invalid_targets:
+                contact["status"] = "observado"
+                history = contact.setdefault("history", [])
+                history.append(
+                    {
+                        "type": "validation_override",
+                        "timestamp": _now_iso(),
+                        "message": "Se programó un envío pese a la validación inválida.",
+                    }
+                )
+            store_dirty = True
+
+    if warning_targets and targets:
+        _info(
+            "Algunos contactos no tienen código de país. Podrían fallar los envíos.",
+            color=Fore.YELLOW,
+        )
+        choice = ask("¿Deseás continuar con ellos? (S/n): ").strip().lower()
+        if choice == "n":
+            to_exclude = {id(entry[0]) for entry in warning_targets}
+            targets = [contact for contact in targets if id(contact) not in to_exclude]
+            store_dirty = True
+            _info(
+                "Se quitaron los contactos en advertencia del envío.",
+                color=Fore.YELLOW,
+            )
+
+    if not targets:
+        _info("No quedaron contactos válidos tras la validación.", color=Fore.YELLOW)
+        if store_dirty:
+            store.save()
+        press_enter()
+        return
+
+    if store_dirty:
+        store.save()
+
     message_template = ask_multiline(
         "Mensaje a enviar (usa {nombre} para personalizar): "
     ).strip()
@@ -1199,6 +1505,9 @@ def _plan_message_run(store: WhatsAppDataStore) -> None:
                 "status": "pendiente",
                 "delivered_at": None,
                 "notes": "",
+                "confirmation": "no_enviado",
+                "validation_status": contact.get("validation", {}).get("status"),
+                "error_code": None,
             }
         )
         _mark_contact_scheduled(
@@ -1259,12 +1568,17 @@ def _print_runs_overview(store: WhatsAppDataStore) -> None:
     if active:
         _subtitle("Envíos activos")
         for run in sorted(active, key=lambda item: item.get("created_at") or ""):
-            total, processed, pending, _ = _run_counts(run)
+            total, sent, pending, cancelled, failed = _run_counts(run)
             status = _run_status_label(run)
             next_run = run.get("next_run_at") or "(esperando horario)"
+            result_bits = [f"{sent}/{total} enviados"]
+            if failed:
+                result_bits.append(f"{failed} fallidos")
+            if cancelled:
+                result_bits.append(f"{cancelled} omitidos/cancelados")
             print(
                 f" • {_run_list_label(run)} → {_run_number_label(run)} | {status} | "
-                f"{processed}/{total} enviados | Próximo: {next_run}"
+                f"{' • '.join(result_bits)} | Próximo: {next_run}"
             )
     else:
         _info("No hay ejecuciones activas en este momento.")
@@ -1280,12 +1594,17 @@ def _print_runs_overview(store: WhatsAppDataStore) -> None:
             key=lambda item: item.get("completed_at") or item.get("last_activity_at") or item.get("created_at") or "",
             reverse=True,
         )[:3]:
-            total, processed, pending, cancelled = _run_counts(run)
+            total, sent, pending, cancelled, failed = _run_counts(run)
             status = _run_status_label(run)
             finished = run.get("completed_at") or run.get("last_activity_at") or run.get("created_at")
+            result_bits = [f"{sent}/{total} enviados"]
+            if failed:
+                result_bits.append(f"{failed} fallidos")
+            if cancelled:
+                result_bits.append(f"{cancelled} omitidos/cancelados")
             print(
                 f" • {_run_list_label(run)} → {_run_number_label(run)} | {status} | "
-                f"{processed}/{total} completados | Finalizó: {finished or 'sin fecha'}"
+                f"{' • '.join(result_bits)} | Finalizó: {finished or 'sin fecha'}"
             )
 
 
@@ -1301,11 +1620,13 @@ def _show_run_detail(store: WhatsAppDataStore) -> None:
     banner()
     title("Detalle del envío por WhatsApp")
     print(_line())
-    total, processed, pending, cancelled = _run_counts(run)
+    total, sent, pending, cancelled, failed = _run_counts(run)
     print(f"Lista: {_run_list_label(run)} → Número: {_run_number_label(run)}")
     print(f"Estado actual: {_run_status_label(run)}")
-    print(f"Mensajes enviados: {processed}/{total}")
-    print(f"Pendientes: {pending} | Cancelados/Omitidos: {cancelled}")
+    print(f"Mensajes enviados: {sent}/{total}")
+    print(
+        f"Pendientes: {pending} | Fallidos: {failed} | Cancelados/Omitidos: {cancelled}"
+    )
     print(f"Delay configurado: {_format_delay(run.get('delay', {'min': 5.0, 'max': 12.0}))}")
     session_limit = run.get("session_limit") or 0
     if session_limit:
@@ -1332,6 +1653,21 @@ def _show_run_detail(store: WhatsAppDataStore) -> None:
         _subtitle("Actividad registrada")
         for entry in log[-5:]:
             print(f" - {entry.get('timestamp')}: {entry.get('message')}")
+
+    processed_events = [
+        event
+        for event in run.get("events", [])
+        if (event.get("status") or "") in {"enviado", "fallido", "cancelado", "omitido"}
+    ]
+    if processed_events:
+        print()
+        _subtitle("Resultados recientes por contacto")
+        for event in processed_events[-10:]:
+            contact_label = event.get("name") or event.get("contact") or "(sin nombre)"
+            status_label = _format_event_status(event)
+            print(f" - {contact_label}: {status_label}")
+            if event.get("notes"):
+                print(f"     Motivo: {event.get('notes')}")
     press_enter()
 
 
@@ -1420,10 +1756,13 @@ def _select_run(
     print(_line())
     _subtitle(prompt)
     for idx, run in enumerate(filtered, 1):
-        total, processed, pending, _ = _run_counts(run)
+        total, sent, pending, cancelled, failed = _run_counts(run)
         print(
             f"{idx}) {_run_list_label(run)} → {_run_number_label(run)} | {_run_status_label(run)} | "
-            f"{processed}/{total} enviados | Pendientes: {pending}"
+            f"{sent}/{total} enviados"
+            + (f" • {failed} fallidos" if failed else "")
+            + (f" • {cancelled} omitidos" if cancelled else "")
+            + f" | Pendientes: {pending}"
         )
     idx = ask_int("Selección: ", min_value=1)
     if idx > len(filtered):
@@ -1456,17 +1795,55 @@ def _run_status_label(run: dict[str, Any]) -> str:
     return status
 
 
-def _run_counts(run: dict[str, Any]) -> tuple[int, int, int, int]:
+def _run_counts(run: dict[str, Any]) -> tuple[int, int, int, int, int]:
     events = run.get("events", [])
     total = len(events)
-    processed = sum(1 for event in events if (event.get("status") or "") == "enviado")
+    sent = sum(1 for event in events if (event.get("status") or "") == "enviado")
+    failed = sum(1 for event in events if (event.get("status") or "") == "fallido")
     pending = sum(1 for event in events if (event.get("status") or "") == "pendiente")
     cancelled = sum(
         1
         for event in events
         if (event.get("status") or "") in {"cancelado", "omitido"}
     )
-    return total, processed, pending, cancelled
+    return total, sent, pending, cancelled, failed
+
+
+def _confirmation_badge(event: dict[str, Any]) -> str:
+    confirmation = (event.get("confirmation") or "no_enviado").lower()
+    if confirmation == "leido":
+        return "✔✔"
+    if confirmation == "entregado":
+        return "✔✔"
+    if confirmation == "enviado":
+        return "✔"
+    return "✖"
+
+
+def _format_event_status(event: dict[str, Any]) -> str:
+    status = (event.get("status") or "").lower()
+    reason = event.get("notes") or ""
+    badge = _confirmation_badge(event)
+    if status == "enviado":
+        return f"{badge} Entregado"
+    if status == "fallido":
+        base = "✖ Fallido"
+        if reason:
+            base += f" – {reason}"
+        return base
+    if status == "pendiente":
+        return "⏳ Pendiente"
+    if status == "omitido":
+        base = "⚪ Omitido"
+        if reason:
+            base += f" – {reason}"
+        return base
+    if status == "cancelado":
+        base = "⏹ Cancelado"
+        if reason:
+            base += f" – {reason}"
+        return base
+    return status or "(desconocido)"
 
 
 def _append_run_log(run: dict[str, Any], message: str) -> None:
@@ -1493,7 +1870,7 @@ def _refresh_run_counters(run: dict[str, Any]) -> None:
     run["processed"] = sum(
         1
         for event in events
-        if (event.get("status") or "") in {"enviado", "cancelado", "omitido"}
+        if (event.get("status") or "") in {"enviado", "cancelado", "omitido", "fallido"}
     )
 
 
@@ -1554,7 +1931,10 @@ def _reconcile_runs(store: WhatsAppDataStore) -> None:
                 changed = True
             _refresh_run_counters(run)
             continue
-        if all((event.get("status") or "") in {"enviado", "cancelado", "omitido"} for event in events):
+        if all(
+            (event.get("status") or "") in {"enviado", "cancelado", "omitido", "fallido"}
+            for event in events
+        ):
             if status != "completado":
                 run["status"] = "completado"
                 run["completed_at"] = _now_iso()
@@ -1571,7 +1951,7 @@ def _reconcile_runs(store: WhatsAppDataStore) -> None:
         if run.get("next_run_at") != next_at:
             run["next_run_at"] = next_at
             changed = True
-        if any((event.get("status") or "") == "enviado" for event in events):
+        if any((event.get("status") or "") in {"enviado", "fallido"} for event in events):
             if run.get("status") not in {"en pausa", "completado"}:
                 run["status"] = "en progreso"
                 changed = True
@@ -1588,6 +1968,9 @@ def _deliver_event(store: WhatsAppDataStore, run: dict[str, Any], event: dict[st
     if not contact_list:
         event["status"] = "omitido"
         event["delivered_at"] = delivered_at
+        event["confirmation"] = "no_enviado"
+        event["error_code"] = "list_missing"
+        event["notes"] = "La lista vinculada fue eliminada."
         _append_run_log(
             run,
             f"La lista '{run.get('list_alias')}' ya no existe. Se omitió el envío a {event.get('contact')}.",
@@ -1597,27 +1980,87 @@ def _deliver_event(store: WhatsAppDataStore, run: dict[str, Any], event: dict[st
         if not contact:
             event["status"] = "omitido"
             event["delivered_at"] = delivered_at
+            event["confirmation"] = "no_enviado"
+            event["error_code"] = "contact_missing"
+            event["notes"] = "El contacto ya no está disponible en la lista."
             _append_run_log(
                 run,
                 f"No se encontró el contacto {event.get('contact')} dentro de la lista.",
             )
         else:
-            contact["status"] = "mensaje enviado"
-            contact["last_message_at"] = event.get("scheduled_at") or delivered_at
-            contact.setdefault("history", []).append(
-                {
-                    "type": "send",
-                    "run_id": run.get("id"),
-                    "message": event.get("message", ""),
-                    "sent_at": delivered_at,
-                    "delay": run.get("delay"),
-                }
-            )
-            event["status"] = "enviado"
-            event["delivered_at"] = delivered_at
+            validation = _update_contact_validation(contact)
+            event["validation_status"] = validation.get("status")
+            sender = store.find_number(run.get("number_id", ""))
+            failure_reason: str | None = None
+            failure_code: str | None = None
+            if validation["status"] == "invalid":
+                failure_reason = validation.get("message") or "Número inválido."
+                failure_code = "invalid_number"
+            elif not sender:
+                failure_reason = "El número de envío ya no está registrado."
+                failure_code = "sender_missing"
+            elif not sender.get("connected"):
+                failure_reason = "La sesión de WhatsApp seleccionada no está activa."
+                failure_code = "session_inactiva"
+            elif (sender.get("connection_state") or "").lower() == "fallido":
+                failure_reason = "La vinculación del número presentó un error reciente."
+                failure_code = "session_error"
+
+            if failure_reason:
+                contact["status"] = "observado"
+                contact.setdefault("history", []).append(
+                    {
+                        "type": "send_failed",
+                        "run_id": run.get("id"),
+                        "message": event.get("message", ""),
+                        "attempted_at": delivered_at,
+                        "error": failure_reason,
+                    }
+                )
+                event["status"] = "fallido"
+                event["notes"] = failure_reason
+                event["error_code"] = failure_code
+                event["confirmation"] = "no_enviado"
+                event["delivered_at"] = delivered_at
+                _append_delivery_log(
+                    contact,
+                    run,
+                    status="fallido",
+                    reason=failure_reason,
+                    confirmation="no_enviado",
+                )
+                _append_run_log(
+                    run,
+                    f"Fallo el envío a {contact.get('name') or contact.get('number')}: {failure_reason}",
+                )
+            else:
+                contact["status"] = "mensaje enviado"
+                contact["last_message_at"] = event.get("scheduled_at") or delivered_at
+                contact.setdefault("history", []).append(
+                    {
+                        "type": "send",
+                        "run_id": run.get("id"),
+                        "message": event.get("message", ""),
+                        "sent_at": delivered_at,
+                        "delay": run.get("delay"),
+                        "confirmation": "entregado",
+                    }
+                )
+                event["status"] = "enviado"
+                event["delivered_at"] = delivered_at
+                event["confirmation"] = "entregado"
+                event["error_code"] = None
+                if not event.get("notes"):
+                    event["notes"] = "Mensaje enviado correctamente."
+                _append_delivery_log(
+                    contact,
+                    run,
+                    status="enviado",
+                    confirmation="entregado",
+                )
     run["last_activity_at"] = delivered_at
     _refresh_run_counters(run)
-    if event.get("status") == "enviado":
+    if (event.get("status") or "") in {"enviado", "fallido"}:
         run["status"] = "en progreso"
     return True
 
@@ -1903,6 +2346,18 @@ def _auto_add_to_master_list(store: WhatsAppDataStore, capture: dict[str, Any]) 
             }
         ],
     }
+    validation = _validate_phone_number(contact.get("number", ""))
+    contact["number"] = validation.get("normalized") or contact.get("number", "")
+    contact.setdefault("history", []).append(
+        {
+            "type": "validation",
+            "status": validation["status"],
+            "checked_at": validation["checked_at"],
+            "message": validation["message"],
+        }
+    )
+    contact["validation"] = validation
+    contact["delivery_log"] = []
     if capture.get("message_sent"):
         contact["history"].append(
             {
