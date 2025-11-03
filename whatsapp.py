@@ -10,6 +10,7 @@ import random
 import shutil
 import textwrap
 import uuid
+import webbrowser
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -125,6 +126,7 @@ class WhatsAppDataStore:
                 "last_connected_at": None,
                 "session_notes": [],
                 "keep_alive": True,
+                "connection_method": "playwright",
             }
         return {
             "id": value.get("id") or str(uuid.uuid4()),
@@ -138,6 +140,7 @@ class WhatsAppDataStore:
             "qr_snapshot": value.get("qr_snapshot"),
             "last_qr_capture_at": value.get("last_qr_capture_at"),
             "connection_state": value.get("connection_state", "pendiente"),
+            "connection_method": value.get("connection_method", "playwright"),
         }
 
     # ------------------------------------------------------------------
@@ -388,6 +391,28 @@ def _print_numbers_summary(store: WhatsAppDataStore) -> None:
         )
 
 
+def _select_connection_backend() -> str | None:
+    backend_labels = {
+        "1": "playwright",
+        "2": "selenium",
+        "3": "system",
+    }
+    while True:
+        print(_line())
+        _subtitle("Método de vinculación")
+        print("1) Navegador automatizado con Playwright (Chromium)")
+        print("2) Navegador automatizado con Selenium (Chrome/Safari)")
+        print("3) Abrir navegador predeterminado del sistema")
+        print("4) Volver\n")
+        choice = ask("Opción: ").strip()
+        if choice == "4":
+            return None
+        backend = backend_labels.get(choice)
+        if backend:
+            return backend
+        _info("Opción inválida. Intentá nuevamente.", color=Fore.YELLOW)
+
+
 def _connect_number(store: WhatsAppDataStore) -> None:
     while True:
         banner()
@@ -418,12 +443,25 @@ def _link_new_number(store: WhatsAppDataStore) -> None:
         press_enter()
         return
     note = ask("Nota interna u observación (opcional): ").strip()
+    backend = _select_connection_backend()
+    if backend is None:
+        _info("No se inició ninguna vinculación.")
+        press_enter()
+        return
+
     session_id = str(uuid.uuid4())
     session_dir = SESSIONS_DIR / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
 
-    _info("Preparando navegador automatizado para WhatsApp Web...")
-    success, snapshot, details = _initiate_whatsapp_web_login(session_dir)
+    backend_titles = {
+        "playwright": "Playwright (Chromium)",
+        "selenium": "Selenium",
+        "system": "el navegador predeterminado",
+    }
+    _info(
+        f"Preparando {backend_titles.get(backend, 'el método seleccionado')} para WhatsApp Web..."
+    )
+    success, snapshot, details = _initiate_whatsapp_web_login(session_dir, backend)
     if details:
         _info(details)
 
@@ -435,6 +473,11 @@ def _link_new_number(store: WhatsAppDataStore) -> None:
             success = True
 
     state = store.state.setdefault("numbers", {})
+    method_descriptions = {
+        "playwright": "Playwright (Chromium)",
+        "selenium": "Selenium",
+        "system": "el navegador predeterminado del sistema",
+    }
     record = {
         "id": session_id,
         "alias": alias or phone,
@@ -444,7 +487,10 @@ def _link_new_number(store: WhatsAppDataStore) -> None:
         "session_notes": [
             {
                 "created_at": _now_iso(),
-                "text": note or "Sesión gestionada mediante navegador automatizado",
+                "text": note
+                or "Sesión gestionada mediante {}.".format(
+                    method_descriptions.get(backend, "el método seleccionado")
+                ),
             }
         ],
         "keep_alive": True,
@@ -452,6 +498,7 @@ def _link_new_number(store: WhatsAppDataStore) -> None:
         "qr_snapshot": str(snapshot) if snapshot else None,
         "last_qr_capture_at": _now_iso() if snapshot else None,
         "connection_state": "verificado" if success else "pendiente",
+        "connection_method": backend,
     }
     if not success:
         record["session_notes"].append(
@@ -514,7 +561,19 @@ def _remove_linked_number(store: WhatsAppDataStore) -> None:
     press_enter()
 
 
-def _initiate_whatsapp_web_login(session_dir: Path) -> tuple[bool, Path | None, str]:
+def _initiate_whatsapp_web_login(
+    session_dir: Path, backend: str
+) -> tuple[bool, Path | None, str]:
+    if backend == "playwright":
+        return _initiate_with_playwright(session_dir)
+    if backend == "selenium":
+        return _initiate_with_selenium(session_dir)
+    if backend == "system":
+        return _initiate_with_system_browser()
+    return False, None, "Método de vinculación desconocido."
+
+
+def _initiate_with_playwright(session_dir: Path) -> tuple[bool, Path | None, str]:
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
     except ImportError:
@@ -599,6 +658,123 @@ def _initiate_whatsapp_web_login(session_dir: Path) -> tuple[bool, Path | None, 
 
     message = " ".join(info_messages)
     return success, snapshot_path if snapshot_path.exists() else None, message
+
+
+def _initiate_with_selenium(session_dir: Path) -> tuple[bool, Path | None, str]:
+    try:
+        from selenium import webdriver
+        from selenium.common.exceptions import TimeoutException, WebDriverException
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.webdriver.support.ui import WebDriverWait
+    except ImportError:
+        return (
+            False,
+            None,
+            "Selenium no está instalado. Ejecutá 'pip install selenium' y asegurate de contar con el driver correspondiente.",
+        )
+
+    snapshot_path = session_dir / "qr.png"
+    info_messages: list[str] = []
+    success = False
+    driver = None
+    driver_label = ""
+
+    profile_root = session_dir / "selenium_profile"
+    profile_root.mkdir(parents=True, exist_ok=True)
+
+    chrome_profile = profile_root / "chrome"
+    chrome_profile.mkdir(parents=True, exist_ok=True)
+    try:
+        from selenium.webdriver.chrome.options import Options as ChromeOptions
+
+        chrome_options = ChromeOptions()
+        chrome_options.add_argument(f"--user-data-dir={str(chrome_profile)}")
+        chrome_options.add_argument("--disable-notifications")
+        chrome_options.add_argument("--disable-infobars")
+        chrome_options.add_argument("--remote-allow-origins=*")
+        driver = webdriver.Chrome(options=chrome_options)
+        driver_label = "Chrome"
+    except Exception:
+        driver = None
+
+    if driver is None:
+        try:
+            driver = webdriver.Safari()
+            driver_label = "Safari"
+        except Exception:
+            driver = None
+
+    if driver is None:
+        return (
+            False,
+            None,
+            "No se pudo iniciar un navegador compatible con Selenium. Verificá que el driver esté instalado y habilitado.",
+        )
+
+    info_messages.append(
+        f"Se abrió {driver_label} mediante Selenium. Escaneá el QR para continuar."
+    )
+
+    try:
+        driver.get("https://web.whatsapp.com")
+        wait = WebDriverWait(driver, 60)
+        try:
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "canvas[data-testid='qrcode']")))
+        except TimeoutException:
+            pass
+
+        try:
+            driver.save_screenshot(str(snapshot_path))
+        except Exception:
+            pass
+
+        if snapshot_path.exists():
+            info_messages.append(
+                f"Se guardó una captura del código QR en {snapshot_path}."
+            )
+        info_messages.append(
+            "Escaneá el código con tu celular para completar la vinculación."
+        )
+
+        try:
+            WebDriverWait(driver, 180).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-testid='chat-list-search']"))
+            )
+            success = True
+        except TimeoutException:
+            try:
+                driver.find_element(By.CSS_SELECTOR, "canvas[data-testid='qrcode']")
+            except Exception:
+                success = True
+    except WebDriverException:
+        info_messages.append(
+            "Selenium no pudo completar la automatización. Revisá la configuración del navegador y volvé a intentar."
+        )
+        success = False
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+    message = " ".join(info_messages)
+    return success, snapshot_path if snapshot_path.exists() else None, message
+
+
+def _initiate_with_system_browser() -> tuple[bool, Path | None, str]:
+    opened = webbrowser.open("https://web.whatsapp.com")
+    if opened:
+        message = (
+            "Se abrió el navegador predeterminado en https://web.whatsapp.com. "
+            "Escaneá el código QR y luego confirmá en la terminal si la vinculación se completó."
+        )
+    else:
+        message = (
+            "Intentá abrir manualmente https://web.whatsapp.com desde tu navegador, "
+            "escaneá el código QR y luego confirmá en la terminal si la vinculación se completó."
+        )
+    return False, None, message
 
 
 # ----------------------------------------------------------------------
