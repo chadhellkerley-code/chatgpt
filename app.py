@@ -31,6 +31,7 @@ storage = _safe_import("storage")
 responder = _safe_import("responder")
 licensekit = _safe_import("licensekit")
 state_view = _safe_import("state_view")
+whatsapp = _safe_import("whatsapp")
 
 
 def _counts():
@@ -78,10 +79,11 @@ def current_menu_option_labels() -> list[str]:
         f"4) {em('📜')} Ver registros de envíos  ",
         f"5) {em('🤖')} Auto-responder con OpenAI  ",
         f"6) {em('📊')} Estado de la conversación  ",
+        f"7) {em('📱')} Automatización por WhatsApp  ",
     ]
     if not SETTINGS.client_distribution:
-        options.append(f"7) {em('📦')} Entregar a cliente (licencia / ZIP)  ")
-        options.append(f"8) {em('🚪')} Salir  ")
+        options.append(f"8) {em('📦')} Entregar a cliente (licencia / ZIP)  ")
+        options.append(f"9) {em('🚪')} Salir  ")
     else:
         options.append(f"8) {em('🚪')} Salir  ")
     return options
@@ -112,13 +114,19 @@ def menu():
         elif op == "6" and state_view:
             clear_console()
             state_view.menu_conversation_state()
+        elif op == "7" and whatsapp:
+            clear_console()
+            whatsapp.menu_whatsapp()
         elif (
-            op == "7"
+            op == "8"
             and licensekit
             and not SETTINGS.client_distribution
         ):
             licensekit.menu_deliver()
-        elif op == "8":
+        elif (
+            (op == "8" and SETTINGS.client_distribution)
+            or (op == "9" and not SETTINGS.client_distribution)
+        ):
             print("Saliendo...")
             time.sleep(0.3)
             break
