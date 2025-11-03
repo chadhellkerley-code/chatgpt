@@ -1960,6 +1960,369 @@ def _reconcile_runs(store: WhatsAppDataStore) -> None:
         store.save()
 
 
+def _send_message_via_backend(
+    sender: dict[str, Any], contact: dict[str, Any], event: dict[str, Any]
+) -> dict[str, Any]:
+    method = (sender.get("connection_method") or "").lower()
+    message = event.get("message", "")
+    if method == "selenium":
+        return _send_with_selenium(sender, contact, message)
+    return {
+        "success": True,
+        "confirmation": "entregado",
+        "note": event.get("notes") or "Mensaje enviado correctamente.",
+        "delivered_at": _now_iso(),
+    }
+
+
+def _start_selenium_driver(session_dir: Path) -> tuple[Any | None, str | None, str | None]:
+    try:
+        from selenium import webdriver
+        from selenium.common.exceptions import WebDriverException
+        from selenium.webdriver.chrome.options import Options as ChromeOptions
+    except ImportError:
+        return None, None, (
+            "Selenium no está disponible en este entorno. Instalalo para habilitar el envío automatizado."
+        )
+
+    profile_root = session_dir / "selenium_profile"
+    chrome_profile = profile_root / "chrome"
+    chrome_profile.mkdir(parents=True, exist_ok=True)
+
+    driver = None
+    label: str | None = None
+    error: str | None = None
+
+    try:
+        chrome_options = ChromeOptions()
+        chrome_options.add_argument(f"--user-data-dir={str(chrome_profile)}")
+        chrome_options.add_argument("--disable-notifications")
+        chrome_options.add_argument("--disable-infobars")
+        chrome_options.add_argument("--remote-allow-origins=*")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--window-size=1280,720")
+        driver = webdriver.Chrome(options=chrome_options)
+        label = "Chrome"
+    except Exception as exc:  # noqa: BLE001
+        driver = None
+        error = str(exc)
+
+    if driver is None:
+        try:
+            driver = webdriver.Safari()
+            label = "Safari"
+            error = None
+        except Exception as exc:  # noqa: BLE001
+            driver = None
+            error = error or str(exc)
+
+    if driver is None:
+        return None, None, (
+            "No se pudo iniciar un navegador con Selenium. Verificá que el driver esté instalado y habilitado."
+        )
+
+    return driver, label, error
+
+
+def _collect_selenium_alert_text(driver: Any) -> str:
+    texts: list[str] = []
+    selectors = [
+        "div[data-testid='app-state-message']",
+        "div[data-testid='alert-qr-text']",
+        "div[data-testid='empty-state-title']",
+        "div[role='dialog']",
+        "div[data-testid='popup-controls-ok']",
+    ]
+    for selector in selectors:
+        try:
+            for element in driver.find_elements("css selector", selector):
+                text = (element.text or "").strip()
+                if text and text not in texts:
+                    texts.append(text)
+        except Exception:  # noqa: BLE001
+            continue
+    if texts:
+        return " ".join(texts)
+    try:
+        body = driver.find_element("tag name", "body")
+        snippet = (body.text or "").strip().splitlines()
+        if snippet:
+            return snippet[0]
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
+def _extract_selenium_bubble_text(element: Any) -> str:
+    texts: list[str] = []
+    try:
+        candidates = element.find_elements("css selector", "span[data-testid='conversation-text']")
+    except Exception:  # noqa: BLE001
+        candidates = []
+    if not candidates:
+        try:
+            candidates = element.find_elements(
+                "css selector", "span.selectable-text.copyable-text span"
+            )
+        except Exception:  # noqa: BLE001
+            candidates = []
+    for item in candidates:
+        try:
+            text = (item.text or "").strip()
+        except Exception:  # noqa: BLE001
+            text = ""
+        if text:
+            texts.append(text)
+    return "\n".join(texts).strip()
+
+
+def _send_with_selenium(
+    sender: dict[str, Any], contact: dict[str, Any], message: str
+) -> dict[str, Any]:
+    try:
+        from selenium.common.exceptions import TimeoutException, WebDriverException
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.common.keys import Keys
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.webdriver.support.ui import WebDriverWait
+    except ImportError:
+        return {
+            "success": False,
+            "code": "selenium_missing",
+            "reason": "Selenium no está instalado. Instalalo para enviar mensajes automáticamente.",
+            "session_expired": False,
+        }
+
+    session_path = sender.get("session_path")
+    if not session_path:
+        return {
+            "success": False,
+            "code": "session_missing",
+            "reason": "No se encontró la carpeta de sesión asociada a este número.",
+            "session_expired": False,
+        }
+
+    session_dir = Path(session_path)
+    if not session_dir.exists():
+        return {
+            "success": False,
+            "code": "session_missing",
+            "reason": "La sesión guardada ya no está disponible en el disco.",
+            "session_expired": False,
+        }
+
+    driver, driver_label, init_error = _start_selenium_driver(session_dir)
+    if driver is None:
+        return {
+            "success": False,
+            "code": "driver_unavailable",
+            "reason": init_error
+            or "No se pudo iniciar el navegador automatizado para WhatsApp Web.",
+            "session_expired": False,
+        }
+
+    digits = "".join(ch for ch in (contact.get("number") or "") if ch.isdigit())
+    if not digits:
+        try:
+            driver.quit()
+        except Exception:  # noqa: BLE001
+            pass
+        return {
+            "success": False,
+            "code": "invalid_number",
+            "reason": "El número no tiene dígitos suficientes para WhatsApp.",
+            "session_expired": False,
+        }
+
+    wait = WebDriverWait(driver, 45)
+
+    try:
+        driver.get("https://web.whatsapp.com/")
+        try:
+            wait.until(
+                EC.any_of(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-testid='pane-side']")),
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-testid='chat-list']")),
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "canvas[data-testid='qrcode']")),
+                )
+            )
+        except TimeoutException:
+            return {
+                "success": False,
+                "code": "whatsapp_unreachable",
+                "reason": "WhatsApp Web no respondió a tiempo. Intentá nuevamente en unos minutos.",
+                "session_expired": False,
+            }
+
+        if driver.find_elements(By.CSS_SELECTOR, "canvas[data-testid='qrcode']"):
+            return {
+                "success": False,
+                "code": "session_expired",
+                "reason": "La sesión de WhatsApp caducó. Volvé a escanear el código QR.",
+                "session_expired": True,
+            }
+
+        driver.get(f"https://web.whatsapp.com/send?phone={digits}")
+
+        try:
+            wait.until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "div[contenteditable='true'][data-testid='conversation-compose-box-input']")
+                )
+            )
+        except TimeoutException:
+            message_text = _collect_selenium_alert_text(driver) or (
+                "No se pudo abrir la conversación. Confirmá que el número tenga WhatsApp."
+            )
+            return {
+                "success": False,
+                "code": "chat_unavailable",
+                "reason": message_text,
+                "session_expired": False,
+            }
+
+        try:
+            input_box = driver.find_element(
+                By.CSS_SELECTOR,
+                "div[contenteditable='true'][data-testid='conversation-compose-box-input']",
+            )
+        except Exception:  # noqa: BLE001
+            return {
+                "success": False,
+                "code": "input_missing",
+                "reason": "No se encontró el cuadro de mensaje en WhatsApp Web.",
+                "session_expired": False,
+            }
+
+        try:
+            input_box.click()
+            input_box.send_keys(Keys.CONTROL, "a")
+            input_box.send_keys(Keys.DELETE)
+        except Exception:  # noqa: BLE001
+            try:
+                input_box.click()
+                input_box.send_keys(Keys.COMMAND, "a")
+                input_box.send_keys(Keys.DELETE)
+            except Exception:  # noqa: BLE001
+                pass
+
+        typed_message = message or ""
+        if typed_message.strip():
+            for index, line in enumerate(typed_message.splitlines() or [""]):
+                if index:
+                    input_box.send_keys(Keys.SHIFT, Keys.ENTER)
+                if line:
+                    input_box.send_keys(line)
+                else:
+                    input_box.send_keys(" ")
+        else:
+            input_box.send_keys(" ")
+
+        snapshot = (input_box.text or "").strip()
+        if not snapshot:
+            return {
+                "success": False,
+                "code": "empty_message",
+                "reason": "El mensaje quedó vacío y no se envió a WhatsApp.",
+                "session_expired": False,
+            }
+
+        try:
+            send_button = wait.until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "button[data-testid='compose-btn-send']"))
+            )
+        except TimeoutException:
+            return {
+                "success": False,
+                "code": "send_disabled",
+                "reason": "WhatsApp no habilitó el botón de envío para este contacto.",
+                "session_expired": False,
+            }
+
+        before_count = len(driver.find_elements(By.CSS_SELECTOR, "div[data-testid='msg-container']"))
+        send_button.click()
+
+        try:
+            wait.until(
+                lambda drv: len(drv.find_elements(By.CSS_SELECTOR, "div[data-testid='msg-container']"))
+                > before_count
+            )
+        except TimeoutException:
+            return {
+                "success": False,
+                "code": "send_unconfirmed",
+                "reason": "WhatsApp no confirmó el mensaje en la conversación.",
+                "session_expired": False,
+            }
+
+        bubbles = driver.find_elements(By.CSS_SELECTOR, "div[data-testid='msg-container']")
+        if not bubbles:
+            return {
+                "success": False,
+                "code": "bubble_missing",
+                "reason": "No se detectó el mensaje dentro de la conversación.",
+                "session_expired": False,
+            }
+
+        last_bubble = bubbles[-1]
+        bubble_text = _extract_selenium_bubble_text(last_bubble)
+        normalized_message = "\n".join(line.strip() for line in typed_message.splitlines()).strip()
+        normalized_bubble = "\n".join(line.strip() for line in bubble_text.splitlines()).strip()
+        if normalized_message and (
+            normalized_message not in normalized_bubble
+            and normalized_bubble not in normalized_message
+        ):
+            return {
+                "success": False,
+                "code": "text_mismatch",
+                "reason": "WhatsApp no mostró el contenido del mensaje enviado.",
+                "session_expired": False,
+            }
+
+        confirmation = "enviado"
+        try:
+            if last_bubble.find_elements(By.CSS_SELECTOR, "svg[data-testid='msg-dblcheck-read']"):
+                confirmation = "leido"
+            elif last_bubble.find_elements(By.CSS_SELECTOR, "svg[data-testid='msg-dblcheck']"):
+                confirmation = "entregado"
+            elif last_bubble.find_elements(By.CSS_SELECTOR, "svg[data-testid='msg-check']"):
+                confirmation = "enviado"
+        except Exception:  # noqa: BLE001
+            confirmation = "enviado"
+
+        note = "Mensaje confirmado en WhatsApp Web mediante Selenium."
+        if driver_label:
+            note = f"Mensaje confirmado en WhatsApp Web mediante Selenium ({driver_label})."
+
+        return {
+            "success": True,
+            "confirmation": confirmation,
+            "note": note,
+            "delivered_at": _now_iso(),
+            "session_expired": False,
+        }
+    except TimeoutException:
+        return {
+            "success": False,
+            "code": "timeout",
+            "reason": "WhatsApp Web tardó demasiado en responder al enviar el mensaje.",
+            "session_expired": False,
+        }
+    except WebDriverException:
+        return {
+            "success": False,
+            "code": "webdriver_error",
+            "reason": "Selenium reportó un error inesperado durante el envío.",
+            "session_expired": False,
+        }
+    finally:
+        try:
+            driver.quit()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _deliver_event(store: WhatsAppDataStore, run: dict[str, Any], event: dict[str, Any]) -> bool:
     if (event.get("status") or "") != "pendiente":
         return False
@@ -1993,6 +2356,7 @@ def _deliver_event(store: WhatsAppDataStore, run: dict[str, Any], event: dict[st
             sender = store.find_number(run.get("number_id", ""))
             failure_reason: str | None = None
             failure_code: str | None = None
+            delivery_result: dict[str, Any] | None = None
             if validation["status"] == "invalid":
                 failure_reason = validation.get("message") or "Número inválido."
                 failure_code = "invalid_number"
@@ -2005,6 +2369,30 @@ def _deliver_event(store: WhatsAppDataStore, run: dict[str, Any], event: dict[st
             elif (sender.get("connection_state") or "").lower() == "fallido":
                 failure_reason = "La vinculación del número presentó un error reciente."
                 failure_code = "session_error"
+            else:
+                delivery_result = _send_message_via_backend(sender, contact, event)
+                if not delivery_result.get("success"):
+                    failure_reason = (
+                        delivery_result.get("reason")
+                        or "WhatsApp no confirmó el envío del mensaje."
+                    )
+                    failure_code = delivery_result.get("code") or "send_failed"
+                    if delivery_result.get("session_expired"):
+                        sender["connected"] = False
+                        sender["connection_state"] = "fallido"
+                        sender["last_connected_at"] = None
+                        sender.setdefault("session_notes", []).append(
+                            {
+                                "created_at": _now_iso(),
+                                "text": "La sesión caducó durante un envío automático. Repetí la vinculación escaneando el QR.",
+                            }
+                        )
+                        _append_run_log(
+                            run,
+                            "La sesión de WhatsApp se cerró durante el envío. Es necesario volver a vincular el número.",
+                        )
+                else:
+                    delivered_at = delivery_result.get("delivered_at") or delivered_at
 
             if failure_reason:
                 contact["status"] = "observado"
@@ -2034,6 +2422,13 @@ def _deliver_event(store: WhatsAppDataStore, run: dict[str, Any], event: dict[st
                     f"Fallo el envío a {contact.get('name') or contact.get('number')}: {failure_reason}",
                 )
             else:
+                confirmation_value = "entregado"
+                success_note = event.get("notes") or "Mensaje enviado correctamente."
+                if delivery_result:
+                    confirmation_value = (
+                        delivery_result.get("confirmation") or confirmation_value
+                    )
+                    success_note = delivery_result.get("note") or success_note
                 contact["status"] = "mensaje enviado"
                 contact["last_message_at"] = event.get("scheduled_at") or delivered_at
                 contact.setdefault("history", []).append(
@@ -2043,20 +2438,27 @@ def _deliver_event(store: WhatsAppDataStore, run: dict[str, Any], event: dict[st
                         "message": event.get("message", ""),
                         "sent_at": delivered_at,
                         "delay": run.get("delay"),
-                        "confirmation": "entregado",
+                        "confirmation": confirmation_value,
                     }
                 )
                 event["status"] = "enviado"
                 event["delivered_at"] = delivered_at
-                event["confirmation"] = "entregado"
+                event["confirmation"] = confirmation_value
                 event["error_code"] = None
-                if not event.get("notes"):
-                    event["notes"] = "Mensaje enviado correctamente."
+                event["notes"] = success_note
                 _append_delivery_log(
                     contact,
                     run,
                     status="enviado",
-                    confirmation="entregado",
+                    reason=success_note,
+                    confirmation=confirmation_value,
+                )
+                _append_run_log(
+                    run,
+                    "WhatsApp confirmó el mensaje para {} con estado {}.".format(
+                        contact.get("name") or contact.get("number"),
+                        confirmation_value,
+                    ),
                 )
     run["last_activity_at"] = delivered_at
     _refresh_run_counters(run)
