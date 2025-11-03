@@ -7,6 +7,7 @@ from __future__ import annotations
 import csv
 import json
 import random
+import shutil
 import textwrap
 import uuid
 from datetime import datetime, timedelta
@@ -30,6 +31,8 @@ BASE.mkdir(parents=True, exist_ok=True)
 DATA_FILE = BASE / "whatsapp_automation.json"
 EXPORTS_DIR = BASE / "whatsapp_exports"
 EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+SESSIONS_DIR = BASE / "browser_sessions"
+SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _now() -> datetime:
@@ -131,6 +134,10 @@ class WhatsAppDataStore:
             "last_connected_at": value.get("last_connected_at"),
             "session_notes": list(value.get("session_notes", [])),
             "keep_alive": bool(value.get("keep_alive", True)),
+            "session_path": value.get("session_path", ""),
+            "qr_snapshot": value.get("qr_snapshot"),
+            "last_qr_capture_at": value.get("last_qr_capture_at"),
+            "connection_state": value.get("connection_state", "pendiente"),
         }
 
     # ------------------------------------------------------------------
@@ -369,17 +376,41 @@ def _print_numbers_summary(store: WhatsAppDataStore) -> None:
     _subtitle("Números activos")
     for item in sorted(numbers, key=lambda n: n.get("alias")):  # type: ignore[arg-type]
         alias = item.get("alias") or item.get("phone")
-        status = "🟢 Activo" if item.get("connected") else "⚪ Disponible"
+        if item.get("connected"):
+            status = "🟢 Verificado"
+        elif item.get("connection_state") == "fallido":
+            status = "🔴 Error de vinculación"
+        else:
+            status = "⚪ Pendiente"
         last = item.get("last_connected_at") or "(sin actividad)"
-        print(f" • {alias} ({item.get('phone')}) - {status} – última conexión: {last}")
+        print(
+            f" • {alias} ({item.get('phone')}) - {status} – última conexión: {last}"
+        )
 
 
 def _connect_number(store: WhatsAppDataStore) -> None:
-    banner()
-    title("Conectar número de WhatsApp")
-    print(_line())
-    _print_numbers_summary(store)
-    print(_line())
+    while True:
+        banner()
+        title("Conectar número de WhatsApp")
+        print(_line())
+        _print_numbers_summary(store)
+        print(_line())
+        print("1) Vincular nuevo número")
+        print("2) Eliminar número vinculado")
+        print("3) Volver\n")
+        op = ask("Opción: ").strip()
+        if op == "1":
+            _link_new_number(store)
+        elif op == "2":
+            _remove_linked_number(store)
+        elif op == "3":
+            return
+        else:
+            _info("Opción inválida. Intentá nuevamente.", color=Fore.YELLOW)
+            press_enter()
+
+
+def _link_new_number(store: WhatsAppDataStore) -> None:
     alias = ask("Alias interno para reconocer el número: ").strip()
     phone = ask("Número en formato internacional (ej: +54911...): ").strip()
     if not phone:
@@ -388,29 +419,186 @@ def _connect_number(store: WhatsAppDataStore) -> None:
         return
     note = ask("Nota interna u observación (opcional): ").strip()
     session_id = str(uuid.uuid4())
-    store.state.setdefault("numbers", {})[session_id] = {
+    session_dir = SESSIONS_DIR / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    _info("Preparando navegador automatizado para WhatsApp Web...")
+    success, snapshot, details = _initiate_whatsapp_web_login(session_dir)
+    if details:
+        _info(details)
+
+    if not success:
+        confirm = ask(
+            "¿Lograste vincular la sesión desde la ventana abierta? (s/N): "
+        ).strip().lower()
+        if confirm == "s":
+            success = True
+
+    state = store.state.setdefault("numbers", {})
+    record = {
         "id": session_id,
         "alias": alias or phone,
         "phone": phone,
-        "connected": True,
-        "last_connected_at": _now_iso(),
+        "connected": success,
+        "last_connected_at": _now_iso() if success else None,
         "session_notes": [
             {
                 "created_at": _now_iso(),
-                "text": note or "Sesión iniciada mediante escaneo QR",
+                "text": note or "Sesión gestionada mediante navegador automatizado",
             }
         ],
         "keep_alive": True,
+        "session_path": str(session_dir),
+        "qr_snapshot": str(snapshot) if snapshot else None,
+        "last_qr_capture_at": _now_iso() if snapshot else None,
+        "connection_state": "verificado" if success else "pendiente",
     }
+    if not success:
+        record["session_notes"].append(
+            {
+                "created_at": _now_iso(),
+                "text": "La vinculación automática no se completó. Reintentar desde el menú.",
+            }
+        )
+        record["connection_state"] = "fallido"
+    state[session_id] = record
     store.save()
-    print()
-    _info(
-        "Escaneá el código QR desde WhatsApp Web en tu dispositivo."
-        " Cuando finalices presioná Enter para confirmar la vinculación.",
-    )
-    press_enter("Presioná Enter una vez vinculada la sesión...")
-    ok("Sesión vinculada y lista para operar en segundo plano.")
+
+    if success:
+        ok("Sesión verificada y lista para operar en segundo plano.")
+    else:
+        _info(
+            "No se confirmó la vinculación. Podés reintentar el proceso desde este mismo menú.",
+            color=Fore.YELLOW,
+        )
     press_enter()
+
+
+def _remove_linked_number(store: WhatsAppDataStore) -> None:
+    numbers = list(store.iter_numbers())
+    if not numbers:
+        _info("No hay números registrados para eliminar.", color=Fore.YELLOW)
+        press_enter()
+        return
+    print(_line())
+    _subtitle("Seleccioná el número a desvincular")
+    ordered = sorted(numbers, key=lambda n: n.get("alias"))
+    for idx, item in enumerate(ordered, 1):
+        alias = item.get("alias") or item.get("phone")
+        status = "🟢" if item.get("connected") else "⚪"
+        print(f"{idx}) {alias} ({item.get('phone')}) - {status}")
+    idx = ask_int("Número a eliminar: ", min_value=1)
+    if idx > len(ordered):
+        _info("Selección fuera de rango.", color=Fore.YELLOW)
+        press_enter()
+        return
+    selected = ordered[idx - 1]
+    alias = selected.get("alias") or selected.get("phone")
+    confirm = ask(f"Confirmá eliminación de '{alias}' (s/N): ").strip().lower()
+    if confirm != "s":
+        _info("Operación cancelada.")
+        press_enter()
+        return
+    state = store.state.setdefault("numbers", {})
+    state.pop(selected.get("id"), None)
+    session_path = selected.get("session_path")
+    if session_path:
+        path = Path(session_path)
+        if path.exists():
+            try:
+                shutil.rmtree(path)
+            except OSError:
+                pass
+    store.save()
+    ok(f"Se eliminó la sesión asociada a '{alias}'.")
+    press_enter()
+
+
+def _initiate_whatsapp_web_login(session_dir: Path) -> tuple[bool, Path | None, str]:
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
+    except ImportError:
+        return (
+            False,
+            None,
+            "Playwright no está instalado. Ejecutá 'pip install playwright' y luego 'playwright install'.",
+        )
+
+    snapshot_path = session_dir / "qr.png"
+    info_messages: list[str] = []
+    success = False
+
+    try:
+        with sync_playwright() as playwright:
+            context = playwright.chromium.launch_persistent_context(
+                str(session_dir),
+                headless=False,
+                args=["--disable-notifications", "--disable-infobars"],
+            )
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                page.set_default_timeout(60000)
+                page.goto("https://web.whatsapp.com", wait_until="networkidle")
+
+                qr_element = None
+                try:
+                    qr_element = page.wait_for_selector(
+                        "canvas[data-testid='qrcode']",
+                        timeout=30000,
+                    )
+                except PlaywrightTimeoutError:
+                    try:
+                        qr_element = page.wait_for_selector("canvas", timeout=15000)
+                    except PlaywrightTimeoutError:
+                        qr_element = None
+
+                if qr_element is not None:
+                    try:
+                        qr_element.screenshot(path=str(snapshot_path))
+                    except Exception:
+                        page.screenshot(path=str(snapshot_path))
+                else:
+                    page.screenshot(path=str(snapshot_path))
+
+                if snapshot_path.exists():
+                    info_messages.append(
+                        f"Se guardó una captura del código QR en {snapshot_path}."
+                    )
+                info_messages.append(
+                    "Escaneá el código con tu celular para completar la vinculación."
+                )
+
+                verification_targets = [
+                    "div[data-testid='chat-list-search']",
+                    "div[data-testid='pane-side']",
+                    "div[data-testid='app-title']",
+                ]
+                for selector in verification_targets:
+                    try:
+                        page.wait_for_selector(selector, timeout=180000)
+                        success = True
+                        break
+                    except PlaywrightTimeoutError:
+                        continue
+
+                if not success:
+                    try:
+                        page.wait_for_selector("canvas[data-testid='qrcode']", timeout=1000)
+                    except PlaywrightTimeoutError:
+                        success = True
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+    except Exception:
+        info_messages.append(
+            "No se pudo automatizar la conexión. Verificá que Playwright tenga los navegadores instalados."
+        )
+        success = False
+
+    message = " ".join(info_messages)
+    return success, snapshot_path if snapshot_path.exists() else None, message
 
 
 # ----------------------------------------------------------------------
@@ -430,13 +618,19 @@ def _import_contacts(store: WhatsAppDataStore) -> None:
             print(_line())
         print("1) Carga manual")
         print("2) Importar desde CSV (nombre, número)")
-        print("3) Volver\n")
+        print("3) Ver listas cargadas")
+        print("4) Eliminar una lista cargada")
+        print("5) Volver\n")
         op = ask("Opción: ").strip()
         if op == "1":
             _manual_contacts_entry(store)
         elif op == "2":
             _csv_contacts_entry(store)
         elif op == "3":
+            _show_loaded_contacts(store)
+        elif op == "4":
+            _delete_contact_list(store)
+        elif op == "5":
             return
         else:
             _info("Opción inválida. Probá otra vez.", color=Fore.YELLOW)
@@ -496,6 +690,62 @@ def _csv_contacts_entry(store: WhatsAppDataStore) -> None:
         return
     _persist_contacts(store, alias, contacts)
     ok(f"Importación completada. {len(contacts)} registros cargados en '{alias}'.")
+    press_enter()
+
+
+def _select_existing_list(
+    store: WhatsAppDataStore, prompt: str
+) -> tuple[str, dict[str, Any]] | None:
+    lists = sorted(list(store.iter_lists()), key=lambda item: item[0].lower())
+    if not lists:
+        _info("Aún no hay listas registradas.", color=Fore.YELLOW)
+        press_enter()
+        return None
+    print(_line())
+    _subtitle(prompt)
+    for idx, (alias, data) in enumerate(lists, 1):
+        total = len(data.get("contacts", []))
+        print(f"{idx}) {alias} ({total} contactos)")
+    idx = ask_int("Selección: ", min_value=1)
+    if idx > len(lists):
+        _info("Selección fuera de rango.", color=Fore.YELLOW)
+        press_enter()
+        return None
+    return lists[idx - 1]
+
+
+def _show_loaded_contacts(store: WhatsAppDataStore) -> None:
+    selection = _select_existing_list(store, "Elegí la lista a visualizar")
+    if not selection:
+        return
+    alias, data = selection
+    banner()
+    title(f"Contactos registrados en '{alias}'")
+    print(_line())
+    contacts = data.get("contacts", [])
+    if not contacts:
+        _info("La lista no tiene contactos cargados.", color=Fore.YELLOW)
+        press_enter()
+        return
+    for contact in contacts:
+        name = contact.get("name") or contact.get("number")
+        print(f"• {name} - {contact.get('number')}")
+    press_enter()
+
+
+def _delete_contact_list(store: WhatsAppDataStore) -> None:
+    selection = _select_existing_list(store, "Seleccioná la lista a eliminar")
+    if not selection:
+        return
+    alias, _ = selection
+    confirm = ask(f"Confirmá eliminación de la lista '{alias}' (s/N): ").strip().lower()
+    if confirm != "s":
+        _info("Operación cancelada.")
+        press_enter()
+        return
+    store.state.setdefault("contact_lists", {}).pop(alias, None)
+    store.save()
+    ok(f"Se eliminó la lista '{alias}'.")
     press_enter()
 
 
@@ -614,7 +864,12 @@ def _choose_number(store: WhatsAppDataStore) -> dict[str, Any] | None:
     print(_line())
     _subtitle("Seleccioná el número de envío")
     for idx, item in enumerate(options, 1):
-        status = "🟢 activo" if item.get("connected") else "⚪ inactivo"
+        if item.get("connected"):
+            status = "🟢 verificado"
+        elif item.get("connection_state") == "fallido":
+            status = "🔴 error"
+        else:
+            status = "⚪ pendiente"
         print(f"{idx}) {item.get('alias')} ({item.get('phone')}) - {status}")
     idx = ask_int("Número elegido: ", min_value=1)
     if idx > len(options):
