@@ -7,6 +7,7 @@ from __future__ import annotations
 import csv
 import json
 import random
+import time
 import shutil
 import textwrap
 import uuid
@@ -14,6 +15,8 @@ import webbrowser
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Iterator
+
+from http.client import RemoteDisconnected
 
 from paths import runtime_base
 from ui import Fore, full_line, style_text
@@ -42,6 +45,16 @@ def _now() -> datetime:
 
 def _now_iso() -> str:
     return _now().isoformat() + "Z"
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        clean = value.rstrip("Z")
+        return datetime.fromisoformat(clean)
+    except Exception:
+        return None
 
 
 def _default_state() -> dict[str, Any]:
@@ -105,7 +118,11 @@ class WhatsAppDataStore:
             key: self._ensure_contact_list_structure(value)
             for key, value in dict(data.get("contact_lists", {})).items()
         }
-        merged["message_runs"] = list(data.get("message_runs", []))
+        merged["message_runs"] = [
+            self._ensure_message_run(item)
+            for item in data.get("message_runs", [])
+            if isinstance(item, dict)
+        ]
         merged["ai_automations"] = {
             key: self._ensure_ai_config(value)
             for key, value in dict(data.get("ai_automations", {})).items()
@@ -171,6 +188,85 @@ class WhatsAppDataStore:
             "created_at": value.get("created_at") or _now_iso(),
             "contacts": contacts,
             "notes": value.get("notes", ""),
+        }
+
+    # ------------------------------------------------------------------
+    def _ensure_message_run(self, value: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            value = {}
+
+        def _to_int(raw: Any, default: int = 0) -> int:
+            try:
+                if raw in (None, ""):
+                    return default
+                return int(raw)
+            except Exception:
+                return default
+
+        def _to_float(raw: Any, default: float = 0.0) -> float:
+            try:
+                if raw in (None, ""):
+                    return default
+                return float(raw)
+            except Exception:
+                return default
+
+        delay = value.get("delay") or {}
+        events = []
+        for item in value.get("events", []):
+            if not isinstance(item, dict):
+                continue
+            events.append(
+                {
+                    "contact": item.get("contact"),
+                    "name": item.get("name"),
+                    "message": item.get("message", ""),
+                    "scheduled_at": item.get("scheduled_at"),
+                    "status": item.get("status", "pendiente"),
+                    "delivered_at": item.get("delivered_at"),
+                    "notes": item.get("notes", ""),
+                }
+            )
+
+        log = [
+            {
+                "timestamp": entry.get("timestamp", _now_iso()),
+                "message": entry.get("message", ""),
+            }
+            for entry in value.get("log", [])
+            if isinstance(entry, dict)
+        ]
+
+        message_template = value.get("message_template", "") or value.get("template", "")
+        message_preview = value.get("message_preview", "")
+        if message_template and not message_preview:
+            message_preview = textwrap.shorten(message_template, width=90, placeholder="…")
+
+        return {
+            "id": value.get("id", str(uuid.uuid4())),
+            "number_id": value.get("number_id"),
+            "number_alias": value.get("number_alias"),
+            "number_phone": value.get("number_phone"),
+            "list_alias": value.get("list_alias"),
+            "created_at": value.get("created_at") or _now_iso(),
+            "status": value.get("status", "programado"),
+            "paused": bool(value.get("paused", False)),
+            "session_limit": _to_int(value.get("session_limit"), 0),
+            "total_contacts": _to_int(value.get("total_contacts"), len(events)),
+            "processed": _to_int(value.get("processed"), 0),
+            "completed_at": value.get("completed_at"),
+            "last_activity_at": value.get("last_activity_at"),
+            "next_run_at": value.get("next_run_at"),
+            "delay": {
+                "min": _to_float(delay.get("min"), 5.0),
+                "max": _to_float(delay.get("max"), 12.0),
+            },
+            "message_template": message_template,
+            "message_preview": message_preview,
+            "events": events,
+            "max_contacts": _to_int(value.get("max_contacts"), 0),
+            "last_session_at": value.get("last_session_at"),
+            "log": log,
         }
 
     # ------------------------------------------------------------------
@@ -330,6 +426,7 @@ def _format_delay(delay: dict[str, float]) -> str:
 def menu_whatsapp() -> None:
     store = WhatsAppDataStore()
     while True:
+        _reconcile_runs(store)
         banner()
         title("Automatización por WhatsApp")
         print(_line())
@@ -716,6 +813,8 @@ def _initiate_with_selenium(session_dir: Path) -> tuple[bool, Path | None, str]:
         f"Se abrió {driver_label} mediante Selenium. Escaneá el QR para continuar."
     )
 
+    monitor_completed = False
+
     try:
         driver.get("https://web.whatsapp.com")
         wait = WebDriverWait(driver, 60)
@@ -726,6 +825,8 @@ def _initiate_with_selenium(session_dir: Path) -> tuple[bool, Path | None, str]:
 
         try:
             driver.save_screenshot(str(snapshot_path))
+        except RemoteDisconnected:
+            raise
         except Exception:
             pass
 
@@ -737,16 +838,42 @@ def _initiate_with_selenium(session_dir: Path) -> tuple[bool, Path | None, str]:
             "Escaneá el código con tu celular para completar la vinculación."
         )
 
-        try:
-            WebDriverWait(driver, 180).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-testid='chat-list-search']"))
-            )
-            success = True
-        except TimeoutException:
+        verification_targets = [
+            "div[data-testid='chat-list-search']",
+            "div[data-testid='pane-side']",
+            "div[role='grid']",
+            "div[data-testid='app-title']",
+        ]
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            success = False
+            for selector in verification_targets:
+                try:
+                    WebDriverWait(driver, 8).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                    )
+                    success = True
+                    break
+                except TimeoutException:
+                    continue
+            if success:
+                break
             try:
-                driver.find_element(By.CSS_SELECTOR, "canvas[data-testid='qrcode']")
-            except Exception:
+                qr_visible = driver.find_elements(By.CSS_SELECTOR, "canvas[data-testid='qrcode']")
+            except RemoteDisconnected:
+                raise
+            except WebDriverException as exc:
+                raise exc
+            if not qr_visible:
                 success = True
+                break
+            time.sleep(2)
+        monitor_completed = True
+    except RemoteDisconnected:
+        info_messages.append(
+            "El navegador se cerró antes de completar la vinculación. Volvé a intentar."
+        )
+        success = False
     except WebDriverException:
         info_messages.append(
             "Selenium no pudo completar la automatización. Revisá la configuración del navegador y volvé a intentar."
@@ -757,6 +884,16 @@ def _initiate_with_selenium(session_dir: Path) -> tuple[bool, Path | None, str]:
             driver.quit()
         except Exception:
             pass
+
+    if monitor_completed:
+        if success:
+            info_messages.append(
+                "La sesión quedó vinculada correctamente y permanecerá activa en segundo plano."
+            )
+        else:
+            info_messages.append(
+                "No se detectó la vinculación en 90 segundos. Se canceló automáticamente."
+            )
 
     message = " ".join(info_messages)
     return success, snapshot_path if snapshot_path.exists() else None, message
@@ -965,73 +1102,585 @@ def _persist_contacts(store: WhatsAppDataStore, alias: str, contacts: Iterable[d
 
 def _send_messages(store: WhatsAppDataStore) -> None:
     if not list(store.iter_numbers()):
-        _info("Necesitás vincular al menos un número antes de enviar mensajes.", color=Fore.YELLOW)
+        _info(
+            "Necesitás vincular al menos un número antes de enviar mensajes.",
+            color=Fore.YELLOW,
+        )
         press_enter()
         return
-    lists = list(store.iter_lists())
-    if not lists:
+    if not list(store.iter_lists()):
         _info("Cargá primero una lista de contactos.", color=Fore.YELLOW)
         press_enter()
         return
+
+    while True:
+        _reconcile_runs(store)
+        banner()
+        title("Programación de envíos por WhatsApp")
+        print(_line())
+        _print_runs_overview(store)
+        print(_line())
+        print("1) Programar nuevo envío automático")
+        print("2) Ver detalle de un envío programado")
+        print("3) Pausar o reanudar un envío")
+        print("4) Cancelar un envío")
+        print("5) Volver\n")
+        op = ask("Opción: ").strip()
+        if op == "1":
+            _plan_message_run(store)
+        elif op == "2":
+            _show_run_detail(store)
+        elif op == "3":
+            _toggle_run_pause(store)
+        elif op == "4":
+            _cancel_run(store)
+        elif op == "5":
+            return
+        else:
+            _info("Opción inválida.", color=Fore.YELLOW)
+            press_enter()
+
+
+def _plan_message_run(store: WhatsAppDataStore) -> None:
     number = _choose_number(store)
     if not number:
         return
     contact_list = _choose_contact_list(store)
     if not contact_list:
         return
-    min_delay, max_delay = _ask_delay_range()
-    message_template = ask_multiline("Mensaje a enviar (usa {nombre} para personalizar): ")
-    if not message_template:
-        _info("Mensaje vacío. Operación cancelada.", color=Fore.YELLOW)
-        press_enter()
-        return
-    contacts = contact_list.get("contacts", [])
+    contacts = list(contact_list.get("contacts", []))
     if not contacts:
         _info("La lista no tiene contactos.", color=Fore.YELLOW)
         press_enter()
         return
-    simulated_events = []
+
+    max_contacts = ask_int(
+        "¿Cuántos contactos incluir en este envío? (0 = todos): ",
+        min_value=0,
+        default=0,
+    )
+    if max_contacts and max_contacts < len(contacts):
+        targets = contacts[:max_contacts]
+    else:
+        targets = contacts
+    if not targets:
+        _info("No se seleccionaron contactos para el envío.", color=Fore.YELLOW)
+        press_enter()
+        return
+
+    message_template = ask_multiline(
+        "Mensaje a enviar (usa {nombre} para personalizar): "
+    ).strip()
+    if not message_template:
+        _info("Mensaje vacío. Operación cancelada.", color=Fore.YELLOW)
+        press_enter()
+        return
+
+    min_delay, max_delay = _ask_delay_range()
+    session_limit = ask_int(
+        "Cantidad máxima de mensajes por sesión (0 = sin tope): ",
+        min_value=0,
+        default=0,
+    )
+
     planned_at = _now()
-    for contact in contacts:
+    run_id = str(uuid.uuid4())
+    events: list[dict[str, Any]] = []
+    for contact in targets:
         planned_at += timedelta(seconds=random.uniform(min_delay, max_delay))
         rendered = _render_message(message_template, contact)
-        event = {
-            "contact": contact.get("number"),
-            "name": contact.get("name"),
-            "message": rendered,
-            "scheduled_at": planned_at.isoformat() + "Z",
-        }
-        simulated_events.append(event)
-        contact["status"] = "mensaje enviado"
-        contact["last_message_at"] = _now_iso()
-        contact.setdefault("history", []).append(
+        scheduled_at = planned_at.isoformat() + "Z"
+        events.append(
             {
-                "type": "send",
+                "contact": contact.get("number"),
+                "name": contact.get("name"),
                 "message": rendered,
-                "delay": {"min": min_delay, "max": max_delay},
-                "scheduled_at": event["scheduled_at"],
+                "scheduled_at": scheduled_at,
+                "status": "pendiente",
+                "delivered_at": None,
+                "notes": "",
             }
         )
-    run_id = str(uuid.uuid4())
-    store.state.setdefault("message_runs", []).append(
-        {
-            "id": run_id,
-            "number_id": number["id"],
-            "number_alias": number.get("alias"),
-            "list_alias": contact_list.get("alias"),
-            "created_at": _now_iso(),
-            "delay": {"min": min_delay, "max": max_delay},
-            "template": message_template,
-            "events": simulated_events,
-        }
+        _mark_contact_scheduled(
+            contact,
+            run_id,
+            rendered,
+            scheduled_at,
+            min_delay,
+            max_delay,
+        )
+
+    run = {
+        "id": run_id,
+        "number_id": number["id"],
+        "number_alias": number.get("alias"),
+        "number_phone": number.get("phone"),
+        "list_alias": contact_list.get("alias"),
+        "created_at": _now_iso(),
+        "status": "programado",
+        "paused": False,
+        "session_limit": session_limit,
+        "total_contacts": len(events),
+        "processed": 0,
+        "completed_at": None,
+        "last_activity_at": None,
+        "next_run_at": events[0]["scheduled_at"] if events else None,
+        "delay": {"min": min_delay, "max": max_delay},
+        "message_template": message_template,
+        "message_preview": textwrap.shorten(
+            message_template, width=90, placeholder="…"
+        ),
+        "events": events,
+        "max_contacts": max_contacts,
+        "last_session_at": None,
+        "log": [],
+    }
+    _append_run_log(
+        run,
+        f"Se programó el envío para {len(events)} contactos con delays entre {min_delay:.1f}s y {max_delay:.1f}s.",
     )
+    store.state.setdefault("message_runs", []).append(run)
     store.save()
     ok(
-        f"Se planificó el envío inicial para {len(contacts)} contactos desde "
-        f"'{number.get('alias')}' respetando delays humanos."
+        "El envío quedó programado y continuará ejecutándose en segundo plano con ritmo humano."
     )
     press_enter()
 
+
+def _print_runs_overview(store: WhatsAppDataStore) -> None:
+    runs = store.state.setdefault("message_runs", [])
+    if not runs:
+        _info("No hay envíos programados todavía. Usá la opción 1 para crear uno.")
+        return
+
+    active = [
+        run for run in runs if (run.get("status") or "").lower() not in {"completado", "cancelado"}
+    ]
+    if active:
+        _subtitle("Envíos activos")
+        for run in sorted(active, key=lambda item: item.get("created_at") or ""):
+            total, processed, pending, _ = _run_counts(run)
+            status = _run_status_label(run)
+            next_run = run.get("next_run_at") or "(esperando horario)"
+            print(
+                f" • {_run_list_label(run)} → {_run_number_label(run)} | {status} | "
+                f"{processed}/{total} enviados | Próximo: {next_run}"
+            )
+    else:
+        _info("No hay ejecuciones activas en este momento.")
+
+    completed = [
+        run for run in runs if (run.get("status") or "").lower() in {"completado", "cancelado"}
+    ]
+    if completed:
+        print()
+        _subtitle("Historial reciente")
+        for run in sorted(
+            completed,
+            key=lambda item: item.get("completed_at") or item.get("last_activity_at") or item.get("created_at") or "",
+            reverse=True,
+        )[:3]:
+            total, processed, pending, cancelled = _run_counts(run)
+            status = _run_status_label(run)
+            finished = run.get("completed_at") or run.get("last_activity_at") or run.get("created_at")
+            print(
+                f" • {_run_list_label(run)} → {_run_number_label(run)} | {status} | "
+                f"{processed}/{total} completados | Finalizó: {finished or 'sin fecha'}"
+            )
+
+
+def _show_run_detail(store: WhatsAppDataStore) -> None:
+    run = _select_run(
+        store,
+        "Seleccioná el envío a monitorear",
+        include_completed=True,
+    )
+    if not run:
+        return
+    _reconcile_runs(store)
+    banner()
+    title("Detalle del envío por WhatsApp")
+    print(_line())
+    total, processed, pending, cancelled = _run_counts(run)
+    print(f"Lista: {_run_list_label(run)} → Número: {_run_number_label(run)}")
+    print(f"Estado actual: {_run_status_label(run)}")
+    print(f"Mensajes enviados: {processed}/{total}")
+    print(f"Pendientes: {pending} | Cancelados/Omitidos: {cancelled}")
+    print(f"Delay configurado: {_format_delay(run.get('delay', {'min': 5.0, 'max': 12.0}))}")
+    session_limit = run.get("session_limit") or 0
+    if session_limit:
+        print(f"Límite por sesión: {session_limit} mensajes")
+    next_run = run.get("next_run_at")
+    if next_run:
+        print(f"Próximo envío estimado: {next_run}")
+    if run.get("last_session_at"):
+        print(f"Última sesión completada: {run.get('last_session_at')}")
+    if run.get("message_preview"):
+        print(f"Plantilla: {run.get('message_preview')}")
+    next_event = next(
+        (event for event in run.get("events", []) if (event.get("status") or "") == "pendiente"),
+        None,
+    )
+    if next_event:
+        print(
+            "Próximo contacto: "
+            f"{next_event.get('name') or next_event.get('contact')} a las {next_event.get('scheduled_at')}"
+        )
+    log = run.get("log", [])
+    if log:
+        print()
+        _subtitle("Actividad registrada")
+        for entry in log[-5:]:
+            print(f" - {entry.get('timestamp')}: {entry.get('message')}")
+    press_enter()
+
+
+def _toggle_run_pause(store: WhatsAppDataStore) -> None:
+    run = _select_run(
+        store,
+        "Seleccioná el envío a pausar o reanudar",
+        include_completed=False,
+    )
+    if not run:
+        return
+    status = (run.get("status") or "").lower()
+    if status in {"completado", "cancelado"}:
+        _info("Ese envío ya finalizó y no puede modificarse.", color=Fore.YELLOW)
+        press_enter()
+        return
+    if run.get("paused"):
+        run["paused"] = False
+        run["status"] = "en progreso" if run.get("processed") else "programado"
+        run["next_run_at"] = _next_pending_at(run.get("events", []))
+        _append_run_log(run, "La ejecución se reanudó manualmente.")
+        ok("El envío se reanudó. Continuará respetando los delays configurados.")
+    else:
+        run["paused"] = True
+        run["status"] = "en pausa"
+        run["last_session_at"] = _now_iso()
+        _append_run_log(run, "La ejecución se pausó manualmente.")
+        ok("El envío quedó en pausa segura.")
+    store.save()
+    press_enter()
+
+
+def _cancel_run(store: WhatsAppDataStore) -> None:
+    run = _select_run(
+        store,
+        "Seleccioná el envío a cancelar",
+        include_completed=False,
+    )
+    if not run:
+        return
+    status = (run.get("status") or "").lower()
+    if status == "cancelado":
+        _info("Ese envío ya está cancelado.")
+        press_enter()
+        return
+    if status == "completado":
+        _info("Ese envío ya finalizó por completo.", color=Fore.YELLOW)
+        press_enter()
+        return
+    confirm = ask("Confirmá la cancelación permanente (s/N): ").strip().lower()
+    if confirm != "s":
+        _info("Operación cancelada.")
+        press_enter()
+        return
+    for event in run.get("events", []):
+        if (event.get("status") or "") == "pendiente":
+            _reset_contact_for_cancellation(store, run, event)
+    run["status"] = "cancelado"
+    run["paused"] = False
+    run["completed_at"] = _now_iso()
+    run["next_run_at"] = None
+    _refresh_run_counters(run)
+    _append_run_log(run, "La ejecución fue cancelada manualmente.")
+    store.save()
+    ok("El envío se canceló sin afectar al resto del sistema.")
+    press_enter()
+
+
+def _select_run(
+    store: WhatsAppDataStore,
+    prompt: str,
+    *,
+    include_completed: bool = True,
+) -> dict[str, Any] | None:
+    runs = store.state.setdefault("message_runs", [])
+    filtered: list[dict[str, Any]] = []
+    for run in runs:
+        status = (run.get("status") or "").lower()
+        if not include_completed and status in {"completado", "cancelado"}:
+            continue
+        filtered.append(run)
+    if not filtered:
+        _info("No hay envíos disponibles para esta acción.", color=Fore.YELLOW)
+        press_enter()
+        return None
+    print(_line())
+    _subtitle(prompt)
+    for idx, run in enumerate(filtered, 1):
+        total, processed, pending, _ = _run_counts(run)
+        print(
+            f"{idx}) {_run_list_label(run)} → {_run_number_label(run)} | {_run_status_label(run)} | "
+            f"{processed}/{total} enviados | Pendientes: {pending}"
+        )
+    idx = ask_int("Selección: ", min_value=1)
+    if idx > len(filtered):
+        _info("Selección fuera de rango.", color=Fore.YELLOW)
+        press_enter()
+        return None
+    return filtered[idx - 1]
+
+
+def _run_number_label(run: dict[str, Any]) -> str:
+    return run.get("number_alias") or run.get("number_phone") or "(sin alias)"
+
+
+def _run_list_label(run: dict[str, Any]) -> str:
+    return run.get("list_alias") or "(sin lista)"
+
+
+def _run_status_label(run: dict[str, Any]) -> str:
+    status = (run.get("status") or "programado").lower()
+    if status == "en pausa" or run.get("paused"):
+        return "⏸ en pausa"
+    if status == "en progreso":
+        return "🟢 en progreso"
+    if status == "programado":
+        return "🕒 programado"
+    if status == "completado":
+        return "✅ completado"
+    if status == "cancelado":
+        return "✖ cancelado"
+    return status
+
+
+def _run_counts(run: dict[str, Any]) -> tuple[int, int, int, int]:
+    events = run.get("events", [])
+    total = len(events)
+    processed = sum(1 for event in events if (event.get("status") or "") == "enviado")
+    pending = sum(1 for event in events if (event.get("status") or "") == "pendiente")
+    cancelled = sum(
+        1
+        for event in events
+        if (event.get("status") or "") in {"cancelado", "omitido"}
+    )
+    return total, processed, pending, cancelled
+
+
+def _append_run_log(run: dict[str, Any], message: str) -> None:
+    log = run.setdefault("log", [])
+    log.append({"timestamp": _now_iso(), "message": message})
+    if len(log) > 50:
+        del log[:-50]
+
+
+def _next_pending_at(events: Iterable[dict[str, Any]]) -> str | None:
+    upcoming = [
+        event.get("scheduled_at")
+        for event in events
+        if (event.get("status") or "") == "pendiente" and event.get("scheduled_at")
+    ]
+    if not upcoming:
+        return None
+    return min(upcoming)
+
+
+def _refresh_run_counters(run: dict[str, Any]) -> None:
+    events = run.get("events", [])
+    run["total_contacts"] = len(events)
+    run["processed"] = sum(
+        1
+        for event in events
+        if (event.get("status") or "") in {"enviado", "cancelado", "omitido"}
+    )
+
+
+def _reconcile_runs(store: WhatsAppDataStore) -> None:
+    runs = store.state.setdefault("message_runs", [])
+    now = _now()
+    changed = False
+    for run in runs:
+        status = (run.get("status") or "").lower()
+        events = run.get("events", [])
+        if not events:
+            continue
+        if status == "cancelado":
+            continue
+        if run.get("paused"):
+            next_at = _next_pending_at(events)
+            if run.get("next_run_at") != next_at:
+                run["next_run_at"] = next_at
+                changed = True
+            continue
+
+        session_limit = run.get("session_limit") or 0
+        processed_now = 0
+        for event in events:
+            if (event.get("status") or "") != "pendiente":
+                continue
+            scheduled_at = _parse_iso(event.get("scheduled_at")) or now
+            if scheduled_at > now:
+                upcoming = event.get("scheduled_at")
+                if run.get("next_run_at") != upcoming:
+                    run["next_run_at"] = upcoming
+                    changed = True
+                break
+            if session_limit and processed_now >= session_limit:
+                upcoming = event.get("scheduled_at")
+                if run.get("next_run_at") != upcoming:
+                    run["next_run_at"] = upcoming
+                    changed = True
+                break
+            if _deliver_event(store, run, event):
+                processed_now += 1
+                changed = True
+        if session_limit and processed_now >= session_limit and any(
+            (event.get("status") or "") == "pendiente" for event in events
+        ):
+            if not run.get("paused"):
+                run["paused"] = True
+                run["status"] = "en pausa"
+                run["last_session_at"] = _now_iso()
+                _append_run_log(
+                    run,
+                    "Se alcanzó el límite de mensajes por sesión. La ejecución se pausó automáticamente.",
+                )
+                changed = True
+            next_at = _next_pending_at(events)
+            if run.get("next_run_at") != next_at:
+                run["next_run_at"] = next_at
+                changed = True
+            _refresh_run_counters(run)
+            continue
+        if all((event.get("status") or "") in {"enviado", "cancelado", "omitido"} for event in events):
+            if status != "completado":
+                run["status"] = "completado"
+                run["completed_at"] = _now_iso()
+                run["paused"] = False
+                run["next_run_at"] = None
+                _append_run_log(
+                    run,
+                    "La ejecución finalizó y todos los mensajes fueron procesados.",
+                )
+                changed = True
+            _refresh_run_counters(run)
+            continue
+        next_at = _next_pending_at(events)
+        if run.get("next_run_at") != next_at:
+            run["next_run_at"] = next_at
+            changed = True
+        if any((event.get("status") or "") == "enviado" for event in events):
+            if run.get("status") not in {"en pausa", "completado"}:
+                run["status"] = "en progreso"
+                changed = True
+        _refresh_run_counters(run)
+    if changed:
+        store.save()
+
+
+def _deliver_event(store: WhatsAppDataStore, run: dict[str, Any], event: dict[str, Any]) -> bool:
+    if (event.get("status") or "") != "pendiente":
+        return False
+    delivered_at = _now_iso()
+    contact_list = store.find_list(run.get("list_alias", ""))
+    if not contact_list:
+        event["status"] = "omitido"
+        event["delivered_at"] = delivered_at
+        _append_run_log(
+            run,
+            f"La lista '{run.get('list_alias')}' ya no existe. Se omitió el envío a {event.get('contact')}.",
+        )
+    else:
+        contact = _locate_contact(contact_list, event.get("contact"))
+        if not contact:
+            event["status"] = "omitido"
+            event["delivered_at"] = delivered_at
+            _append_run_log(
+                run,
+                f"No se encontró el contacto {event.get('contact')} dentro de la lista.",
+            )
+        else:
+            contact["status"] = "mensaje enviado"
+            contact["last_message_at"] = event.get("scheduled_at") or delivered_at
+            contact.setdefault("history", []).append(
+                {
+                    "type": "send",
+                    "run_id": run.get("id"),
+                    "message": event.get("message", ""),
+                    "sent_at": delivered_at,
+                    "delay": run.get("delay"),
+                }
+            )
+            event["status"] = "enviado"
+            event["delivered_at"] = delivered_at
+    run["last_activity_at"] = delivered_at
+    _refresh_run_counters(run)
+    if event.get("status") == "enviado":
+        run["status"] = "en progreso"
+    return True
+
+
+def _locate_contact(contact_list: dict[str, Any], number: str | None) -> dict[str, Any] | None:
+    if not number:
+        return None
+    for contact in contact_list.get("contacts", []):
+        if contact.get("number") == number:
+            return contact
+    return None
+
+
+def _mark_contact_scheduled(
+    contact: dict[str, Any],
+    run_id: str,
+    message: str,
+    scheduled_at: str,
+    min_delay: float,
+    max_delay: float,
+) -> None:
+    preview = textwrap.shorten(message, width=80, placeholder="…") if message else ""
+    contact.setdefault("history", []).append(
+        {
+            "type": "scheduled",
+            "run_id": run_id,
+            "scheduled_at": scheduled_at,
+            "message": preview,
+            "delay": {"min": min_delay, "max": max_delay},
+        }
+    )
+    current_status = (contact.get("status") or "").lower()
+    if not current_status or any(hint in current_status for hint in ("sin", "espera", "program")):
+        contact["status"] = "mensaje programado"
+
+
+def _reset_contact_for_cancellation(
+    store: WhatsAppDataStore,
+    run: dict[str, Any],
+    event: dict[str, Any],
+) -> None:
+    contact_list = store.find_list(run.get("list_alias", ""))
+    if not contact_list:
+        event["status"] = "cancelado"
+        event["delivered_at"] = _now_iso()
+        return
+    contact = _locate_contact(contact_list, event.get("contact"))
+    event["status"] = "cancelado"
+    event["delivered_at"] = _now_iso()
+    if not contact:
+        return
+    history = contact.setdefault("history", [])
+    history.append(
+        {
+            "type": "cancelled",
+            "run_id": run.get("id"),
+            "scheduled_at": event.get("scheduled_at"),
+            "cancelled_at": event.get("delivered_at"),
+        }
+    )
+    current_status = (contact.get("status") or "").lower()
+    if "program" in current_status and not contact.get("last_message_at"):
+        contact["status"] = "sin mensaje"
 
 def _choose_number(store: WhatsAppDataStore) -> dict[str, Any] | None:
     options = list(store.iter_numbers())
