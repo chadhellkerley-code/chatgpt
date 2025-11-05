@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import contextlib
 import csv
 import getpass
 import io
@@ -21,6 +22,12 @@ import logging
 from urllib.parse import urlparse
 
 from config import SETTINGS
+from instagram_adapter import (
+    InstagramClientAdapter,
+    TwoFARequired,
+    TwoFactorCodeRejected,
+    prompt_two_factor_code,
+)
 from proxy_manager import (
     ProxyConfig,
     apply_proxy_to_client,
@@ -925,67 +932,60 @@ def _login_and_save_session(
                 remaining,
             )
             return False
+
     try:
-        from instagrapi import Client, exceptions as ig_exceptions
+        from instagrapi import exceptions as ig_exceptions
     except Exception as exc:
-        logger.debug("No se pudo crear el cliente de Instagram: %s", exc)
+        logger.debug("No se pudo importar instagrapi para el login de @%s: %s", username, exc)
         return False
 
     try:
-        cl = Client()
+        adapter = InstagramClientAdapter()
     except Exception as exc:
-        logger.debug("Error inicializando instagrapi para @%s: %s", username, exc)
+        logger.debug("No se pudo crear el cliente de Instagram para @%s: %s", username, exc)
         return False
+
+    try:
+        load_into(adapter, username)
+        logger.debug("Se cargó la sesión previa para @%s", username)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.debug("No se pudo cargar la sesión previa de @%s: %s", username, exc)
 
     binding = None
     try:
-        binding = apply_proxy_to_client(cl, username, account, reason="login")
+        binding = apply_proxy_to_client(adapter, username, account, reason="login")
     except Exception as exc:
         if account.get("proxy_url"):
             record_proxy_failure(username, exc)
         logger.debug("No se pudo aplicar el proxy de @%s: %s", username, exc)
 
     payload = _two_factor_payload_for_login(account)
-    verification_code = payload.code if payload else ""
     if payload and payload.mode == "totp":
         logger.debug("Aplicando TOTP automático para @%s", username)
 
     jitter = random.uniform(1.5, 3.5)
     time.sleep(jitter)
 
+    verification_code = payload.code if payload and payload.mode != "totp" else None
+
     try:
-        cl.login(username, password, verification_code=verification_code)
-        save_from(cl, username)
+        adapter.do_login(username, password, verification_code=verification_code)
+        save_from(adapter, username)
         mark_connected(username, True)
         _clear_login_failure(username)
         account["has_totp"] = has_totp_secret(username)
         ok(f"Sesión guardada para {username}.")
         return True
+    except TwoFARequired as exc:
+        return _handle_two_factor_challenge(account, adapter, exc)
     except ig_exceptions.BadPassword:
         warn(f"Contraseña incorrecta para @{username}. Actualizá la clave y reintentá.")
     except ig_exceptions.UserNotFound:
         warn(
             f"Instagram indicó que la cuenta @{username} no existe o fue deshabilitada."
         )
-    except ig_exceptions.TwoFactorRequired:
-        info = getattr(cl, "last_json", {}).get("two_factor_info", {})
-        mode = _two_factor_mode_from_info(info)
-        if mode == "whatsapp":
-            warn(
-                "Esta cuenta requiere verificación externa por WhatsApp. El login automático no es posible."
-            )
-        elif mode == "sms":
-            warn(
-                "Esta cuenta requiere verificación externa por SMS. El login automático no es posible."
-            )
-        elif payload and payload.mode == "totp":
-            warn(
-                f"Instagram rechazó el código TOTP automático para @{username}. Revisá el secreto en tu autenticador."
-            )
-        else:
-            warn(
-                f"Instagram solicitó un código 2FA para @{username}. Guardá el secreto TOTP o ingresá el código manualmente."
-            )
     except ig_exceptions.ChallengeRequired:
         warn(
             f"Instagram solicitó un challenge adicional para @{username}. Resolvilo manualmente para continuar."
@@ -1004,6 +1004,78 @@ def _login_and_save_session(
         _record_login_failure(username)
         return False
 
+    mark_connected(username, False)
+    _record_login_failure(username)
+    return False
+
+
+def _handle_two_factor_challenge(
+    account: Dict,
+    adapter: InstagramClientAdapter,
+    exc: TwoFARequired,
+) -> bool:
+    username = account.get("username", "")
+    method = exc.method or "unknown"
+    methods = exc.methods or []
+
+    if method not in {"sms", "whatsapp", "email"}:
+        warn(
+            "Instagram solicitó un desafío 2FA para @{username} que requiere intervención manual desde la app.".format(
+                username=username
+            )
+        )
+        mark_connected(username, False)
+        _record_login_failure(username)
+        return False
+
+    if method == "sms" and "whatsapp" in methods:
+        try:
+            adapter.request_2fa_code("whatsapp")
+            method = "whatsapp"
+        except Exception as err:
+            logger.warning(
+                "No se pudo solicitar el código vía WhatsApp para @%s: %s",
+                username,
+                err,
+            )
+    logger.info(
+        "Esperando código 2FA para @%s vía %s", username, method
+    )
+
+    attempts = 0
+    cooldown = 8
+    while attempts < 3:
+        attempts += 1
+        code = prompt_two_factor_code(username, method, attempts)
+        if not code:
+            logger.info(
+                "No se ingresó código 2FA para @%s (intento %d)", username, attempts
+            )
+        else:
+            try:
+                adapter.finish_2fa(code)
+                save_from(adapter, username)
+                mark_connected(username, True)
+                _clear_login_failure(username)
+                account["has_totp"] = has_totp_secret(username)
+                ok(f"Sesión guardada para {username} tras verificación 2FA.")
+                return True
+            except TwoFactorCodeRejected:
+                warn(
+                    f"Instagram rechazó el código ingresado para @{username}. Intentá nuevamente."
+                )
+        if attempts < 3:
+            logger.info(
+                "Reintentando 2FA para @%s en %d segundos", username, cooldown
+            )
+            time.sleep(cooldown)
+            cooldown = min(cooldown + 7, 30)
+            with contextlib.suppress(Exception):
+                adapter.resend_2fa_code(method)
+
+    warn(
+        f"No se pudo completar el login 2FA para @{username}. Volvé a intentarlo más tarde."
+    )
     mark_connected(username, False)
     _record_login_failure(username)
     return False
