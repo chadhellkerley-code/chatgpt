@@ -11,7 +11,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
-from playwright.sync_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+from playwright.sync_api import (
+    Browser,
+    BrowserContext,
+    ElementHandle,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+    sync_playwright,
+)
 
 from totp_store import generate_code as generate_totp_code
 
@@ -105,11 +112,13 @@ class InstagramPlaywrightSession:
         self._accept_cookies_if_present()
 
         message_button = self._locate_message_button()
+        with contextlib.suppress(PlaywrightTimeoutError):
+            page.wait_for_timeout(400)
         message_button.click()
         _human_delay(1.0, 2.0)
 
         try:
-            textarea = page.wait_for_selector("textarea", timeout=20000)
+            textarea = page.wait_for_selector("textarea", timeout=25000, state="visible")
         except PlaywrightTimeoutError as exc:  # pragma: no cover - requiere UI real
             raise RuntimeError("No se encontró el cuadro de mensaje en Instagram.") from exc
 
@@ -120,6 +129,13 @@ class InstagramPlaywrightSession:
         _human_delay(0.6, 1.4)
         page.keyboard.press("Enter")
         _human_delay(0.8, 1.6)
+
+        snippet = message.strip()
+        if snippet:
+            snippet = snippet.splitlines()[0][:60]
+            bubble_locator = page.locator("div[role='listitem']").filter(has_text=snippet)
+            with contextlib.suppress(PlaywrightTimeoutError):
+                bubble_locator.first.wait_for(state="visible", timeout=6000)
 
     # Internal helpers -------------------------------------------------------
     def _ensure_session(self) -> None:
@@ -210,39 +226,63 @@ class InstagramPlaywrightSession:
         page = self._page
         candidates = [
             "button[type='submit']",
+            "form button[type='submit']",
             "button:has-text('Iniciar sesión')",
             "button:has-text('Inicia sesión')",
             "button:has-text('Entrar')",
             "button:has-text('Log in')",
+            "button:has-text('Log In')",
             "div[role='button']:has-text('Iniciar sesión')",
             "div[role='button']:has-text('Log in')",
         ]
-        for selector in candidates:
-            locator = page.locator(selector)
-            if locator.count():
-                button = locator.first
-                with contextlib.suppress(PlaywrightTimeoutError):
-                    button.wait_for(state="visible", timeout=8000)
-                with contextlib.suppress(Exception):
-                    button.click()
-                    return
+        element = self._wait_for_click_target(candidates, timeout=25000)
+        if element is not None:
+            with contextlib.suppress(Exception):
+                element.click()
+                return
         # Fallback a enviar Enter si no se encuentra un botón visible
         page.keyboard.press("Enter")
 
     def _locate_message_button(self):
         assert self._page is not None
-        page = self._page
         candidates = [
             "button:has-text('Enviar mensaje')",
+            "button:has-text('Enviar mensaxe')",
             "button:has-text('Message')",
+            "button:has-text('Send message')",
             "div[role='button']:has-text('Enviar mensaje')",
             "div[role='button']:has-text('Message')",
+            "a:has-text('Message')",
+            "a:has-text('Enviar mensaje')",
         ]
-        for selector in candidates:
-            locator = page.locator(selector)
-            if locator.count() > 0:
-                return locator.first
-        raise RuntimeError("No se encontró el botón para enviar mensaje.")
+        element = self._wait_for_click_target(candidates, timeout=25000)
+        if element is None:
+            raise RuntimeError("No se encontró el botón para enviar mensaje.")
+        return element
+
+    def _wait_for_click_target(self, selectors: Sequence[str], *, timeout: int) -> Optional[ElementHandle]:
+        """Return the first visible element matching any selector across frames."""
+
+        assert self._page is not None
+        page = self._page
+        deadline = time.time() + timeout / 1000
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            wait_timeout = max(500, int(remaining * 1000))
+            frames = [page] + [frame for frame in page.frames if frame is not page]
+            for frame in frames:
+                for selector in selectors:
+                    try:
+                        element = frame.wait_for_selector(
+                            selector, timeout=wait_timeout, state="visible"
+                        )
+                    except PlaywrightTimeoutError:
+                        continue
+                    if element is not None:
+                        return element
+            _human_delay(0.2, 0.5)
 
     def _resolve_two_factor_challenge(self) -> None:
         payload = self._build_two_factor_payload()
