@@ -5,6 +5,7 @@ import contextlib
 import csv
 import logging
 import random
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -172,7 +173,9 @@ class InstagramPlaywrightSession:
         assert self._page is not None
         page = self._page
         logger.debug("Iniciando sesión en Instagram para @%s", self._username)
-        page.goto("https://www.instagram.com/accounts/login/", wait_until="domcontentloaded")
+        page.goto("https://www.instagram.com/accounts/login/", wait_until="networkidle")
+        with contextlib.suppress(PlaywrightTimeoutError):
+            page.wait_for_load_state("networkidle", timeout=30000)
         self._accept_cookies_if_present()
         _human_delay(1.0, 2.0)
 
@@ -224,9 +227,32 @@ class InstagramPlaywrightSession:
     def _submit_login_form(self) -> None:
         assert self._page is not None
         page = self._page
+        with contextlib.suppress(PlaywrightTimeoutError):
+            page.wait_for_selector("form button", timeout=20000)
+
+        label_patterns = [
+            re.compile(r"inicia?r? sesi[oó]n", re.IGNORECASE),
+            re.compile(r"entrar", re.IGNORECASE),
+            re.compile(r"log\s?in", re.IGNORECASE),
+            re.compile(r"connexion", re.IGNORECASE),
+            re.compile(r"se connecter", re.IGNORECASE),
+            re.compile(r"acceder", re.IGNORECASE),
+        ]
+        for pattern in label_patterns:
+            locator = page.get_by_role("button", name=pattern)
+            if locator.count():
+                with contextlib.suppress(PlaywrightTimeoutError):
+                    locator.first.wait_for(state="visible", timeout=6000)
+                with contextlib.suppress(Exception):
+                    locator.first.click()
+                    return
+
         candidates = [
-            "button[type='submit']",
+            "button[data-testid='login-button']",
+            "form button[data-testid='login-button']",
             "form button[type='submit']",
+            "button[type='submit']",
+            "form button[type='button']",
             "button:has-text('Iniciar sesión')",
             "button:has-text('Inicia sesión')",
             "button:has-text('Entrar')",
@@ -235,8 +261,10 @@ class InstagramPlaywrightSession:
             "div[role='button']:has-text('Iniciar sesión')",
             "div[role='button']:has-text('Log in')",
         ]
-        element = self._wait_for_click_target(candidates, timeout=25000)
+        element = self._wait_for_click_target(candidates, timeout=30000)
         if element is not None:
+            with contextlib.suppress(Exception):
+                element.scroll_into_view_if_needed()
             with contextlib.suppress(Exception):
                 element.click()
                 return
@@ -276,12 +304,19 @@ class InstagramPlaywrightSession:
                 for selector in selectors:
                     try:
                         element = frame.wait_for_selector(
-                            selector, timeout=wait_timeout, state="visible"
+                            selector, timeout=wait_timeout, state="attached"
                         )
                     except PlaywrightTimeoutError:
                         continue
-                    if element is not None:
-                        return element
+                    if element is None:
+                        continue
+                    is_visible = False
+                    with contextlib.suppress(Exception):
+                        if element.is_visible():
+                            is_visible = True
+                    if not is_visible:
+                        continue
+                    return element
             _human_delay(0.2, 0.5)
 
     def _resolve_two_factor_challenge(self) -> None:
