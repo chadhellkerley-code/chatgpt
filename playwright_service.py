@@ -123,7 +123,7 @@ class InstagramPlaywrightSession:
         page = self._page
         profile_url = f"https://www.instagram.com/{target_username.strip('/')}/"
         logger.debug("Abriendo perfil @%s", target_username)
-        page.goto(profile_url, wait_until="domcontentloaded")
+        page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
         with contextlib.suppress(PlaywrightTimeoutError):
             page.wait_for_load_state("domcontentloaded", timeout=30000)
         with contextlib.suppress(PlaywrightTimeoutError):
@@ -241,7 +241,11 @@ class InstagramPlaywrightSession:
         assert self._page is not None
         page = self._page
         logger.debug("Iniciando sesión en Instagram para @%s", self._username)
-        page.goto("https://www.instagram.com/accounts/login/", wait_until="domcontentloaded")
+        page.goto(
+            "https://www.instagram.com/accounts/login/",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
         with contextlib.suppress(PlaywrightTimeoutError):
             page.wait_for_load_state("domcontentloaded", timeout=30000)
         with contextlib.suppress(PlaywrightTimeoutError):
@@ -462,7 +466,11 @@ class InstagramPlaywrightSession:
         assert self._page is not None
         page = self._page
         try:
-            page.goto("https://www.instagram.com/", wait_until="domcontentloaded")
+            page.goto(
+                "https://www.instagram.com/",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
         except Exception as exc:
             logger.debug("Fallo al validar sesión almacenada para @%s: %s", self._username, exc)
             return False
