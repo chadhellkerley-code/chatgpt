@@ -16,13 +16,18 @@ from playwright.sync_api import (
     Browser,
     BrowserContext,
     ElementHandle,
+    Frame,
     Locator,
     Page,
     TimeoutError as PlaywrightTimeoutError,
     sync_playwright,
 )
 
+import pyotp
+
 from totp_store import generate_code as generate_totp_code
+from totp_store import has_secret as has_totp_secret
+from totp_store import save_secret as save_totp_secret
 
 logger = logging.getLogger(__name__)
 
@@ -454,11 +459,16 @@ class InstagramPlaywrightSession:
         challenge_present = any(
             frame.locator(selector).count() > 0 for frame in frames for selector in challenge_markers
         )
+        challenge_mode = self._detect_two_factor_mode(frames)
 
         if payload is None:
             if challenge_present:
+                if challenge_mode == "external":
+                    raise RuntimeError(
+                        "Esta cuenta requiere verificación externa por WhatsApp/SMS. El login automático no es posible."
+                    )
                 raise RuntimeError(
-                    "Se requiere un código de verificación en dos pasos para continuar, pero no se proporcionó."
+                    "Se requiere un código TOTP configurado para completar el inicio de sesión y no se encontró ninguno."
                 )
             return
 
@@ -508,6 +518,12 @@ class InstagramPlaywrightSession:
                     try:
                         code_input.wait_for(state="hidden", timeout=20000)
                     except PlaywrightTimeoutError as exc:
+                        updated_frames = [page] + [f for f in page.frames if f is not page]
+                        mode_after = self._detect_two_factor_mode(updated_frames)
+                        if mode_after == "external":
+                            raise RuntimeError(
+                                "Esta cuenta requiere verificación externa por WhatsApp/SMS. El login automático no es posible."
+                            ) from exc
                         raise RuntimeError(
                             "Instagram no aceptó el código de verificación proporcionado."
                         ) from exc
@@ -520,7 +536,12 @@ class InstagramPlaywrightSession:
         challenge_present = any(
             frame.locator(selector).count() > 0 for frame in frames for selector in challenge_markers
         )
+        challenge_mode = self._detect_two_factor_mode(frames)
         if challenge_present:
+            if challenge_mode == "external":
+                raise RuntimeError(
+                    "Esta cuenta requiere verificación externa por WhatsApp/SMS. El login automático no es posible."
+                )
             raise RuntimeError(
                 "No se encontró un campo válido para ingresar el código de verificación de Instagram."
             )
@@ -539,10 +560,65 @@ class InstagramPlaywrightSession:
             totp_code = generate_totp_code(username)
             if totp_code:
                 return _TwoFactorPayload(code=totp_code, label="TOTP")
+
+        secret_candidate = self._extract_totp_secret()
+        if secret_candidate:
+            if not has_totp_secret(username):
+                try:
+                    save_totp_secret(username, secret_candidate)
+                    logger.debug("Se registró el secreto TOTP para @%s", username)
+                except ValueError as exc:
+                    logger.warning(
+                        "El secreto TOTP provisto para @%s es inválido: %s", username, exc
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "No se pudo guardar el secreto TOTP para @%s: %s", username, exc
+                    )
+            with contextlib.suppress(Exception):
+                totp_code = generate_totp_code(username)
+                if totp_code:
+                    return _TwoFactorPayload(code=totp_code, label="TOTP")
+            with contextlib.suppress(Exception):
+                parsed_secret = secret_candidate
+                if parsed_secret.lower().startswith("otpauth://"):
+                    parsed_secret = pyotp.parse_uri(parsed_secret).secret
+                totp_code = pyotp.TOTP(parsed_secret.replace(" ", "")).now()
+                if totp_code:
+                    return _TwoFactorPayload(code=totp_code, label="TOTP")
+
         for key in ("totp_code", "2fa_code", "two_factor_code", "sms_code", "whatsapp_code"):
             value = (self._account.get(key) or "").strip()
             if value:
                 return _TwoFactorPayload(code=value, label=key)
+        return None
+
+    def _extract_totp_secret(self) -> Optional[str]:
+        candidates = (
+            "totp_secret",
+            "totp seed",
+            "totp_seed",
+            "totp key",
+            "totp_key",
+            "totp_uri",
+            "totp uri",
+            "authenticator_secret",
+            "authenticator",
+            "2fa_secret",
+            "two_factor_secret",
+        )
+        for key in candidates:
+            raw_value = self._account.get(key)
+            if not raw_value:
+                continue
+            candidate = raw_value.strip()
+            if not candidate:
+                continue
+            if candidate.lower().startswith("otpauth://") or len(candidate) >= 10:
+                return candidate
+        fallback = (self._account.get("totp") or "").strip()
+        if fallback and (fallback.lower().startswith("otpauth://") or len(fallback) >= 16):
+            return fallback
         return None
 
     def _persist_session(self) -> None:
@@ -637,6 +713,56 @@ class InstagramPlaywrightSession:
             page.wait_for_timeout(200)
 
         raise RuntimeError(f"No se encontró el campo de {description} en el formulario de inicio de sesión de Instagram.")
+
+    def _detect_two_factor_mode(self, frames: Sequence[Frame | Page]) -> str:
+        def _matches(markers: Sequence[str]) -> bool:
+            for frame in frames:
+                for marker in markers:
+                    try:
+                        if frame.locator(f"text=/{re.escape(marker)}/i").count():
+                            return True
+                    except Exception:
+                        continue
+            return False
+
+        external_markers = [
+            "sms",
+            "texto",
+            "text message",
+            "whatsapp",
+            "mensaje",
+        ]
+        external_buttons = [
+            "button:has-text('SMS')",
+            "button:has-text('WhatsApp')",
+            "button:has-text('Enviar SMS')",
+            "button:has-text('Enviar código por SMS')",
+            "button:has-text('Enviar código por WhatsApp')",
+            "button:has-text('Send code')",
+        ]
+        for frame in frames:
+            for selector in external_buttons:
+                try:
+                    if frame.locator(selector).count():
+                        return "external"
+                except Exception:
+                    continue
+        if _matches(external_markers):
+            return "external"
+
+        totp_markers = [
+            "authenticator",
+            "autenticación",
+            "autenticacion",
+            "authentication app",
+            "app de autenticación",
+            "app de verificación",
+            "verificación en dos pasos",
+            "verification code",
+        ]
+        if _matches(totp_markers):
+            return "totp"
+        return "unknown"
 
     def _detect_account_block(self) -> None:
         assert self._page is not None
@@ -878,12 +1004,34 @@ def send_messages_from_csv(
 
         proxy_payload = _proxy_payload(record)
 
+        totp_secret = (
+            record.get("totp_secret")
+            or record.get("totp secret")
+            or record.get("totp_seed")
+            or record.get("totp seed")
+            or record.get("totp_key")
+            or record.get("totp key")
+            or record.get("2fa_secret")
+            or record.get("2fa secret")
+            or record.get("two_factor_secret")
+            or record.get("two factor secret")
+        )
+        totp_uri = record.get("totp_uri") or record.get("totp uri") or ""
+        if not totp_secret and totp_uri:
+            totp_secret = totp_uri
+        if totp_secret and not (
+            totp_secret.strip().lower().startswith("otpauth://") or len(totp_secret.strip()) >= 10
+        ):
+            totp_secret = ""
+
         account_payload: Dict[str, str] = {
             "username": username,
             "password": password,
             "proxy_url": proxy_payload.get("proxy_url", ""),
             "proxy_user": proxy_payload.get("proxy_user", ""),
             "proxy_pass": proxy_payload.get("proxy_pass", ""),
+            "totp_secret": (totp_secret or "").strip(),
+            "totp_uri": totp_uri.strip(),
             "totp_code": record.get("totp")
             or record.get("totp_code")
             or record.get("totp code")
