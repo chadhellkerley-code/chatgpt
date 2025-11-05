@@ -173,8 +173,7 @@ class InstagramPlaywrightSession:
         _human_type(password_input, self._password)
         _human_delay(0.3, 0.7)
 
-        submit_button = page.locator("button:has-text('Iniciar sesión'), button[type='submit']").first
-        submit_button.click()
+        self._submit_login_form()
         _human_delay(1.0, 2.0)
 
         self._resolve_two_factor_challenge()
@@ -206,6 +205,30 @@ class InstagramPlaywrightSession:
                 _human_delay(0.3, 0.7)
                 break
 
+    def _submit_login_form(self) -> None:
+        assert self._page is not None
+        page = self._page
+        candidates = [
+            "button[type='submit']",
+            "button:has-text('Iniciar sesión')",
+            "button:has-text('Inicia sesión')",
+            "button:has-text('Entrar')",
+            "button:has-text('Log in')",
+            "div[role='button']:has-text('Iniciar sesión')",
+            "div[role='button']:has-text('Log in')",
+        ]
+        for selector in candidates:
+            locator = page.locator(selector)
+            if locator.count():
+                button = locator.first
+                with contextlib.suppress(PlaywrightTimeoutError):
+                    button.wait_for(state="visible", timeout=8000)
+                with contextlib.suppress(Exception):
+                    button.click()
+                    return
+        # Fallback a enviar Enter si no se encuentra un botón visible
+        page.keyboard.press("Enter")
+
     def _locate_message_button(self):
         assert self._page is not None
         page = self._page
@@ -228,14 +251,44 @@ class InstagramPlaywrightSession:
         assert self._page is not None
         page = self._page
         logger.debug("Resolviendo desafío 2FA con %s", payload.label)
-        with contextlib.suppress(PlaywrightTimeoutError):
-            code_input = page.wait_for_selector("input[name='verificationCode']", timeout=15000)
-            code_input.click()
-            _human_delay(0.2, 0.4)
-            _human_type(code_input, payload.code)
-            _human_delay(0.5, 1.0)
-            page.keyboard.press("Enter")
-            _human_delay(1.0, 2.0)
+        code_selectors = [
+            "input[name='verificationCode']",
+            "input[name='verification_code']",
+            "input[name='security_code']",
+            "input[name='otp']",
+            "input[aria-label*='código']",
+            "input[aria-label*='code']",
+        ]
+
+        # Algunas pantallas requieren solicitar el envío del código antes de poder ingresarlo.
+        for selector in (
+            "button:has-text('Enviar código')",
+            "button:has-text('Send security code')",
+            "button:has-text('Continuar')",
+            "button:has-text('Continuar como')",
+            "button:has-text('Siguiente')",
+        ):
+            locator = page.locator(selector)
+            if locator.count():
+                with contextlib.suppress(Exception):
+                    locator.first.click()
+                    _human_delay(0.6, 1.2)
+
+        for selector in code_selectors:
+            locator = page.locator(selector)
+            if locator.count():
+                code_input = locator.first
+                with contextlib.suppress(PlaywrightTimeoutError):
+                    code_input.wait_for(state="visible", timeout=15000)
+                code_input.click()
+                _human_delay(0.2, 0.4)
+                _human_type(code_input, payload.code)
+                _human_delay(0.5, 1.0)
+                page.keyboard.press("Enter")
+                _human_delay(1.0, 2.0)
+                return
+
+        logger.warning("Se solicitó 2FA pero no se identificó el campo de código para @%s", self._username)
 
     def _build_two_factor_payload(self) -> Optional[_TwoFactorPayload]:
         if not self._account:
