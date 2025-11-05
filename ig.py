@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import contextlib
 import logging
+import math
 import queue
 import random
-import math
 import threading
 import time
 from collections import defaultdict, deque
@@ -31,14 +32,12 @@ except Exception:  # pragma: no cover - si falta dateutil
 from accounts import (
     auto_login_with_saved_password,
     get_account,
-    has_valid_session_settings,
     list_all,
     mark_connected,
     prompt_login,
 )
 from config import SETTINGS
 from leads import load_list
-from proxy_manager import apply_proxy_to_client, record_proxy_failure, should_retry_proxy
 from runtime import (
     STOP_EVENT,
     ensure_logging,
@@ -48,7 +47,8 @@ from runtime import (
     sleep_with_stop,
     start_q_listener,
 )
-from session_store import has_session, load_into
+from session_store import has_session
+from playwright_service import InstagramPlaywrightSession
 from storage import (
     already_contacted,
     log_sent,
@@ -164,46 +164,20 @@ def get_message_totals() -> tuple[int, int]:
     return ok_total, error_total
 
 
-def _client_for(username: str):
-    from instagrapi import Client
-
+def _client_for(username: str) -> InstagramPlaywrightSession:
     account = get_account(username)
-    cl = Client()
-    binding = None
-    try:
-        binding = apply_proxy_to_client(cl, username, account, reason="envio")
-    except Exception as exc:
-        if account and account.get("proxy_url"):
-            record_proxy_failure(username, exc)
-            raise RuntimeError(
-                f"El proxy configurado para @{username} no respondió: {exc}"
-            ) from exc
-        logger.warning("Proxy no disponible para @%s: %s", username, exc, exc_info=False)
-
-    try:
-        load_into(cl, username)
-    except FileNotFoundError as exc:
-        mark_connected(username, False)
-        raise RuntimeError(f"No hay sesión guardada para {username}. Usá opción 1.") from exc
-    except Exception as exc:
-        if binding and should_retry_proxy(exc):
-            record_proxy_failure(username, exc)
-        mark_connected(username, False)
-        raise
-
-    if not has_valid_session_settings(cl):
-        mark_connected(username, False)
-        raise RuntimeError(
-            f"La sesión guardada para {username} no contiene credenciales activas. Iniciá sesión nuevamente."
-        )
-
+    if not account:
+        raise RuntimeError(f"No se encontró la cuenta {username}.")
+    session = InstagramPlaywrightSession(account, headless=True)
+    session.ensure_logged_in()
     mark_connected(username, True)
-    return cl
+    return session
 
 
 def _ensure_session(username: str) -> bool:
     try:
-        _client_for(username)
+        with contextlib.closing(_client_for(username)):
+            pass
         return True
     except Exception:
         return False
@@ -211,12 +185,9 @@ def _ensure_session(username: str) -> bool:
 
 def _send_dm(cl, to_username: str, message: str) -> bool:
     try:
-        uid = cl.user_id_from_username(to_username)
-        cl.direct_send(message, [uid])
+        cl.send_direct_message(to_username, message)
         return True
     except Exception as exc:
-        if should_retry_proxy(exc):
-            raise
         logger.debug("Error enviando DM a @%s: %s", to_username, exc, exc_info=False)
         return False
 
@@ -787,12 +758,10 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
         reason_label: str | None = None
         suggestion: str | None = None
         scope: str | None = None
-        max_retries = 3
-        retries = 0
         while not STOP_EVENT.is_set():
             try:
-                cl = _client_for(username)
-                success_flag = _send_dm(cl, lead, message)
+                with contextlib.closing(_client_for(username)) as cl:
+                    success_flag = _send_dm(cl, lead, message)
                 if not success_flag:
                     detail = "Instagram no confirmó el envío"
                     reason_code = reason_code or "send_failed"
@@ -800,35 +769,7 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
                     suggestion = suggestion or "Revisá si la cuenta puede enviar mensajes manualmente."
                     scope = scope or "account"
                 break
-            except Exception as exc:  # pragma: no cover - external SDK
-                if should_retry_proxy(exc):
-                    retries += 1
-                    record_proxy_failure(username, exc)
-                    wait_retry = min(30, 5 * retries)
-                    logger.warning(
-                        "Proxy error con @%s → @%s (intento %d/%d): %s",
-                        username,
-                        lead,
-                        retries,
-                        max_retries,
-                        exc,
-                        exc_info=False,
-                    )
-                    if retries >= max_retries:
-                        detail = "proxy sin respuesta"
-                        attention_message = (
-                            "El proxy configurado para @"
-                            f"{username} falló repetidamente. Revisá la opción 1 para actualizarlo o quitarlo."
-                        )
-                        reason_code = "proxy_unavailable"
-                        reason_label = "Proxy sin respuesta"
-                        suggestion = (
-                            "Actualizá o quitá el proxy configurado antes de continuar con esta cuenta."
-                        )
-                        scope = "account"
-                        break
-                    sleep_with_stop(wait_retry)
-                    continue
+            except Exception as exc:  # pragma: no cover - automatización externa
                 detail, diag_attention, code, label, suggestion_hint, scope_hint = _classify_exception(exc)
                 if code and not reason_code:
                     reason_code = code
