@@ -84,6 +84,8 @@ class Settings:
     low_profile_activity_threshold: int = 30
     low_profile_daily_cap: int = 15
     low_profile_delay_factor: int = 150
+    prompt_2fa_sms: bool = True
+    prompt_2fa_timeout_seconds: int = 180
 
 
 def _validated_ranges(values: Dict[str, str]) -> Tuple[int, int, int, int]:
@@ -195,6 +197,16 @@ def load_settings() -> Settings:
         low_profile_activity_threshold=low_profile_activity_threshold,
         low_profile_daily_cap=low_profile_daily_cap,
         low_profile_delay_factor=low_profile_delay_factor,
+        prompt_2fa_sms=_coerce_bool(
+            env_values.get("PROMPT_2FA_SMS"), defaults.prompt_2fa_sms
+        ),
+        prompt_2fa_timeout_seconds=max(
+            10,
+            _coerce_int(
+                env_values.get("PROMPT_2FA_TIMEOUT_SECONDS"),
+                defaults.prompt_2fa_timeout_seconds,
+            ),
+        ),
     )
 
 

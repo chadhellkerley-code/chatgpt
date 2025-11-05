@@ -4,18 +4,152 @@
 
 from __future__ import annotations
 
+import base64
+import contextlib
+import hashlib
+import json
+import logging
 import os
 import re
+import tempfile
+import time
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional
+
+from cryptography.fernet import Fernet, InvalidToken
 
 from paths import runtime_base
+
+logger = logging.getLogger(__name__)
 
 _BASE = runtime_base(Path(__file__).resolve().parent)
 _BASE.mkdir(parents=True, exist_ok=True)
 _OLD_DIR = _BASE / ".sessions"
 _NEW_DIR = _BASE / "storage" / "sessions"
 _CLIENT_ALIAS_RE = re.compile(r"[^a-z0-9_-]+")
+_LOCK_SUFFIX = ".lock"
+_LOCK_TIMEOUT = float(os.environ.get("SESSION_LOCK_TIMEOUT", "10"))
+_MAGIC = b"IGSESS1"
+
+_ENCRYPTION_KEY = os.environ.get("SESSION_ENCRYPTION_KEY", "").strip()
+
+
+def _build_fernet(raw_key: str) -> Optional[Fernet]:
+    if not raw_key:
+        return None
+    key_bytes = raw_key.strip().encode("utf-8")
+    try:
+        return Fernet(key_bytes)
+    except Exception:
+        digest = hashlib.sha256(key_bytes).digest()
+        derived = base64.urlsafe_b64encode(digest)
+        logger.warning("La clave de sesión no es un token válido; se derivó un secreto seguro.")
+        return Fernet(derived)
+
+
+_FERNET = _build_fernet(_ENCRYPTION_KEY)
+
+
+def _fernet_instance() -> Optional[Fernet]:
+    return _FERNET
+
+
+def _lock_path(path: Path) -> Path:
+    return path.with_suffix(path.suffix + _LOCK_SUFFIX)
+
+
+class _FileLock:
+    def __init__(self, path: Path, timeout: float) -> None:
+        self._path = path
+        self._timeout = timeout
+        self._handle: Optional[object] = None
+
+    def __enter__(self):
+        start = time.time()
+        delay = 0.05
+        while True:
+            self._handle = open(self._path, "a+b")
+            try:
+                if os.name == "nt":
+                    import msvcrt  # type: ignore
+
+                    msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl  # type: ignore
+
+                    fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                self._handle.close()
+                if time.time() - start >= self._timeout:
+                    raise TimeoutError(f"No se pudo adquirir lock para {self._path}")
+                time.sleep(delay)
+                delay = min(delay * 1.7, 0.5)
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._handle is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt  # type: ignore
+
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl  # type: ignore
+
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._handle.close()
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        temp_name = tmp.name
+    os.replace(temp_name, path)
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
+
+
+def _encrypt_payload(data: bytes) -> bytes:
+    fernet = _fernet_instance()
+    if not fernet:
+        return data
+    token = fernet.encrypt(data)
+    return _MAGIC + token
+
+
+def _decrypt_payload(data: bytes) -> bytes:
+    if data.startswith(_MAGIC):
+        fernet = _fernet_instance()
+        if not fernet:
+            raise RuntimeError(
+                "Se encontró una sesión cifrada pero SESSION_ENCRYPTION_KEY no está configurada."
+            )
+        token = data[len(_MAGIC) :]
+        return fernet.decrypt(token)
+    return data
+
+
+def _collect_settings_bytes(client) -> bytes:
+    if hasattr(client, "get_settings"):
+        settings = client.get_settings()
+        if isinstance(settings, (bytes, bytearray)):
+            return bytes(settings)
+        if isinstance(settings, str):
+            return settings.encode("utf-8")
+        return json.dumps(settings, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+    try:
+        temp.close()
+        client.dump_settings(temp.name)
+        return Path(temp.name).read_bytes()
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(temp.name)
 
 
 def _session_dirs() -> Iterable[Path]:
@@ -79,9 +213,34 @@ def has_session(username: str) -> bool:
 def load_into(client, username: str) -> Path:
     """Carga la primera sesión disponible en el cliente."""
     for path in session_candidates(username):
-        if path.exists():
-            client.load_settings(str(path))
-            return path
+        if not path.exists():
+            continue
+        lock_file = _lock_path(path)
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with _FileLock(lock_file, _LOCK_TIMEOUT):
+                raw = path.read_bytes()
+        except TimeoutError as exc:
+            logger.warning("No se pudo obtener lock para la sesión %s: %s", path, exc)
+            continue
+        except OSError as exc:
+            logger.warning("No se pudo leer la sesión %s: %s", path, exc)
+            continue
+        try:
+            payload = _decrypt_payload(raw)
+        except (InvalidToken, RuntimeError) as exc:
+            logger.error("No se pudo descifrar la sesión %s: %s", path, exc)
+            continue
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
+            tmp.write(payload)
+            tmp.flush()
+            temp_name = tmp.name
+        try:
+            client.load_settings(temp_name)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(temp_name)
+        return path
     raise FileNotFoundError(f"No existe sesión guardada para {username}.")
 
 
@@ -101,17 +260,34 @@ def save_from(client, username: str) -> Path:
     """Guarda la sesión en el nuevo formato y replica en el legado."""
     ensure_dirs()
     username = username.strip().lstrip("@")
-    client_path = None
+    payload = _collect_settings_bytes(client)
+    prepared = _encrypt_payload(payload)
+
+    paths: List[Path] = []
     directory = _client_session_dir()
     if directory:
-        client_path = directory / f"session_{username}.json"
-        client.dump_settings(str(client_path))
+        paths.append(directory / f"session_{username}.json")
     new_path = _NEW_DIR / f"{username}.json"
-    client.dump_settings(str(new_path))
-    # replica para mantener compatibilidad con scripts antiguos
-    legacy_path = _OLD_DIR / f"{username}.json"
-    client.dump_settings(str(legacy_path))
-    return client_path or new_path
+    paths.append(new_path)
+    paths.append(_OLD_DIR / f"{username}.json")
+
+    saved_path: Optional[Path] = None
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = _lock_path(path)
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with _FileLock(lock_file, _LOCK_TIMEOUT):
+                _atomic_write(path, prepared)
+        except TimeoutError as exc:
+            logger.warning("No se pudo guardar la sesión en %s: %s", path, exc)
+            continue
+        except OSError as exc:
+            logger.warning("Error escribiendo la sesión en %s: %s", path, exc)
+            continue
+        if saved_path is None:
+            saved_path = path
+    return saved_path or new_path
 
 
 def remove(username: str) -> None:
@@ -119,6 +295,9 @@ def remove(username: str) -> None:
         try:
             if path.exists():
                 path.unlink()
+            lock_file = _lock_path(path)
+            if lock_file.exists():
+                lock_file.unlink()
         except Exception:
             pass
 

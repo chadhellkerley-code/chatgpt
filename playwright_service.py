@@ -6,11 +6,13 @@ import csv
 import logging
 import random
 import re
+import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 from playwright.sync_api import (
     Browser,
@@ -25,6 +27,7 @@ from playwright.sync_api import (
 
 import pyotp
 
+from config import SETTINGS
 from totp_store import generate_code as generate_totp_code
 from totp_store import has_secret as has_totp_secret
 from totp_store import save_secret as save_totp_secret
@@ -33,6 +36,109 @@ logger = logging.getLogger(__name__)
 
 _PLAYWRIGHT_SESSIONS_DIR = Path("storage") / "playwright_sessions"
 _PLAYWRIGHT_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+_MANUAL_CODE_ATTEMPTS = 3
+_MANUAL_CODE_MIN_LEN = 4
+_MANUAL_CODE_MAX_LEN = 8
+
+
+class TwoFactorCodeRejected(RuntimeError):
+    """Raised when Instagram keeps the 2FA challenge active after submitting a code."""
+
+
+def _sanitize_two_factor_code(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    digits = re.sub(r"\D", "", value)
+    if _MANUAL_CODE_MIN_LEN <= len(digits) <= _MANUAL_CODE_MAX_LEN:
+        return digits
+    return None
+
+
+def _prompt_two_factor_code_cli(
+    username: str,
+    method: str,
+    attempt: int,
+    timeout: Optional[int],
+) -> Optional[str]:
+    label = method.lower()
+    prompt = f"Ingrese el código recibido por {label} para {username}: "
+    logger.info(
+        "2FA manual solicitado para @%s vía %s (intento %d)",
+        username,
+        label,
+        attempt,
+    )
+    try:
+        value = _read_input_with_timeout(prompt, timeout)
+    except Exception as exc:  # pragma: no cover - interacción dependiente de entorno
+        logger.warning(
+            "Error leyendo el código 2FA manual para @%s (%s): %s",
+            username,
+            method,
+            exc,
+        )
+        return None
+    sanitized = _sanitize_two_factor_code(value)
+    if sanitized is None:
+        logger.warning(
+            "Código 2FA inválido proporcionado para @%s vía %s (intento %d)",
+            username,
+            method,
+            attempt,
+        )
+    return sanitized
+
+
+def _read_input_with_timeout(prompt: str, timeout: Optional[int]) -> Optional[str]:
+    if timeout is not None and timeout <= 0:
+        timeout = None
+
+    if timeout is None:
+        return input(prompt)
+
+    deadline = time.time() + timeout
+    print(prompt, end="", flush=True)
+
+    if sys.platform.startswith("win"):
+        import msvcrt  # type: ignore
+
+        buffer: list[str] = []
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                print("\n[Tiempo excedido esperando el código]\n", flush=True)
+                return None
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ("\r", "\n"):
+                    print()
+                    return "".join(buffer)
+                if ch == "\b":
+                    if buffer:
+                        buffer.pop()
+                        print("\b \b", end="", flush=True)
+                    continue
+                buffer.append(ch)
+                print("*", end="", flush=True)
+            else:
+                time.sleep(min(0.2, max(0.0, remaining)))
+    else:
+        import select
+
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                print("\n[Tiempo excedido esperando el código]\n", flush=True)
+                return None
+            ready, _, _ = select.select([sys.stdin], [], [], min(1.0, max(0.1, remaining)))
+            if ready:
+                line = sys.stdin.readline()
+                if not line:
+                    return None
+                return line.rstrip("\n")
+
+    return None
 
 
 def _human_delay(min_seconds: float = 0.4, max_seconds: float = 1.1) -> None:
@@ -97,6 +203,9 @@ class InstagramPlaywrightSession:
         headless: bool = True,
         proxy_override: Optional[Dict[str, str]] = None,
         session_storage_dir: Optional[Path] = None,
+        two_factor_code_provider: Optional[
+            Callable[[str, str, int, Optional[int]], Optional[str]]
+        ] = None,
     ) -> None:
         self._account = account
         self._username = (account.get("username") or "").strip()
@@ -114,6 +223,12 @@ class InstagramPlaywrightSession:
         root.mkdir(parents=True, exist_ok=True)
         self._storage_path = root / f"{self._username}.json"
         self._blocked_reason: Optional[str] = None
+        default_provider = _prompt_two_factor_code_cli if SETTINGS.prompt_2fa_sms else None
+        self._two_factor_code_provider = two_factor_code_provider or default_provider
+        self._two_factor_prompt_timeout = getattr(
+            SETTINGS, "prompt_2fa_timeout_seconds", 0
+        )
+        self._manual_code_attempts = _MANUAL_CODE_ATTEMPTS
 
     # Context manager helpers -------------------------------------------------
     def close(self) -> None:
@@ -442,7 +557,6 @@ class InstagramPlaywrightSession:
             _human_delay(0.2, 0.5)
 
     def _resolve_two_factor_challenge(self) -> None:
-        payload = self._build_two_factor_payload()
         assert self._page is not None
         page = self._page
         challenge_markers = [
@@ -455,24 +569,73 @@ class InstagramPlaywrightSession:
             "input[name='verification_code']",
             "input[name='otp']",
         ]
-        frames = [page] + [frame for frame in page.frames if frame is not page]
+
+        def _current_frames() -> list[Frame | Page]:
+            return [page] + [frame for frame in page.frames if frame is not page]
+
+        frames = _current_frames()
+        challenge_present = any(
+            frame.locator(selector).count() > 0 for frame in frames for selector in challenge_markers
+        )
+        challenge_mode = self._detect_two_factor_mode(frames)
+        manual_label: Optional[str] = None
+        if challenge_mode in {"sms", "whatsapp"}:
+            manual_label = challenge_mode
+        elif challenge_mode == "external":
+            manual_label = "sms/whatsapp"
+
+        attempts = self._manual_code_attempts if manual_label else 1
+
+        for attempt in range(1, attempts + 1):
+            payload = self._build_two_factor_payload()
+            if payload is None and manual_label:
+                payload = self._manual_two_factor_payload(manual_label, attempt)
+            if payload is None:
+                break
+            logger.debug("Resolviendo desafío 2FA con %s", payload.label)
+            try:
+                if self._submit_two_factor_code(payload, challenge_markers):
+                    return
+            except TwoFactorCodeRejected:
+                if manual_label and attempt < attempts:
+                    logger.warning(
+                        "Instagram rechazó el código 2FA proporcionado para @%s (intento %d)",
+                        self._username,
+                        attempt,
+                    )
+                    continue
+                raise RuntimeError("Instagram no aceptó el código de verificación proporcionado.")
+
+        frames = _current_frames()
         challenge_present = any(
             frame.locator(selector).count() > 0 for frame in frames for selector in challenge_markers
         )
         challenge_mode = self._detect_two_factor_mode(frames)
 
-        if payload is None:
-            if challenge_present:
-                if challenge_mode == "external":
-                    raise RuntimeError(
-                        "Esta cuenta requiere verificación externa por WhatsApp/SMS. El login automático no es posible."
-                    )
+        if challenge_present:
+            if challenge_mode in {"sms", "whatsapp", "external"}:
                 raise RuntimeError(
-                    "Se requiere un código TOTP configurado para completar el inicio de sesión y no se encontró ninguno."
+                    "Esta cuenta requiere verificación externa por WhatsApp/SMS. El login automático no es posible."
                 )
-            return
+            raise RuntimeError(
+                "Se requiere un código TOTP configurado para completar el inicio de sesión y no se encontró ninguno."
+            )
 
-        logger.debug("Resolviendo desafío 2FA con %s", payload.label)
+        if manual_label and payload is None:
+            raise RuntimeError(
+                "No se recibió un código 2FA válido para completar el inicio de sesión."
+            )
+
+        logger.debug(
+            "No se detectó un formulario de código 2FA para @%s tras el intento de verificación.",
+            self._username,
+        )
+
+    def _submit_two_factor_code(
+        self, payload: _TwoFactorPayload, challenge_markers: Sequence[str]
+    ) -> bool:
+        assert self._page is not None
+        page = self._page
         code_selectors = [
             "input[name='verificationCode']",
             "input[name='verification_code']",
@@ -485,7 +648,6 @@ class InstagramPlaywrightSession:
             "input[placeholder*='code']",
         ]
 
-        # Algunas pantallas requieren solicitar el envío del código antes de poder ingresarlo.
         for selector in (
             "button:has-text('Enviar código')",
             "button:has-text('Send security code')",
@@ -500,57 +662,44 @@ class InstagramPlaywrightSession:
                     _human_delay(0.6, 1.2)
 
         frames = [page] + [frame for frame in page.frames if frame is not page]
-
         for frame in frames:
             for selector in code_selectors:
                 locator = frame.locator(selector)
-                if locator.count():
-                    code_input = locator.first
-                    with contextlib.suppress(PlaywrightTimeoutError):
-                        code_input.wait_for(state="visible", timeout=20000)
-                    code_input.click()
-                    _human_delay(0.2, 0.4)
-                    _human_type(code_input, payload.code)
-                    _human_delay(0.5, 1.0)
-                    with contextlib.suppress(Exception):
-                        code_input.press("Enter")
-                    _human_delay(1.0, 2.0)
-                    try:
-                        code_input.wait_for(state="hidden", timeout=20000)
-                    except PlaywrightTimeoutError as exc:
-                        updated_frames = [page] + [f for f in page.frames if f is not page]
-                        mode_after = self._detect_two_factor_mode(updated_frames)
-                        if mode_after == "external":
-                            raise RuntimeError(
-                                "Esta cuenta requiere verificación externa por WhatsApp/SMS. El login automático no es posible."
-                            ) from exc
-                        raise RuntimeError(
-                            "Instagram no aceptó el código de verificación proporcionado."
-                        ) from exc
-                    except Exception:
-                        # La navegación puede invalidar el handle; considérese éxito.
-                        pass
-                    return
+                if not locator.count():
+                    continue
+                code_input = locator.first
+                with contextlib.suppress(PlaywrightTimeoutError):
+                    code_input.wait_for(state="visible", timeout=20000)
+                code_input.click()
+                _human_delay(0.2, 0.4)
+                _human_type(code_input, payload.code)
+                _human_delay(0.5, 1.0)
+                with contextlib.suppress(Exception):
+                    code_input.press("Enter")
+                _human_delay(1.0, 2.0)
+                try:
+                    code_input.wait_for(state="hidden", timeout=20000)
+                except PlaywrightTimeoutError as exc:
+                    updated_frames = [page] + [f for f in page.frames if f is not page]
+                    mode_after = self._detect_two_factor_mode(updated_frames)
+                    if mode_after in {"external", "sms", "whatsapp", "totp"}:
+                        raise TwoFactorCodeRejected() from exc
+                    raise RuntimeError(
+                        "Instagram no aceptó el código de verificación proporcionado."
+                    ) from exc
+                except Exception:
+                    pass
+                return True
 
         frames = [page] + [frame for frame in page.frames if frame is not page]
         challenge_present = any(
             frame.locator(selector).count() > 0 for frame in frames for selector in challenge_markers
         )
-        challenge_mode = self._detect_two_factor_mode(frames)
         if challenge_present:
-            if challenge_mode == "external":
-                raise RuntimeError(
-                    "Esta cuenta requiere verificación externa por WhatsApp/SMS. El login automático no es posible."
-                )
             raise RuntimeError(
                 "No se encontró un campo válido para ingresar el código de verificación de Instagram."
             )
-
-        logger.debug(
-            "No se detectó un formulario de código 2FA para @%s tras el intento de verificación.",
-            self._username,
-        )
-        return
+        return False
 
     def _build_two_factor_payload(self) -> Optional[_TwoFactorPayload]:
         if not self._account:
@@ -592,6 +741,35 @@ class InstagramPlaywrightSession:
             if value:
                 return _TwoFactorPayload(code=value, label=key)
         return None
+
+    def _manual_two_factor_payload(
+        self, method: str, attempt: int
+    ) -> Optional[_TwoFactorPayload]:
+        provider = self._two_factor_code_provider
+        if provider is None:
+            logger.info(
+                "2FA manual deshabilitado para @%s (método %s)",
+                self._username,
+                method,
+            )
+            return None
+        code = provider(
+            self._username,
+            method,
+            attempt,
+            self._two_factor_prompt_timeout,
+        )
+        sanitized = _sanitize_two_factor_code(code)
+        if sanitized is None:
+            return None
+        label = method.upper()
+        logger.info(
+            "Se recibió código 2FA manual para @%s vía %s (intento %d)",
+            self._username,
+            method,
+            attempt,
+        )
+        return _TwoFactorPayload(code=sanitized, label=label)
 
     def _extract_totp_secret(self) -> Optional[str]:
         candidates = (
@@ -725,12 +903,16 @@ class InstagramPlaywrightSession:
                         continue
             return False
 
-        external_markers = [
+        whatsapp_markers = [
+            "whatsapp",
+            "wasap",
+            "wa",
+        ]
+        sms_markers = [
             "sms",
             "texto",
             "text message",
-            "whatsapp",
-            "mensaje",
+            "mensaje de texto",
         ]
         external_buttons = [
             "button:has-text('SMS')",
@@ -739,16 +921,30 @@ class InstagramPlaywrightSession:
             "button:has-text('Enviar código por SMS')",
             "button:has-text('Enviar código por WhatsApp')",
             "button:has-text('Send code')",
+            "button:has-text('Send SMS')",
+            "button:has-text('Send WhatsApp')",
         ]
         for frame in frames:
             for selector in external_buttons:
                 try:
-                    if frame.locator(selector).count():
-                        return "external"
+                    locator = frame.locator(selector)
                 except Exception:
                     continue
-        if _matches(external_markers):
-            return "external"
+                if not locator.count():
+                    continue
+                try:
+                    text = locator.first.inner_text().lower()
+                except Exception:
+                    text = ""
+                if any(word in text for word in whatsapp_markers):
+                    return "whatsapp"
+                if any(word in text for word in sms_markers):
+                    return "sms"
+                return "external"
+        if _matches(whatsapp_markers):
+            return "whatsapp"
+        if _matches(sms_markers):
+            return "sms"
 
         totp_markers = [
             "authenticator",
@@ -883,6 +1079,9 @@ def login_account_with_playwright(
     headless: bool = True,
     proxy_override: Optional[Dict[str, str]] = None,
     session_storage_dir: Optional[Path] = None,
+    two_factor_code_provider: Optional[
+        Callable[[str, str, int, Optional[int]], Optional[str]]
+    ] = None,
 ) -> bool:
     """Perform a Playwright-based login for an account and persist the session."""
 
@@ -892,6 +1091,7 @@ def login_account_with_playwright(
             headless=headless,
             proxy_override=proxy_override,
             session_storage_dir=session_storage_dir,
+            two_factor_code_provider=two_factor_code_provider,
         )
     except Exception as exc:
         logger.warning(
@@ -1090,4 +1290,9 @@ def send_messages_from_csv(
     return results
 
 
-__all__ = ["BulkSendResult", "InstagramPlaywrightSession", "send_messages_from_csv"]
+__all__ = [
+    "BulkSendResult",
+    "InstagramPlaywrightSession",
+    "login_account_with_playwright",
+    "send_messages_from_csv",
+]
