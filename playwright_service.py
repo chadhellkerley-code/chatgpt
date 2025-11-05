@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import contextlib
+import csv
 import logging
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict, Optional
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence
 
 from playwright.sync_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
@@ -32,10 +35,20 @@ class _TwoFactorPayload:
     label: str
 
 
+@dataclass
+class BulkSendResult:
+    """Result of attempting to send a DM from a CSV-provisioned account."""
+
+    username: str
+    target: str
+    status: str
+    error: Optional[str] = None
+
+
 class InstagramPlaywrightSession:
     """Encapsulates a Playwright browser session for Instagram automation."""
 
-    def __init__(self, account: Dict[str, str], *, headless: bool = True) -> None:
+    def __init__(self, account: Dict[str, str], *, headless: bool = True, proxy_override: Optional[Dict[str, str]] = None) -> None:
         self._account = account
         self._username = (account.get("username") or "").strip()
         self._password = (account.get("password") or "").strip()
@@ -47,6 +60,7 @@ class InstagramPlaywrightSession:
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._logged_in = False
+        self._proxy_settings = self._extract_proxy_settings(proxy_override)
 
     # Context manager helpers -------------------------------------------------
     def close(self) -> None:
@@ -130,6 +144,8 @@ class InstagramPlaywrightSession:
                 "--no-sandbox",
             ],
         }
+        if self._proxy_settings:
+            browser_args["proxy"] = self._proxy_settings
         self._browser = self._playwright.chromium.launch(**browser_args)
         self._context = self._browser.new_context(locale="es-ES", timezone_id="America/Argentina/Buenos_Aires")
         self._page = self._context.new_page()
@@ -235,5 +251,197 @@ class InstagramPlaywrightSession:
                 return _TwoFactorPayload(code=value, label=key)
         return None
 
+    def _extract_proxy_settings(self, proxy_override: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+        """Build the Playwright proxy settings for this session if available."""
 
-__all__ = ["InstagramPlaywrightSession"]
+        def _pick(mapping: Dict[str, str], *keys: str) -> Optional[str]:
+            for key in keys:
+                value = mapping.get(key)
+                if value:
+                    text = str(value).strip()
+                    if text:
+                        return text
+            return None
+
+        candidate: Dict[str, str] = {}
+        if proxy_override:
+            candidate.update(proxy_override)
+        for key in ("proxy_url", "proxy", "proxy server", "server", "url"):
+            value = self._account.get(key)
+            if value:
+                candidate.setdefault(key, value)
+        if not candidate:
+            return None
+        server = _pick(candidate, "proxy_url", "proxy", "proxy server", "server", "url")
+        if not server:
+            return None
+        proxy_settings: Dict[str, str] = {"server": server}
+        username = _pick(candidate, "proxy_user", "proxy_username", "proxyuser")
+        if username:
+            proxy_settings["username"] = username
+        password = _pick(candidate, "proxy_pass", "proxy_password", "proxypass")
+        if password:
+            proxy_settings["password"] = password
+        logger.debug("Proxy configurado para @%s", self._username)
+        return proxy_settings
+
+
+def _chunked(sequence: Sequence[Dict[str, str]], size: int) -> Iterable[List[Dict[str, str]]]:
+    for index in range(0, len(sequence), size):
+        yield list(sequence[index : index + size])
+
+
+def _load_accounts_from_csv(path: Path) -> List[Dict[str, str]]:
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        rows: List[Dict[str, str]] = []
+        for raw_row in reader:
+            if not raw_row:
+                continue
+            normalized = {
+                (key or "").strip().lower(): (value or "").strip()
+                for key, value in raw_row.items()
+                if key is not None
+            }
+            username = normalized.get("username") or normalized.get("user")
+            password = normalized.get("password")
+            if not username or not password:
+                continue
+            rows.append(normalized)
+        return rows
+
+
+def send_messages_from_csv(
+    csv_path: str,
+    default_target: str,
+    default_message: str,
+    *,
+    batch_size: int = 10,
+    headless: bool = True,
+) -> List[BulkSendResult]:
+    """Process Instagram accounts defined in a CSV concurrently and send a DM."""
+
+    path = Path(csv_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"No se encontró el archivo CSV: {path}")
+
+    if batch_size < 1:
+        raise ValueError("batch_size debe ser mayor o igual a 1")
+
+    accounts = _load_accounts_from_csv(path)
+    if not accounts:
+        logger.warning("El CSV %s no contiene cuentas válidas para procesar.", path)
+        return []
+
+    normalized_target = (default_target or "").strip().lstrip("@")
+    normalized_message = (default_message or "").strip()
+    if not normalized_target:
+        raise ValueError("Se requiere un usuario objetivo para enviar mensajes.")
+    if not normalized_message:
+        raise ValueError("Se requiere un mensaje para enviar.")
+
+    results: List[BulkSendResult] = []
+    chunk_size = max(10, batch_size)
+
+    def _proxy_payload(data: Dict[str, str]) -> Dict[str, str]:
+        payload: Dict[str, str] = {}
+        server = (
+            data.get("proxy_url")
+            or data.get("proxy")
+            or data.get("proxy server")
+            or data.get("server")
+            or data.get("url")
+        )
+        if server:
+            payload["proxy_url"] = server
+        user = (
+            data.get("proxy_user")
+            or data.get("proxy username")
+            or data.get("proxy_username")
+            or data.get("proxy user")
+        )
+        if user:
+            payload["proxy_user"] = user
+        password = (
+            data.get("proxy_pass")
+            or data.get("proxy password")
+            or data.get("proxy_password")
+            or data.get("proxy pass")
+        )
+        if password:
+            payload["proxy_pass"] = password
+        return payload
+
+    def _send_from_record(record: Dict[str, str]) -> BulkSendResult:
+        username = (record.get("username") or record.get("user") or "").lstrip("@")
+        password = record.get("password") or ""
+        target = (record.get("target") or record.get("lead") or normalized_target).lstrip("@")
+        message = record.get("message") or normalized_message
+
+        proxy_payload = _proxy_payload(record)
+
+        account_payload: Dict[str, str] = {
+            "username": username,
+            "password": password,
+            "proxy_url": proxy_payload.get("proxy_url", ""),
+            "proxy_user": proxy_payload.get("proxy_user", ""),
+            "proxy_pass": proxy_payload.get("proxy_pass", ""),
+            "totp_code": record.get("totp")
+            or record.get("totp_code")
+            or record.get("totp code")
+            or record.get("2fa code")
+            or "",
+            "sms_code": record.get("sms_code") or record.get("sms code") or record.get("sms"),
+            "whatsapp_code": record.get("whatsapp_code")
+            or record.get("whatsapp code")
+            or record.get("whatsapp"),
+            "two_factor_code": record.get("two_factor_code")
+            or record.get("two factor code")
+            or record.get("twofactor"),
+        }
+
+        session: Optional[InstagramPlaywrightSession] = None
+        try:
+            try:
+                session = InstagramPlaywrightSession(account_payload, headless=headless)
+            except Exception as exc:  # pragma: no cover - requiere entorno Playwright real
+                logger.error("No se pudo inicializar sesión para @%s: %s", username, exc, exc_info=False)
+                return BulkSendResult(username=username, target=target, status="init_failed", error=str(exc))
+
+            try:
+                session.ensure_logged_in()
+            except Exception as exc:  # pragma: no cover - requiere entorno Playwright real
+                logger.error("Fallo el inicio de sesión para @%s: %s", username, exc, exc_info=False)
+                return BulkSendResult(username=username, target=target, status="login_failed", error=str(exc))
+
+            try:
+                session.send_direct_message(target, message)
+                return BulkSendResult(username=username, target=target, status="sent")
+            except Exception as exc:  # pragma: no cover - requiere entorno Playwright real
+                logger.error(
+                    "No se pudo enviar mensaje desde @%s → @%s: %s", username, target, exc, exc_info=False
+                )
+                return BulkSendResult(username=username, target=target, status="send_failed", error=str(exc))
+        finally:
+            if session is not None:
+                session.close()
+
+    for batch in _chunked(accounts, chunk_size):
+        with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+            futures = {executor.submit(_send_from_record, record): record for record in batch}
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                except Exception as exc:  # pragma: no cover - requiere ejecución real concurrente
+                    record = futures[future]
+                    username = record.get("username") or record.get("user") or ""
+                    target = record.get("target") or record.get("lead") or normalized_target
+                    logger.error("Excepción inesperada con @%s: %s", username, exc, exc_info=False)
+                    results.append(BulkSendResult(username=username, target=target, status="error", error=str(exc)))
+                else:
+                    results.append(result)
+
+    return results
+
+
+__all__ = ["BulkSendResult", "InstagramPlaywrightSession", "send_messages_from_csv"]

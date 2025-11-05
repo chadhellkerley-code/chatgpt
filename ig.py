@@ -48,7 +48,7 @@ from runtime import (
     start_q_listener,
 )
 from session_store import has_session
-from playwright_service import InstagramPlaywrightSession
+from playwright_service import InstagramPlaywrightSession, send_messages_from_csv
 from storage import (
     already_contacted,
     log_sent,
@@ -1037,11 +1037,75 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Enviar mensajes rotando cuentas")
+    parser = argparse.ArgumentParser(description="Herramientas de envío de mensajes para Instagram")
     parser.add_argument(
         "--concurrency",
         type=int,
-        help="Cantidad de cuentas enviando en simultáneo",
+        help="Cantidad de cuentas enviando en simultáneo (modo interactivo)",
+    )
+    parser.add_argument(
+        "--csv",
+        help="Ruta a un CSV con cuentas para procesar en paralelo",
+    )
+    parser.add_argument(
+        "--lead",
+        help="Usuario objetivo para el modo CSV",
+    )
+    parser.add_argument(
+        "--message",
+        help="Mensaje a enviar en el modo CSV",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=10,
+        help="Cantidad de cuentas a procesar por tanda (mínimo 10)",
+    )
+    parser.add_argument(
+        "--headed",
+        action="store_true",
+        help="Mostrar el navegador durante el procesamiento del CSV",
     )
     args = parser.parse_args()
+
+    if args.csv:
+        if not args.lead:
+            parser.error("--lead es obligatorio cuando se usa --csv")
+        if not args.message:
+            parser.error("--message es obligatorio cuando se usa --csv")
+
+        ensure_logging(
+            quiet=SETTINGS.quiet,
+            log_dir=SETTINGS.log_dir,
+            log_file=SETTINGS.log_file,
+        )
+
+        print(
+            style_text(
+                "Procesando cuentas desde CSV en paralelo...",
+                color=Fore.CYAN,
+                bold=True,
+            )
+        )
+        results = send_messages_from_csv(
+            args.csv,
+            args.lead,
+            args.message,
+            batch_size=args.batch_size,
+            headless=not args.headed,
+        )
+        total = len(results)
+        sent = sum(1 for item in results if item.status == "sent")
+        failed = [item for item in results if item.status != "sent"]
+
+        print()
+        print(style_text(f"Total de cuentas procesadas: {total}", bold=True))
+        print(style_text(f"Mensajes enviados con éxito: {sent}", color=Fore.GREEN if sent else Fore.WHITE, bold=True))
+        if failed:
+            print(style_text("Fallos detectados:", color=Fore.RED, bold=True))
+            for item in failed:
+                detail = item.error or "motivo no especificado"
+                print(f" - @{item.username or 'desconocida'} → @{item.target}: {item.status} ({detail})")
+        raise SystemExit(0)
+
     menu_send_rotating(concurrency_override=args.concurrency)
