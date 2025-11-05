@@ -40,6 +40,31 @@ def _human_type(locator, text: str, *, min_delay: float = 0.05, max_delay: float
         time.sleep(random.uniform(min_delay, max_delay))
 
 
+def _focus_clear_and_type(field, text: str) -> None:
+    """Bring focus to a field, clear it and type the desired text with delays."""
+
+    with contextlib.suppress(Exception):
+        field.click()
+    _human_delay(0.2, 0.4)
+
+    cleared = False
+    with contextlib.suppress(Exception):
+        field.fill("")
+        cleared = True
+    if not cleared:
+        with contextlib.suppress(Exception):
+            field.press("Control+A")
+            field.press("Delete")
+            cleared = True
+    if not cleared:
+        with contextlib.suppress(Exception):
+            field.press("Meta+A")
+            field.press("Delete")
+
+    _human_delay(0.1, 0.3)
+    _human_type(field, text)
+
+
 @dataclass
 class _TwoFactorPayload:
     code: str
@@ -63,7 +88,7 @@ class InstagramPlaywrightSession:
         self,
         account: Dict[str, str],
         *,
-        headless: bool = False,
+        headless: bool = True,
         proxy_override: Optional[Dict[str, str]] = None,
         session_storage_dir: Optional[Path] = None,
     ) -> None:
@@ -253,17 +278,15 @@ class InstagramPlaywrightSession:
         self._accept_cookies_if_present()
         _human_delay(1.0, 2.0)
 
-        username_input = page.wait_for_selector("input[name='username']", timeout=20000)
-        password_input = page.wait_for_selector("input[name='password']", timeout=20000)
+        username_input = page.locator("input[name='username']")
+        password_input = page.locator("input[name='password']")
 
-        username_input.click()
-        _human_delay(0.2, 0.5)
-        _human_type(username_input, self._username)
+        username_input.wait_for(state="visible", timeout=20000)
+        _focus_clear_and_type(username_input, self._username)
         _human_delay(0.4, 0.9)
 
-        password_input.click()
-        _human_delay(0.2, 0.5)
-        _human_type(password_input, self._password)
+        password_input.wait_for(state="visible", timeout=20000)
+        _focus_clear_and_type(password_input, self._password)
         _human_delay(0.3, 0.7)
 
         self._submit_login_form()
@@ -567,7 +590,7 @@ def send_messages_from_csv(
     default_message: str,
     *,
     batch_size: int = 10,
-    headless: bool = False,
+    headless: bool = True,
 ) -> List[BulkSendResult]:
     """Process Instagram accounts defined in a CSV concurrently and send a DM."""
 

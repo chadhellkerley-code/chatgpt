@@ -168,7 +168,7 @@ def _client_for(username: str) -> InstagramPlaywrightSession:
     account = get_account(username)
     if not account:
         raise RuntimeError(f"No se encontró la cuenta {username}.")
-    session = InstagramPlaywrightSession(account, headless=False)
+    session = InstagramPlaywrightSession(account, headless=True)
     session.ensure_logged_in()
     mark_connected(username, True)
     return session
