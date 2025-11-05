@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import contextlib
 import logging
+import math
 import queue
 import random
-import math
 import threading
 import time
 from collections import defaultdict, deque
@@ -31,14 +32,12 @@ except Exception:  # pragma: no cover - si falta dateutil
 from accounts import (
     auto_login_with_saved_password,
     get_account,
-    has_valid_session_settings,
     list_all,
     mark_connected,
     prompt_login,
 )
 from config import SETTINGS
 from leads import load_list
-from proxy_manager import apply_proxy_to_client, record_proxy_failure, should_retry_proxy
 from runtime import (
     STOP_EVENT,
     ensure_logging,
@@ -48,7 +47,8 @@ from runtime import (
     sleep_with_stop,
     start_q_listener,
 )
-from session_store import has_session, load_into
+from session_store import has_session
+from playwright_service import InstagramPlaywrightSession, send_messages_from_csv
 from storage import (
     already_contacted,
     log_sent,
@@ -164,46 +164,20 @@ def get_message_totals() -> tuple[int, int]:
     return ok_total, error_total
 
 
-def _client_for(username: str):
-    from instagrapi import Client
-
+def _client_for(username: str) -> InstagramPlaywrightSession:
     account = get_account(username)
-    cl = Client()
-    binding = None
-    try:
-        binding = apply_proxy_to_client(cl, username, account, reason="envio")
-    except Exception as exc:
-        if account and account.get("proxy_url"):
-            record_proxy_failure(username, exc)
-            raise RuntimeError(
-                f"El proxy configurado para @{username} no respondió: {exc}"
-            ) from exc
-        logger.warning("Proxy no disponible para @%s: %s", username, exc, exc_info=False)
-
-    try:
-        load_into(cl, username)
-    except FileNotFoundError as exc:
-        mark_connected(username, False)
-        raise RuntimeError(f"No hay sesión guardada para {username}. Usá opción 1.") from exc
-    except Exception as exc:
-        if binding and should_retry_proxy(exc):
-            record_proxy_failure(username, exc)
-        mark_connected(username, False)
-        raise
-
-    if not has_valid_session_settings(cl):
-        mark_connected(username, False)
-        raise RuntimeError(
-            f"La sesión guardada para {username} no contiene credenciales activas. Iniciá sesión nuevamente."
-        )
-
+    if not account:
+        raise RuntimeError(f"No se encontró la cuenta {username}.")
+    session = InstagramPlaywrightSession(account, headless=False)
+    session.ensure_logged_in()
     mark_connected(username, True)
-    return cl
+    return session
 
 
 def _ensure_session(username: str) -> bool:
     try:
-        _client_for(username)
+        with contextlib.closing(_client_for(username)):
+            pass
         return True
     except Exception:
         return False
@@ -211,12 +185,9 @@ def _ensure_session(username: str) -> bool:
 
 def _send_dm(cl, to_username: str, message: str) -> bool:
     try:
-        uid = cl.user_id_from_username(to_username)
-        cl.direct_send(message, [uid])
+        cl.send_direct_message(to_username, message)
         return True
     except Exception as exc:
-        if should_retry_proxy(exc):
-            raise
         logger.debug("Error enviando DM a @%s: %s", to_username, exc, exc_info=False)
         return False
 
@@ -787,12 +758,10 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
         reason_label: str | None = None
         suggestion: str | None = None
         scope: str | None = None
-        max_retries = 3
-        retries = 0
         while not STOP_EVENT.is_set():
             try:
-                cl = _client_for(username)
-                success_flag = _send_dm(cl, lead, message)
+                with contextlib.closing(_client_for(username)) as cl:
+                    success_flag = _send_dm(cl, lead, message)
                 if not success_flag:
                     detail = "Instagram no confirmó el envío"
                     reason_code = reason_code or "send_failed"
@@ -800,35 +769,7 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
                     suggestion = suggestion or "Revisá si la cuenta puede enviar mensajes manualmente."
                     scope = scope or "account"
                 break
-            except Exception as exc:  # pragma: no cover - external SDK
-                if should_retry_proxy(exc):
-                    retries += 1
-                    record_proxy_failure(username, exc)
-                    wait_retry = min(30, 5 * retries)
-                    logger.warning(
-                        "Proxy error con @%s → @%s (intento %d/%d): %s",
-                        username,
-                        lead,
-                        retries,
-                        max_retries,
-                        exc,
-                        exc_info=False,
-                    )
-                    if retries >= max_retries:
-                        detail = "proxy sin respuesta"
-                        attention_message = (
-                            "El proxy configurado para @"
-                            f"{username} falló repetidamente. Revisá la opción 1 para actualizarlo o quitarlo."
-                        )
-                        reason_code = "proxy_unavailable"
-                        reason_label = "Proxy sin respuesta"
-                        suggestion = (
-                            "Actualizá o quitá el proxy configurado antes de continuar con esta cuenta."
-                        )
-                        scope = "account"
-                        break
-                    sleep_with_stop(wait_retry)
-                    continue
+            except Exception as exc:  # pragma: no cover - automatización externa
                 detail, diag_attention, code, label, suggestion_hint, scope_hint = _classify_exception(exc)
                 if code and not reason_code:
                     reason_code = code
@@ -895,69 +836,6 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
                 sleep_with_stop(wait_time)
             account_lock.release()
             semaphore.release()
-
-    if not STOP_EVENT.is_set():
-        print(
-            style_text(
-                "Ejecutando prueba previa de envío por cuenta...",
-                color=Fore.CYAN,
-                bold=True,
-            )
-        )
-        tested_accounts = 0
-        for account in accounts:
-            if STOP_EVENT.is_set():
-                break
-            username = account["username"]
-            if remaining[username] <= 0:
-                continue
-            if not users:
-                warn("No quedan leads suficientes para completar la prueba previa.")
-                break
-            lead = users.popleft()
-            message = random.choice(templates)
-            remaining[username] -= 1
-            live_table.begin(username, lead)
-            event, wait_time = _attempt_send(account, lead, message)
-            if wait_time > 0:
-                sleep_with_stop(wait_time)
-            action = _handle_event(
-                event,
-                success,
-                failed,
-                live_table,
-                remaining,
-                bump,
-                error_tracker,
-                account_error_streaks,
-                paused_runtime,
-            )
-            _render_progress(
-                alias,
-                len(users),
-                success,
-                failed,
-                live_table,
-                send_state,
-            )
-            tested_accounts += 1
-            if not event.success:
-                if event.scope == "account":
-                    remaining[username] = 0
-                    warn(
-                        f"@{username} se omitirá tras fallar la prueba previa ({event.detail})."
-                    )
-                    logger.warning(
-                        "Cuenta omitida tras prueba previa: @%s (%s)",
-                        username,
-                        event.detail,
-                    )
-                else:
-                    remaining[username] += 1
-            if action == "stop" or STOP_EVENT.is_set():
-                break
-        if tested_accounts:
-            logger.info("Prueba previa completada para %d cuentas.", tested_accounts)
 
     try:
         last_render = 0.0
@@ -1096,11 +974,75 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Enviar mensajes rotando cuentas")
+    parser = argparse.ArgumentParser(description="Herramientas de envío de mensajes para Instagram")
     parser.add_argument(
         "--concurrency",
         type=int,
-        help="Cantidad de cuentas enviando en simultáneo",
+        help="Cantidad de cuentas enviando en simultáneo (modo interactivo)",
+    )
+    parser.add_argument(
+        "--csv",
+        help="Ruta a un CSV con cuentas para procesar en paralelo",
+    )
+    parser.add_argument(
+        "--lead",
+        help="Usuario objetivo para el modo CSV",
+    )
+    parser.add_argument(
+        "--message",
+        help="Mensaje a enviar en el modo CSV",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=10,
+        help="Cantidad de cuentas a procesar por tanda (mínimo 10)",
+    )
+    parser.add_argument(
+        "--headed",
+        action="store_true",
+        help="Mostrar el navegador durante el procesamiento del CSV",
     )
     args = parser.parse_args()
+
+    if args.csv:
+        if not args.lead:
+            parser.error("--lead es obligatorio cuando se usa --csv")
+        if not args.message:
+            parser.error("--message es obligatorio cuando se usa --csv")
+
+        ensure_logging(
+            quiet=SETTINGS.quiet,
+            log_dir=SETTINGS.log_dir,
+            log_file=SETTINGS.log_file,
+        )
+
+        print(
+            style_text(
+                "Procesando cuentas desde CSV en paralelo...",
+                color=Fore.CYAN,
+                bold=True,
+            )
+        )
+        results = send_messages_from_csv(
+            args.csv,
+            args.lead,
+            args.message,
+            batch_size=args.batch_size,
+            headless=not args.headed,
+        )
+        total = len(results)
+        sent = sum(1 for item in results if item.status == "sent")
+        failed = [item for item in results if item.status != "sent"]
+
+        print()
+        print(style_text(f"Total de cuentas procesadas: {total}", bold=True))
+        print(style_text(f"Mensajes enviados con éxito: {sent}", color=Fore.GREEN if sent else Fore.WHITE, bold=True))
+        if failed:
+            print(style_text("Fallos detectados:", color=Fore.RED, bold=True))
+            for item in failed:
+                detail = item.error or "motivo no especificado"
+                print(f" - @{item.username or 'desconocida'} → @{item.target}: {item.status} ({detail})")
+        raise SystemExit(0)
+
     menu_send_rotating(concurrency_override=args.concurrency)
