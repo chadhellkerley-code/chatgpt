@@ -616,6 +616,102 @@ def _prompt_totp(username: str) -> bool:
                 return False
 
 
+@dataclass(frozen=True)
+class _LoginTwoFactorPayload:
+    code: str
+    mode: str
+    source: str
+
+
+_TOTP_SECRET_KEYS = (
+    "totp_secret",
+    "totp seed",
+    "totp_seed",
+    "totp key",
+    "totp_key",
+    "totp uri",
+    "totp_uri",
+    "authenticator_secret",
+    "authenticator",
+    "2fa_secret",
+    "two_factor_secret",
+)
+
+
+def _ingest_totp_secret_from_account(account: Dict) -> None:
+    username = (account.get("username") or "").strip()
+    if not username or has_totp_secret(username):
+        return
+
+    for key in _TOTP_SECRET_KEYS:
+        raw = account.get(key)
+        if not raw:
+            continue
+        candidate = str(raw).strip()
+        if not candidate:
+            continue
+        try:
+            save_totp_secret(username, candidate)
+            logger.debug(
+                "Se almacenó el secreto TOTP definido en '%s' para @%s durante el login.",
+                key,
+                username,
+            )
+        except ValueError as exc:
+            logger.warning(
+                "Se ignoró el secreto TOTP incluido en '%s' para @%s: %s",
+                key,
+                username,
+                exc,
+            )
+        finally:
+            break
+
+    account["has_totp"] = has_totp_secret(username)
+
+
+def _two_factor_payload_for_login(account: Dict) -> Optional[_LoginTwoFactorPayload]:
+    username = (account.get("username") or "").strip()
+    if username:
+        _ingest_totp_secret_from_account(account)
+        if has_totp_secret(username):
+            code = generate_totp_code(username)
+            if code:
+                return _LoginTwoFactorPayload(code=code, mode="totp", source="totp_store")
+            logger.warning(
+                "No se pudo generar el código TOTP automático para @%s. Revisá el secreto almacenado.",
+                username,
+            )
+
+    for key in ("totp_code", "two_factor_code", "2fa_code"):
+        value = str(account.get(key) or "").strip()
+        if value:
+            return _LoginTwoFactorPayload(code=value, mode=key, source="manual")
+
+    return None
+
+
+def _two_factor_mode_from_info(info: Dict[str, Any]) -> str:
+    if not isinstance(info, dict):
+        return "unknown"
+
+    if info.get("totp_two_factor_on") or info.get("is_totp_two_factor_enabled"):
+        return "totp"
+    if info.get("whatsapp_two_factor_on") or info.get("should_use_whatsapp_token"):
+        return "whatsapp"
+    if info.get("sms_two_factor_on") or info.get("is_sms_two_factor_enabled"):
+        return "sms"
+
+    method = str(info.get("verification_method") or "").strip()
+    if method == "3":
+        return "totp"
+    if method == "5":
+        return "whatsapp"
+    if method == "1":
+        return "sms"
+    return "unknown"
+
+
 def add_account(username: str, alias: str, proxy: Optional[Dict] = None) -> bool:
     items = _load()
     if _find(items, username):
@@ -829,28 +925,74 @@ def _login_and_save_session(
             )
             return False
     try:
-        from instagrapi import Client
+        from instagrapi import Client, exceptions as ig_exceptions
+    except Exception as exc:
+        logger.debug("No se pudo crear el cliente de Instagram: %s", exc)
+        return False
 
+    try:
         cl = Client()
+    except Exception as exc:
+        logger.debug("Error inicializando instagrapi para @%s: %s", username, exc)
+        return False
+
+    binding = None
+    try:
         binding = apply_proxy_to_client(cl, username, account, reason="login")
-        verification_code = ""
-        if has_totp_secret(username):
-            code = generate_totp_code(username)
-            if code:
-                verification_code = code
-                logger.debug("Aplicando TOTP automático para @%s", username)
-            else:
-                warn(
-                    "No se pudo generar el código 2FA automático. Intentá reconfigurar el TOTP."
-                )
-        jitter = random.uniform(1.5, 3.5)
-        time.sleep(jitter)
+    except Exception as exc:
+        if account.get("proxy_url"):
+            record_proxy_failure(username, exc)
+        logger.debug("No se pudo aplicar el proxy de @%s: %s", username, exc)
+
+    payload = _two_factor_payload_for_login(account)
+    verification_code = payload.code if payload else ""
+    if payload and payload.mode == "totp":
+        logger.debug("Aplicando TOTP automático para @%s", username)
+
+    jitter = random.uniform(1.5, 3.5)
+    time.sleep(jitter)
+
+    try:
         cl.login(username, password, verification_code=verification_code)
         save_from(cl, username)
         mark_connected(username, True)
         _clear_login_failure(username)
+        account["has_totp"] = has_totp_secret(username)
         ok(f"Sesión guardada para {username}.")
         return True
+    except ig_exceptions.BadPassword:
+        warn(f"Contraseña incorrecta para @{username}. Actualizá la clave y reintentá.")
+    except ig_exceptions.UserNotFound:
+        warn(
+            f"Instagram indicó que la cuenta @{username} no existe o fue deshabilitada."
+        )
+    except ig_exceptions.TwoFactorRequired:
+        info = getattr(cl, "last_json", {}).get("two_factor_info", {})
+        mode = _two_factor_mode_from_info(info)
+        if mode == "whatsapp":
+            warn(
+                "Esta cuenta requiere verificación externa por WhatsApp. El login automático no es posible."
+            )
+        elif mode == "sms":
+            warn(
+                "Esta cuenta requiere verificación externa por SMS. El login automático no es posible."
+            )
+        elif payload and payload.mode == "totp":
+            warn(
+                f"Instagram rechazó el código TOTP automático para @{username}. Revisá el secreto en tu autenticador."
+            )
+        else:
+            warn(
+                f"Instagram solicitó un código 2FA para @{username}. Guardá el secreto TOTP o ingresá el código manualmente."
+            )
+    except ig_exceptions.ChallengeRequired:
+        warn(
+            f"Instagram solicitó un challenge adicional para @{username}. Resolvilo manualmente para continuar."
+        )
+    except ig_exceptions.CheckpointChallengeRequired:
+        warn(
+            f"Instagram bloqueó el login de @{username} con un checkpoint. Debés verificar la cuenta manualmente."
+        )
     except Exception as exc:
         if should_retry_proxy(exc):
             record_proxy_failure(username, exc)
@@ -860,6 +1002,10 @@ def _login_and_save_session(
         mark_connected(username, False)
         _record_login_failure(username)
         return False
+
+    mark_connected(username, False)
+    _record_login_failure(username)
+    return False
 
 
 def _authorization_payload(client: Any) -> Dict[str, Any]:
