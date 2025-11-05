@@ -25,6 +25,9 @@ from totp_store import generate_code as generate_totp_code
 
 logger = logging.getLogger(__name__)
 
+_PLAYWRIGHT_SESSIONS_DIR = Path("storage") / "playwright_sessions"
+_PLAYWRIGHT_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def _human_delay(min_seconds: float = 0.4, max_seconds: float = 1.1) -> None:
     """Pause execution emulating a human-scale delay."""
@@ -56,7 +59,14 @@ class BulkSendResult:
 class InstagramPlaywrightSession:
     """Encapsulates a Playwright browser session for Instagram automation."""
 
-    def __init__(self, account: Dict[str, str], *, headless: bool = True, proxy_override: Optional[Dict[str, str]] = None) -> None:
+    def __init__(
+        self,
+        account: Dict[str, str],
+        *,
+        headless: bool = False,
+        proxy_override: Optional[Dict[str, str]] = None,
+        session_storage_dir: Optional[Path] = None,
+    ) -> None:
         self._account = account
         self._username = (account.get("username") or "").strip()
         self._password = (account.get("password") or "").strip()
@@ -69,10 +79,16 @@ class InstagramPlaywrightSession:
         self._page: Optional[Page] = None
         self._logged_in = False
         self._proxy_settings = self._extract_proxy_settings(proxy_override)
+        root = session_storage_dir or _PLAYWRIGHT_SESSIONS_DIR
+        root.mkdir(parents=True, exist_ok=True)
+        self._storage_path = root / f"{self._username}.json"
+        self._blocked_reason: Optional[str] = None
 
     # Context manager helpers -------------------------------------------------
     def close(self) -> None:
         """Dispose every Playwright resource created for the session."""
+        with contextlib.suppress(Exception):
+            self._persist_session()
         with contextlib.suppress(Exception):
             if self._page is not None:
                 self._page.close()
@@ -107,10 +123,15 @@ class InstagramPlaywrightSession:
         page = self._page
         profile_url = f"https://www.instagram.com/{target_username.strip('/')}/"
         logger.debug("Abriendo perfil @%s", target_username)
-        page.goto(profile_url, wait_until="networkidle")
+        page.goto(profile_url, wait_until="domcontentloaded")
+        with contextlib.suppress(PlaywrightTimeoutError):
+            page.wait_for_load_state("domcontentloaded", timeout=30000)
+        with contextlib.suppress(PlaywrightTimeoutError):
+            page.wait_for_load_state("networkidle", timeout=45000)
         _human_delay(1.2, 2.4)
 
         self._accept_cookies_if_present()
+        self._detect_account_block()
 
         message_button = self._locate_message_button()
         with contextlib.suppress(PlaywrightTimeoutError):
@@ -131,19 +152,39 @@ class InstagramPlaywrightSession:
         page.keyboard.press("Enter")
         _human_delay(0.8, 1.6)
 
+        restriction_alerts = [
+            "No puedes enviar mensajes",
+            "You can't send messages",
+            "No puedes responder a esta conversación",
+        ]
+        for text in restriction_alerts:
+            locator = page.locator(f"text={text}")
+            if locator.count():
+                raise RuntimeError(
+                    f"Instagram bloqueó los mensajes para @{self._username}: {text}"
+                )
+
         snippet = message.strip()
         if snippet:
             snippet = snippet.splitlines()[0][:60]
             bubble_locator = page.locator("div[role='listitem']").filter(has_text=snippet)
             with contextlib.suppress(PlaywrightTimeoutError):
                 bubble_locator.first.wait_for(state="visible", timeout=6000)
+        self._persist_session()
 
     # Internal helpers -------------------------------------------------------
     def _ensure_session(self) -> None:
         if self._logged_in:
             return
         self._start_browser()
+        if self._context is None or self._page is None:
+            raise RuntimeError("No se pudo inicializar Playwright correctamente.")
+        if self._storage_path.exists() and self._check_existing_session():
+            self._persist_session()
+            self._logged_in = True
+            return
         self._login_via_web()
+        self._persist_session()
         self._logged_in = True
 
     def ensure_logged_in(self) -> None:
@@ -154,28 +195,57 @@ class InstagramPlaywrightSession:
         if self._playwright is not None:
             return
         self._playwright = sync_playwright().start()
+        base_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+        ]
+        if not self._headless:
+            base_args.append("--start-maximized")
         browser_args = {
             "headless": self._headless,
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-            ],
+            "args": base_args,
         }
         if self._proxy_settings:
             browser_args["proxy"] = self._proxy_settings
-        self._browser = self._playwright.chromium.launch(**browser_args)
-        self._context = self._browser.new_context(locale="es-ES", timezone_id="America/Argentina/Buenos_Aires")
+
+        browser = None
+        if not self._headless:
+            try:
+                browser = self._playwright.chromium.launch(channel="chrome", **browser_args)
+            except Exception as exc:
+                logger.debug(
+                    "No se pudo abrir Chrome para @%s, se usa Chromium predeterminado (%s)",
+                    self._username,
+                    exc,
+                )
+        if browser is None:
+            browser = self._playwright.chromium.launch(**browser_args)
+
+        self._browser = browser
+        context_kwargs = {
+            "locale": "es-ES",
+            "timezone_id": "America/Argentina/Buenos_Aires",
+        }
+        if not self._headless:
+            context_kwargs["viewport"] = None
+        if self._storage_path.exists():
+            context_kwargs["storage_state"] = str(self._storage_path)
+        self._context = self._browser.new_context(**context_kwargs)
         self._page = self._context.new_page()
-        self._page.set_default_navigation_timeout(45000)
-        self._page.set_default_timeout(30000)
+        with contextlib.suppress(Exception):
+            self._page.bring_to_front()
+        self._page.set_default_navigation_timeout(60000)
+        self._page.set_default_timeout(45000)
 
     def _login_via_web(self) -> None:
         assert self._page is not None
         page = self._page
         logger.debug("Iniciando sesión en Instagram para @%s", self._username)
-        page.goto("https://www.instagram.com/accounts/login/", wait_until="networkidle")
+        page.goto("https://www.instagram.com/accounts/login/", wait_until="domcontentloaded")
         with contextlib.suppress(PlaywrightTimeoutError):
-            page.wait_for_load_state("networkidle", timeout=30000)
+            page.wait_for_load_state("domcontentloaded", timeout=30000)
+        with contextlib.suppress(PlaywrightTimeoutError):
+            page.wait_for_load_state("networkidle", timeout=45000)
         self._accept_cookies_if_present()
         _human_delay(1.0, 2.0)
 
@@ -197,6 +267,7 @@ class InstagramPlaywrightSession:
 
         self._resolve_two_factor_challenge()
         self._dismiss_post_login_modals()
+        self._detect_account_block()
 
     def _dismiss_post_login_modals(self) -> None:
         assert self._page is not None
@@ -379,6 +450,49 @@ class InstagramPlaywrightSession:
                 return _TwoFactorPayload(code=value, label=key)
         return None
 
+    def _persist_session(self) -> None:
+        if self._context is None:
+            return
+        try:
+            self._context.storage_state(path=str(self._storage_path))
+        except Exception as exc:
+            logger.debug("No se pudo guardar la sesión de @%s: %s", self._username, exc)
+
+    def _check_existing_session(self) -> bool:
+        assert self._page is not None
+        page = self._page
+        try:
+            page.goto("https://www.instagram.com/", wait_until="domcontentloaded")
+        except Exception as exc:
+            logger.debug("Fallo al validar sesión almacenada para @%s: %s", self._username, exc)
+            return False
+        self._accept_cookies_if_present()
+        with contextlib.suppress(PlaywrightTimeoutError):
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
+        if page.locator("input[name='username']").count():
+            return False
+        self._detect_account_block()
+        return True
+
+    def _detect_account_block(self) -> None:
+        assert self._page is not None
+        page = self._page
+        alerts = [
+            "Tu cuenta ha sido inhabilitada",
+            "Tu cuenta ha sido deshabilitada",
+            "Your account has been disabled",
+            "We detected unusual activity",
+            "Hemos detectado actividad inusual",
+            "No puedes usar esta cuenta",
+        ]
+        for text in alerts:
+            locator = page.locator(f"text={text}")
+            if locator.count():
+                self._blocked_reason = text
+                raise RuntimeError(
+                    f"Instagram reporta restricciones para @{self._username}: {text}"
+                )
+
     def _extract_proxy_settings(self, proxy_override: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
         """Build the Playwright proxy settings for this session if available."""
 
@@ -445,7 +559,7 @@ def send_messages_from_csv(
     default_message: str,
     *,
     batch_size: int = 10,
-    headless: bool = True,
+    headless: bool = False,
 ) -> List[BulkSendResult]:
     """Process Instagram accounts defined in a CSV concurrently and send a DM."""
 

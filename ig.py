@@ -168,7 +168,7 @@ def _client_for(username: str) -> InstagramPlaywrightSession:
     account = get_account(username)
     if not account:
         raise RuntimeError(f"No se encontró la cuenta {username}.")
-    session = InstagramPlaywrightSession(account, headless=True)
+    session = InstagramPlaywrightSession(account, headless=False)
     session.ensure_logged_in()
     mark_connected(username, True)
     return session
@@ -836,69 +836,6 @@ def menu_send_rotating(concurrency_override: Optional[int] = None) -> None:
                 sleep_with_stop(wait_time)
             account_lock.release()
             semaphore.release()
-
-    if not STOP_EVENT.is_set():
-        print(
-            style_text(
-                "Ejecutando prueba previa de envío por cuenta...",
-                color=Fore.CYAN,
-                bold=True,
-            )
-        )
-        tested_accounts = 0
-        for account in accounts:
-            if STOP_EVENT.is_set():
-                break
-            username = account["username"]
-            if remaining[username] <= 0:
-                continue
-            if not users:
-                warn("No quedan leads suficientes para completar la prueba previa.")
-                break
-            lead = users.popleft()
-            message = random.choice(templates)
-            remaining[username] -= 1
-            live_table.begin(username, lead)
-            event, wait_time = _attempt_send(account, lead, message)
-            if wait_time > 0:
-                sleep_with_stop(wait_time)
-            action = _handle_event(
-                event,
-                success,
-                failed,
-                live_table,
-                remaining,
-                bump,
-                error_tracker,
-                account_error_streaks,
-                paused_runtime,
-            )
-            _render_progress(
-                alias,
-                len(users),
-                success,
-                failed,
-                live_table,
-                send_state,
-            )
-            tested_accounts += 1
-            if not event.success:
-                if event.scope == "account":
-                    remaining[username] = 0
-                    warn(
-                        f"@{username} se omitirá tras fallar la prueba previa ({event.detail})."
-                    )
-                    logger.warning(
-                        "Cuenta omitida tras prueba previa: @%s (%s)",
-                        username,
-                        event.detail,
-                    )
-                else:
-                    remaining[username] += 1
-            if action == "stop" or STOP_EVENT.is_set():
-                break
-        if tested_accounts:
-            logger.info("Prueba previa completada para %d cuentas.", tested_accounts)
 
     try:
         last_render = 0.0
