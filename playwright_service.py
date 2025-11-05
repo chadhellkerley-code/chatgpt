@@ -16,6 +16,7 @@ from playwright.sync_api import (
     Browser,
     BrowserContext,
     ElementHandle,
+    Locator,
     Page,
     TimeoutError as PlaywrightTimeoutError,
     sync_playwright,
@@ -278,14 +279,31 @@ class InstagramPlaywrightSession:
         self._accept_cookies_if_present()
         _human_delay(1.0, 2.0)
 
-        username_input = page.locator("input[name='username']")
-        password_input = page.locator("input[name='password']")
-
-        username_input.wait_for(state="visible", timeout=20000)
+        username_input = self._wait_for_visible_locator(
+            (
+                "input[name='username']",
+                "input[name='email']",
+                "input[name='emailOrPhone']",
+                "input[name='phone_number']",
+                "input[aria-label*='usuario']",
+                "input[aria-label*='username']",
+            ),
+            "usuario",
+            timeout=25000,
+        )
         _focus_clear_and_type(username_input, self._username)
         _human_delay(0.4, 0.9)
 
-        password_input.wait_for(state="visible", timeout=20000)
+        password_input = self._wait_for_visible_locator(
+            (
+                "input[name='password']",
+                "input[type='password']",
+                "input[aria-label*='contraseña']",
+                "input[aria-label*='password']",
+            ),
+            "contraseña",
+            timeout=25000,
+        )
         _focus_clear_and_type(password_input, self._password)
         _human_delay(0.3, 0.7)
 
@@ -295,6 +313,7 @@ class InstagramPlaywrightSession:
         self._resolve_two_factor_challenge()
         self._dismiss_post_login_modals()
         self._detect_account_block()
+        self._ensure_login_completed()
 
     def _dismiss_post_login_modals(self) -> None:
         assert self._page is not None
@@ -419,10 +438,30 @@ class InstagramPlaywrightSession:
 
     def _resolve_two_factor_challenge(self) -> None:
         payload = self._build_two_factor_payload()
-        if payload is None:
-            return
         assert self._page is not None
         page = self._page
+        challenge_markers = [
+            "text='Introduce el código'",
+            "text='Ingrese el código'",
+            "text='Enter the code'",
+            "text='Security code'",
+            "input[name='verificationCode']",
+            "input[name='security_code']",
+            "input[name='verification_code']",
+            "input[name='otp']",
+        ]
+        frames = [page] + [frame for frame in page.frames if frame is not page]
+        challenge_present = any(
+            frame.locator(selector).count() > 0 for frame in frames for selector in challenge_markers
+        )
+
+        if payload is None:
+            if challenge_present:
+                raise RuntimeError(
+                    "Se requiere un código de verificación en dos pasos para continuar, pero no se proporcionó."
+                )
+            return
+
         logger.debug("Resolviendo desafío 2FA con %s", payload.label)
         code_selectors = [
             "input[name='verificationCode']",
@@ -431,6 +470,9 @@ class InstagramPlaywrightSession:
             "input[name='otp']",
             "input[aria-label*='código']",
             "input[aria-label*='code']",
+            "input[type='tel']",
+            "input[placeholder*='código']",
+            "input[placeholder*='code']",
         ]
 
         # Algunas pantallas requieren solicitar el envío del código antes de poder ingresarlo.
@@ -447,21 +489,47 @@ class InstagramPlaywrightSession:
                     locator.first.click()
                     _human_delay(0.6, 1.2)
 
-        for selector in code_selectors:
-            locator = page.locator(selector)
-            if locator.count():
-                code_input = locator.first
-                with contextlib.suppress(PlaywrightTimeoutError):
-                    code_input.wait_for(state="visible", timeout=15000)
-                code_input.click()
-                _human_delay(0.2, 0.4)
-                _human_type(code_input, payload.code)
-                _human_delay(0.5, 1.0)
-                page.keyboard.press("Enter")
-                _human_delay(1.0, 2.0)
-                return
+        frames = [page] + [frame for frame in page.frames if frame is not page]
 
-        logger.warning("Se solicitó 2FA pero no se identificó el campo de código para @%s", self._username)
+        for frame in frames:
+            for selector in code_selectors:
+                locator = frame.locator(selector)
+                if locator.count():
+                    code_input = locator.first
+                    with contextlib.suppress(PlaywrightTimeoutError):
+                        code_input.wait_for(state="visible", timeout=20000)
+                    code_input.click()
+                    _human_delay(0.2, 0.4)
+                    _human_type(code_input, payload.code)
+                    _human_delay(0.5, 1.0)
+                    with contextlib.suppress(Exception):
+                        code_input.press("Enter")
+                    _human_delay(1.0, 2.0)
+                    try:
+                        code_input.wait_for(state="hidden", timeout=20000)
+                    except PlaywrightTimeoutError as exc:
+                        raise RuntimeError(
+                            "Instagram no aceptó el código de verificación proporcionado."
+                        ) from exc
+                    except Exception:
+                        # La navegación puede invalidar el handle; considérese éxito.
+                        pass
+                    return
+
+        frames = [page] + [frame for frame in page.frames if frame is not page]
+        challenge_present = any(
+            frame.locator(selector).count() > 0 for frame in frames for selector in challenge_markers
+        )
+        if challenge_present:
+            raise RuntimeError(
+                "No se encontró un campo válido para ingresar el código de verificación de Instagram."
+            )
+
+        logger.debug(
+            "No se detectó un formulario de código 2FA para @%s tras el intento de verificación.",
+            self._username,
+        )
+        return
 
     def _build_two_factor_payload(self) -> Optional[_TwoFactorPayload]:
         if not self._account:
@@ -504,6 +572,71 @@ class InstagramPlaywrightSession:
             return False
         self._detect_account_block()
         return True
+
+    def _ensure_login_completed(self) -> None:
+        """Confirms the login finished successfully or raises descriptive errors."""
+
+        assert self._page is not None
+        page = self._page
+
+        failure_indicators = [
+            "text='Contraseña incorrecta'",
+            "text='Tu contraseña es incorrecta'",
+            "text='Your password was incorrect'",
+            "text='We couldn't log you in'",
+            "text='There was a problem logging you into Instagram'",
+        ]
+
+        success_indicators = [
+            "[aria-label='Inicio']",
+            "[aria-label='Home']",
+            "a[href='/direct/inbox/']",
+            "nav[role='navigation']",
+        ]
+
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            for selector in failure_indicators:
+                if page.locator(selector).count():
+                    raise RuntimeError("Instagram rechazó el inicio de sesión: credenciales inválidas o bloqueo.")
+
+            for selector in success_indicators:
+                if page.locator(selector).count():
+                    return
+
+            if page.locator("input[name='username']").count() and page.locator("input[name='password']").count():
+                # Seguimos en la pantalla de login; espera un poco más antes de fallar.
+                page.wait_for_timeout(500)
+            else:
+                page.wait_for_timeout(500)
+
+        raise RuntimeError("Instagram no completó el inicio de sesión dentro del tiempo esperado.")
+
+    def _wait_for_visible_locator(
+        self,
+        selectors: Sequence[str],
+        description: str,
+        *,
+        timeout: int,
+    ) -> Locator:
+        assert self._page is not None
+        page = self._page
+        deadline = time.time() + timeout / 1000
+
+        while time.time() < deadline:
+            for selector in selectors:
+                locator = page.locator(selector)
+                try:
+                    if locator.count():
+                        locator.first.wait_for(state="visible", timeout=500)
+                        return locator.first
+                except PlaywrightTimeoutError:
+                    continue
+                except Exception:
+                    continue
+            page.wait_for_timeout(200)
+
+        raise RuntimeError(f"No se encontró el campo de {description} en el formulario de inicio de sesión de Instagram.")
 
     def _detect_account_block(self) -> None:
         assert self._page is not None
