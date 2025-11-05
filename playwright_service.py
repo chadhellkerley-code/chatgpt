@@ -697,6 +697,98 @@ def _chunked(sequence: Sequence[Dict[str, str]], size: int) -> Iterable[List[Dic
         yield list(sequence[index : index + size])
 
 
+def _session_variants(username: str) -> List[str]:
+    raw = (username or "").strip()
+    if not raw:
+        return []
+    variants = [raw]
+    stripped = raw.lstrip("@")
+    if stripped and stripped not in variants:
+        variants.append(stripped)
+    if raw.startswith("@"):
+        with_at = raw
+    else:
+        with_at = f"@{raw}"
+    if with_at not in variants:
+        variants.append(with_at)
+    return variants
+
+
+def _playwright_session_paths(
+    username: str, *, session_storage_dir: Optional[Path] = None
+) -> List[Path]:
+    root = session_storage_dir or _PLAYWRIGHT_SESSIONS_DIR
+    root.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for variant in _session_variants(username):
+        paths.append(root / f"{variant}.json")
+    return paths
+
+
+def has_playwright_session(
+    username: str, *, session_storage_dir: Optional[Path] = None
+) -> bool:
+    """Return True if a persisted Playwright storage state exists for the user."""
+
+    for path in _playwright_session_paths(username, session_storage_dir=session_storage_dir):
+        if path.exists():
+            try:
+                if path.stat().st_size > 0:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def remove_playwright_session(
+    username: str, *, session_storage_dir: Optional[Path] = None
+) -> None:
+    """Delete persisted Playwright sessions for the provided username."""
+
+    for path in _playwright_session_paths(username, session_storage_dir=session_storage_dir):
+        with contextlib.suppress(Exception):
+            if path.exists():
+                path.unlink()
+
+
+def login_account_with_playwright(
+    account: Dict[str, str],
+    *,
+    headless: bool = True,
+    proxy_override: Optional[Dict[str, str]] = None,
+    session_storage_dir: Optional[Path] = None,
+) -> bool:
+    """Perform a Playwright-based login for an account and persist the session."""
+
+    try:
+        session = InstagramPlaywrightSession(
+            account,
+            headless=headless,
+            proxy_override=proxy_override,
+            session_storage_dir=session_storage_dir,
+        )
+    except Exception as exc:
+        logger.warning(
+            "No se pudo preparar la sesión de Playwright para @%s: %s",
+            (account.get("username") or "").strip(),
+            exc,
+        )
+        return False
+
+    try:
+        session.ensure_logged_in()
+        return True
+    except Exception as exc:
+        logger.warning(
+            "No se pudo iniciar sesión con Playwright para @%s: %s",
+            (account.get("username") or "").strip(),
+            exc,
+        )
+        return False
+    finally:
+        session.close()
+
+
 def _load_accounts_from_csv(path: Path) -> List[Dict[str, str]]:
     with path.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)

@@ -48,7 +48,12 @@ from runtime import (
     start_q_listener,
 )
 from session_store import has_session
-from playwright_service import InstagramPlaywrightSession, send_messages_from_csv
+from playwright_service import (
+    InstagramPlaywrightSession,
+    has_playwright_session,
+    login_account_with_playwright,
+    send_messages_from_csv,
+)
 from storage import (
     already_contacted,
     log_sent,
@@ -530,7 +535,7 @@ def _build_accounts_for_alias(alias: str) -> list[Dict]:
     needing_login: list[tuple[Dict, str]] = []
     for account in all_acc:
         username = account["username"]
-        if not has_session(username):
+        if not (has_session(username) or has_playwright_session(username)):
             needing_login.append((account, "sin sesión guardada"))
             continue
         if not _ensure_session(username):
@@ -542,11 +547,20 @@ def _build_accounts_for_alias(alias: str) -> list[Dict]:
         remaining: list[tuple[Dict, str]] = []
         for account, reason in needing_login:
             username = account["username"]
-            if auto_login_with_saved_password(username, account=account) and _ensure_session(username):
+            login_ok = False
+            if login_account_with_playwright(account, headless=True) and _ensure_session(username):
                 refreshed = get_account(username) or account
                 if refreshed not in verified:
                     verified.append(refreshed)
-            else:
+                login_ok = True
+            elif auto_login_with_saved_password(username, account=account) and _ensure_session(
+                username
+            ):
+                refreshed = get_account(username) or account
+                if refreshed not in verified:
+                    verified.append(refreshed)
+                login_ok = True
+            if not login_ok:
                 remaining.append((account, reason))
 
         if remaining:
@@ -556,7 +570,16 @@ def _build_accounts_for_alias(alias: str) -> list[Dict]:
             if ask("¿Iniciar sesión ahora? (s/N): ").strip().lower() == "s":
                 for account, _ in remaining:
                     username = account["username"]
-                    if auto_login_with_saved_password(username, account=account) and _ensure_session(username):
+                    if login_account_with_playwright(account, headless=True) and _ensure_session(
+                        username
+                    ):
+                        refreshed = get_account(username) or account
+                        if refreshed not in verified:
+                            verified.append(refreshed)
+                        continue
+                    if auto_login_with_saved_password(username, account=account) and _ensure_session(
+                        username
+                    ):
                         refreshed = get_account(username) or account
                         if refreshed not in verified:
                             verified.append(refreshed)
