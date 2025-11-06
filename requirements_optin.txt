@@ -2,3 +2,9 @@ playwright>=1.30
 pyotp>=2.8
 cryptography>=41
 python-dotenv>=1.0
+# Optional browser automations (opt-in)
+playwright>=1.44
+python-dotenv>=1.0
+pyotp>=2.8
+cryptography>=41
+tenacity>=8.2
