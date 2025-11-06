@@ -1,50 +1,57 @@
-# Instagram Opt-in Toolkit
+# Toolkit opt-in para Instagram (Playwright)
 
-## Instalación
+## Preparación en Windows (PowerShell)
 
-```bash
+```powershell
+py -m venv venv311
+venv311\Scripts\activate
 pip install -r requirements_optin.txt
 python -m playwright install
 ```
 
-## Variables de entorno
+## Variables `.env` sugeridas
 
-Crea un archivo `.env` con los siguientes valores de ejemplo:
-
-```
-OPTIN_HEADLESS=false
-SESSION_ENCRYPTION_KEY=<FernetKeyBase64>
-DELAY_MIN_S=190
-DELAY_MAX_S=350
-DM_PER_HOUR_LIMIT=25
-GLOBAL_TIMEOUT_PER_STEP=15
-RETRIES_PER_STEP=2
-TWOFA_RESEND_COOLDOWN=90
-MAX_CONSECUTIVE_ERRORS_PER_ACCOUNT=3
+```env
+OPTIN_HEADLESS=0
 OPTIN_PROXY_URL=
 OPTIN_IG_TOTP=
+OPTIN_SEND_COOLDOWN_SECONDS=90
+OPTIN_TYPING_MIN_MS=60
+OPTIN_TYPING_MAX_MS=180
+OPTIN_PARALLEL_LIMIT=3
+SESSION_ENCRYPTION_KEY=<generar con Fernet>
+OPTIN_USER_AGENT=
+OPTIN_LOCALE=
+OPTIN_TIMEZONE=
 ```
 
-## CSVs
-
-- `data/accounts.csv` → columnas: `account,username,password,totp_secret,proxy_url,user_agent`
-- `data/recipients.csv` → columnas: `account,to_username,text`
-
-## Uso rápido (single)
+## Primer guardado de sesión
 
 ```bash
-python scripts/run_optin_wizard.py --account cuenta1
-python scripts/run_optin_send.py --account cuenta1 --to usuario --text "Hola!"
+python scripts/run_optin_login.py --account main --user <ig_user> --password <ig_pass>
 ```
 
-## Uso rápido (multi)
+## Enviar un DM usando la sesión
 
 ```bash
-python scripts/run_optin_batch_send.py --accounts data/accounts.csv --recipients data/recipients.csv --text "Hola!" --max-concurrency 5
+python scripts/run_optin_send_dm.py --account main --to <dest> --text "Hola!"
 ```
 
-## Recomendaciones operativas
+## Grabar y reutilizar un flujo
 
-- Usa headful (más humano) y límites conservadores.
-- Re-grabar solo si cambia la UI: wizard o subflow puntual.
-- Revisa `logs/optin_audit.jsonl` y genera un resumen diario en CSV si se requiere.
+```bash
+python scripts/run_optin_record.py --alias add_account
+python scripts/run_optin_playback.py --alias add_account --var USER=<...> --var PASSWORD=<...>
+```
+
+## Responder mensajes entrantes
+
+```bash
+python scripts/run_optin_reply_dm.py --account main --contains "palabra" --reply "Hola {username}!"
+```
+
+## Envío concurrente (CSV to_username,text)
+
+```bash
+python scripts/run_optin_bulk_send.py --account main --csv data/destinos.csv --parallel 5
+```
